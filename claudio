@@ -165,7 +165,6 @@ cmd_use() {
         rm "$target"
       else
         echo "  warning: $target already exists and is not a claudio symlink, skipping" >&2
-        warnings=$((warnings + 1))
         continue
       fi
     fi

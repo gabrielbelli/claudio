@@ -27,7 +27,7 @@ Different directories can have different profiles active simultaneously — each
 
 ## Profile Structure
 
-Each item is optional. claudio only symlinks items that exist in the profile.
+All items are always present — `new` scaffolds everything, `use` fills in any blanks before symlinking. This makes profiles **live links**: add a skill or command to the profile directory after activation and Claude sees it immediately — no need to re-activate.
 
 ```
 ~/.claude/profiles/<name>/
@@ -42,7 +42,7 @@ Each item is optional. claudio only symlinks items that exist in the profile.
 └── hooks/                → .claude/hooks                Hook scripts
 ```
 
-Secrets should never go in profile files. Keep them in your shell environment or a `.env` file you source separately.
+Secrets should never go in profile files. Keep them in your shell environment (e.g. `GITHUB_TOKEN`) — MCP servers pass env vars through automatically.
 
 ## Commands
 
@@ -79,7 +79,7 @@ claudio clean
 
 ### `claudio new <profile>`
 
-Creates a new profile directory with scaffolded `mcp.json` and `settings.json`, then opens it in `$EDITOR`. Fails if the profile already exists.
+Creates a new profile directory with all config items scaffolded (empty JSON files, empty directories), then opens it in `$EDITOR`. Fails if the profile already exists.
 
 ```sh
 claudio new soc
@@ -156,10 +156,18 @@ claudio current
 claudio show soc
 ```
 
+## Testing
+
+```sh
+sh test.sh
+```
+
+Runs 102 tests covering all commands, live-link behaviour, conflict detection, and error handling. Executes in a temp directory and cleans up after itself.
+
 ## Notes
 
 - claudio writes a `.claudio` marker file to the working directory to track the active profile. Add it to `.gitignore` if you prefer.
-- Profiles are directories, not single files. A minimal profile needs only `mcp.json`; a full one can bundle the entire Claude Code config surface.
+- Profiles are live-linked directories. Changes to the profile take effect immediately in any project using it.
 - `clean` only removes symlinks that point into the profiles directory — it won't touch files that aren't managed by claudio.
 - `use` calls `exec` to replace the shell process with Claude Code — no subprocess overhead.
 - `init` follows symlinks when copying, so it captures the resolved content.

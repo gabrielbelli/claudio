@@ -109,14 +109,6 @@ run() {
   " -- "$@" 2>&1
 }
 
-run_exit() {
-  CLAUDIO_PROFILES="$PROFILES" EDITOR=true sh -c "
-    sed 's/exec claude/echo \"[claude]\" #/' '$CLAUDIO' > '$TMP/claudio-test.sh'
-    sh '$TMP/claudio-test.sh' \"\$@\"
-  " -- "$@" 2>&1
-  echo $?
-}
-
 # --- setup ---
 
 TMP=$(mktemp -d)
