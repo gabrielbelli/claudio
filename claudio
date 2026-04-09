@@ -1,0 +1,320 @@
+#!/usr/bin/env sh
+# claudio — Claude Code profile manager
+#
+# Manages named profiles that bundle Claude Code's full project-level
+# configuration: MCP servers, permissions, hooks, skills, commands,
+# subagents, and instruction files. Activating a profile symlinks
+# everything into the current directory, then launches Claude Code.
+#
+# Environment:
+#   CLAUDIO_PROFILES  Directory containing profile directories
+#                     (default: ~/.claude/profiles)
+#   EDITOR            Editor for new/edit commands (default: vim)
+
+PROFILES_DIR="${CLAUDIO_PROFILES:-$HOME/.claude/profiles}"
+MARKER=".claudio"
+
+# Maps profile items to their target paths in the project directory.
+# Format: profile_item:target_path (one per line)
+CONFIG_MAP="
+mcp.json:.mcp.json
+settings.json:.claude/settings.json
+settings.local.json:.claude/settings.local.json
+CLAUDE.md:CLAUDE.md
+CLAUDE.local.md:CLAUDE.local.md
+commands:.claude/commands
+skills:.claude/skills
+agents:.claude/agents
+hooks:.claude/hooks
+"
+
+# --- helpers ---
+
+_usage() {
+  cat <<'EOF'
+claudio — Claude Code profile manager
+
+Usage: claudio <command> [args]
+
+Commands:
+  list                       List available profiles (* = active in cwd)
+  use <profile> [-- <args>]  Activate profile and launch Claude Code
+  clean                      Deactivate profile, remove symlinks from cwd
+  new <profile>              Scaffold a new empty profile
+  edit <profile> [component] Open profile or component in $EDITOR
+  show <profile>             Display profile contents
+  current                    Show which profile is active in cwd
+  init <profile>             Capture current project config as a new profile
+
+Components for edit:
+  mcp, settings, local-settings, claude, local-claude,
+  commands, skills, agents, hooks
+
+Examples:
+  claudio new soc
+  claudio edit soc mcp
+  claudio use soc
+  claudio use soc -- -p "fix the bug"
+  claudio init my-snapshot
+  claudio clean
+EOF
+}
+
+_profiles() {
+  [ ! -d "$PROFILES_DIR" ] && return
+  for d in "$PROFILES_DIR"/*/; do
+    [ -d "$d" ] && basename "$d"
+  done | sort
+}
+
+_require_profile() {
+  [ -z "$1" ] && { echo "Profile name required" >&2; exit 1; }
+  PROFILE_PATH="$PROFILES_DIR/$1"
+  [ ! -d "$PROFILE_PATH" ] && { echo "Profile '$1' not found in $PROFILES_DIR" >&2; exit 1; }
+}
+
+_active_profile() {
+  if [ -f "$MARKER" ]; then
+    cat "$MARKER"
+  fi
+}
+
+_is_claudio_link() {
+  # Returns 0 if the path is a symlink pointing into the profiles dir
+  [ -L "$1" ] || return 1
+  _link_dest=$(readlink "$1")
+  case "$_link_dest" in
+    "$PROFILES_DIR"/*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+_ensure_parent() {
+  dir=$(dirname "$1")
+  [ "$dir" != "." ] && mkdir -p "$dir"
+}
+
+_ensure_profile_items() {
+  # Populate any missing items in a profile with sensible blanks so that
+  # symlinks are always created and later additions take effect immediately.
+  profile="$1"
+  echo "$CONFIG_MAP" | while IFS=: read -r item _target; do
+    [ -z "$item" ] && continue
+    [ -e "$profile/$item" ] && continue
+    case "$item" in
+      mcp.json)      printf '{\n  "mcpServers": {}\n}\n' > "$profile/$item" ;;
+      settings.json) printf '{\n  "permissions": {\n    "allow": [],\n    "deny": []\n  }\n}\n' > "$profile/$item" ;;
+      *.json)        printf '{}\n' > "$profile/$item" ;;
+      *.md)          touch "$profile/$item" ;;
+      *)             mkdir -p "$profile/$item" ;;
+    esac
+  done
+}
+
+_component_path() {
+  case "$1" in
+    mcp)            echo "mcp.json" ;;
+    settings)       echo "settings.json" ;;
+    local-settings) echo "settings.local.json" ;;
+    claude)         echo "CLAUDE.md" ;;
+    local-claude)   echo "CLAUDE.local.md" ;;
+    commands)       echo "commands" ;;
+    skills)         echo "skills" ;;
+    agents)         echo "agents" ;;
+    hooks)          echo "hooks" ;;
+    *) echo "Unknown component: $1" >&2; echo "Valid: mcp, settings, local-settings, claude, local-claude, commands, skills, agents, hooks" >&2; exit 1 ;;
+  esac
+}
+
+# --- commands ---
+
+cmd_list() {
+  profiles=$(_profiles)
+  [ -z "$profiles" ] && { echo "No profiles found in $PROFILES_DIR"; exit 0; }
+  active=$(_active_profile)
+  echo "Available profiles:"
+  echo "$profiles" | while read -r p; do
+    if [ "$p" = "$active" ]; then
+      echo "  * $p  (active)"
+    else
+      echo "    $p"
+    fi
+  done
+}
+
+cmd_use() {
+  _require_profile "$1"
+  profile_name="$1"
+  shift
+
+  # Clean existing profile first if one is active
+  if [ -f "$MARKER" ]; then
+    _do_clean
+  fi
+
+  mkdir -p .claude
+  _ensure_profile_items "$PROFILE_PATH"
+
+  echo "$CONFIG_MAP" | while IFS=: read -r item target; do
+    [ -z "$item" ] && continue
+    src="$PROFILE_PATH/$item"
+
+    # Check for conflicts
+    if [ -e "$target" ] || [ -L "$target" ]; then
+      if _is_claudio_link "$target"; then
+        rm "$target"
+      else
+        echo "  warning: $target already exists and is not a claudio symlink, skipping" >&2
+        warnings=$((warnings + 1))
+        continue
+      fi
+    fi
+
+    _ensure_parent "$target"
+    ln -s "$src" "$target"
+    echo "  linked $target -> $src"
+  done
+
+  echo "$profile_name" > "$MARKER"
+  echo "Activated profile '$profile_name'"
+
+  # Launch claude with remaining args
+  exec claude "$@"
+}
+
+cmd_clean() {
+  if [ ! -f "$MARKER" ]; then
+    echo "No active profile in current directory"
+    exit 0
+  fi
+  _do_clean
+  echo "Profile deactivated"
+}
+
+_do_clean() {
+  echo "$CONFIG_MAP" | while IFS=: read -r item target; do
+    [ -z "$item" ] && continue
+    if _is_claudio_link "$target"; then
+      rm "$target"
+      echo "  removed $target"
+    fi
+  done
+
+  rm -f "$MARKER"
+
+  # Remove .claude/ if empty
+  [ -d ".claude" ] && rmdir ".claude" 2>/dev/null || true
+}
+
+cmd_new() {
+  [ -z "$1" ] && { echo "Profile name required" >&2; exit 1; }
+  profile="$PROFILES_DIR/$1"
+  [ -d "$profile" ] && { echo "Profile '$1' already exists" >&2; exit 1; }
+
+  mkdir -p "$profile"
+  _ensure_profile_items "$profile"
+
+  echo "Created profile '$1' at $profile"
+  ${EDITOR:-vim} "$profile"
+}
+
+cmd_edit() {
+  [ -z "$1" ] && { echo "Profile name required" >&2; exit 1; }
+  _require_profile "$1"
+  profile="$PROFILE_PATH"
+
+  if [ -z "$2" ]; then
+    ${EDITOR:-vim} "$profile"
+  else
+    component=$(_component_path "$2")
+    target="$profile/$component"
+
+    # Create component if it doesn't exist
+    if [ ! -e "$target" ]; then
+      case "$component" in
+        *.json) printf '{}\n' > "$target" ;;
+        *.md)   touch "$target" ;;
+        *)      mkdir -p "$target" ;;
+      esac
+    fi
+
+    ${EDITOR:-vim} "$target"
+  fi
+}
+
+cmd_show() {
+  _require_profile "$1"
+  profile="$PROFILE_PATH"
+
+  echo "Profile: $1"
+  echo "Path:    $profile"
+  echo ""
+
+  echo "$CONFIG_MAP" | while IFS=: read -r item target; do
+    [ -z "$item" ] && continue
+    src="$profile/$item"
+    [ ! -e "$src" ] && continue
+
+    if [ -d "$src" ]; then
+      count=$(find "$src" -type f | wc -l | tr -d ' ')
+      echo "[$item] ($count files) -> $target"
+      find "$src" -type f | sed "s|$profile/||" | sort | sed 's/^/  /'
+    else
+      echo "[$item] -> $target"
+      sed 's/^/  /' "$src"
+    fi
+    echo ""
+  done
+}
+
+cmd_current() {
+  active=$(_active_profile)
+  if [ -z "$active" ]; then
+    echo "No active profile in current directory"
+    exit 0
+  fi
+  echo "$active ($PROFILES_DIR/$active)"
+}
+
+cmd_init() {
+  [ -z "$1" ] && { echo "Profile name required" >&2; exit 1; }
+  profile="$PROFILES_DIR/$1"
+  [ -d "$profile" ] && { echo "Profile '$1' already exists" >&2; exit 1; }
+
+  mkdir -p "$profile"
+
+  echo "$CONFIG_MAP" | while IFS=: read -r item target; do
+    [ -z "$item" ] && continue
+    [ ! -e "$target" ] && continue
+
+    # Resolve symlinks — copy the actual content
+    if [ -d "$target" ]; then
+      cp -RL "$target" "$profile/$item"
+    else
+      cp -L "$target" "$profile/$item"
+    fi
+    echo "  captured $target -> $item"
+  done
+
+  _ensure_profile_items "$profile"
+  echo "Created profile '$1' from current directory config"
+  echo "Path: $profile"
+}
+
+# --- dispatch ---
+
+[ $# -eq 0 ] && { _usage; exit 0; }
+
+CMD=$1; shift
+case $CMD in
+  list)    cmd_list ;;
+  use)     cmd_use "$@" ;;
+  clean)   cmd_clean ;;
+  new)     cmd_new "$1" ;;
+  edit)    cmd_edit "$1" "$2" ;;
+  show)    cmd_show "$1" ;;
+  current) cmd_current ;;
+  init)    cmd_init "$1" ;;
+  -h|--help|help) _usage ;;
+  *)       echo "Unknown command: $CMD" >&2; _usage; exit 1 ;;
+esac
