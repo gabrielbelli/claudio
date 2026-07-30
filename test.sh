@@ -39,7 +39,7 @@ assert_eq() {
 
 assert_contains() {
   TESTS=$((TESTS + 1))
-  if echo "$2" | grep -q "$3"; then
+  if echo "$2" | grep -q -e "$3"; then
     pass "$1"
   else
     fail "$1" "output does not contain '$3'"
@@ -48,7 +48,7 @@ assert_contains() {
 
 assert_not_contains() {
   TESTS=$((TESTS + 1))
-  if echo "$2" | grep -q "$3"; then
+  if echo "$2" | grep -q -e "$3"; then
     fail "$1" "output should not contain '$3'"
   else
     pass "$1"
@@ -102,7 +102,7 @@ assert_exit_code() {
 
 # Wrapper: run claudio with test env, patched to not exec claude
 run() {
-  CLAUDIO_PROFILES="$PROFILES" EDITOR=true sh -c "
+  CLAUDIO_PROFILES="$PROFILES" CLAUDIO_DOCKER="$DOCKER_STUB" EDITOR=true sh -c "
     # Replace 'exec claude' with a no-op for testing
     sed 's/exec claude/echo \"[claude]\" #/' '$CLAUDIO' > '$TMP/claudio-test.sh'
     sh '$TMP/claudio-test.sh' \"\$@\"
@@ -115,6 +115,29 @@ TMP=$(mktemp -d)
 PROFILES="$TMP/profiles"
 WORKDIR="$TMP/project"
 mkdir -p "$PROFILES" "$WORKDIR"
+
+# Hermetic `docker` stub so Docker-MCP mode is exercised without a real daemon.
+# Records every invocation to $TMP/docker.log and simulates success.
+DOCKER_STUB="$TMP/docker-stub"
+DOCKER_LOG="$TMP/docker.log"
+cat > "$DOCKER_STUB" <<STUB
+#!/bin/sh
+echo "\$@" >> "$DOCKER_LOG"
+[ "\$1" = "mcp" ] || exit 0
+shift
+case "\$1 \$2" in
+  "profile create") exit 0 ;;
+  "profile show")   echo "servers: []"; exit 0 ;;
+  "profile server") exit 0 ;;
+  "profile config") exit 0 ;;
+  "profile remove") exit 0 ;;
+  "catalog pull")   echo "pulled"; exit 0 ;;
+  "catalog ls")     echo "no catalogs"; exit 0 ;;
+  *) exit 0 ;;
+esac
+STUB
+chmod +x "$DOCKER_STUB"
+: > "$DOCKER_LOG"
 
 cleanup() {
   rm -rf "$TMP"
@@ -160,6 +183,21 @@ assert_contains "mcp.json has mcpServers" "$mcp_content" "mcpServers"
 settings_content=$(cat "$PROFILES/test-profile/settings.json")
 assert_contains "settings.json has permissions" "$settings_content" "permissions"
 
+# Docker MCP mode is the default: marker written, mcp.json is a gateway runner
+assert_file_exists "new writes mcp.docker marker" "$PROFILES/test-profile/mcp.docker"
+assert_eq "mcp.docker holds docker profile id" "$(cat "$PROFILES/test-profile/mcp.docker")" "test-profile"
+assert_contains "new mode message" "$out" "Docker MCP mode"
+assert_contains "mcp.json is a gateway runner" "$mcp_content" "gateway"
+assert_contains "gateway runner targets docker profile" "$mcp_content" "test-profile"
+assert_contains "new calls docker mcp profile create" "$(cat "$DOCKER_LOG")" "profile create --name test-profile"
+
+# --manual opts out of Docker MCP wiring
+out=$(run new manual-profile --manual)
+assert_contains "new --manual message" "$out" "manual MCP mode"
+assert_file_not_exists "new --manual writes no marker" "$PROFILES/manual-profile/mcp.docker"
+manual_mcp=$(cat "$PROFILES/manual-profile/mcp.json")
+assert_not_contains "new --manual mcp.json is not a gateway runner" "$manual_mcp" "gateway"
+
 # Duplicate name fails
 out=$(run new test-profile 2>&1 || true)
 assert_contains "new rejects duplicate" "$out" "already exists"
@@ -185,7 +223,8 @@ rm -rf .claude .mcp.json .claudio CLAUDE.md CLAUDE.local.md
 
 out=$(run use test-profile)
 assert_contains "use prints activation" "$out" "Activated profile 'test-profile'"
-assert_contains "use launches claude" "$out" "[claude]"
+assert_not_contains "use does NOT auto-launch claude" "$out" "\[claude\]"
+assert_contains "use prints run hint" "$out" "Run"
 
 # All 9 symlinks created
 assert_is_symlink "use links .mcp.json" ".mcp.json"
@@ -206,6 +245,19 @@ assert_eq "marker contains profile name" "$marker" "test-profile"
 # Symlinks point into profiles dir
 link_target=$(readlink .mcp.json)
 assert_contains "symlink points to profiles dir" "$link_target" "$PROFILES/test-profile"
+
+# Docker-mode activation notes the gateway wiring
+assert_contains "use notes Docker MCP wiring" "$out" "Docker MCP Toolkit"
+
+# ============================================================
+printf "\n\033[1m=== use -l / --launch ===\033[0m\n"
+# ============================================================
+
+out=$(run use test-profile -l)
+assert_contains "use -l launches claude" "$out" "\[claude\]"
+
+out=$(run use test-profile --launch)
+assert_contains "use --launch launches claude" "$out" "\[claude\]"
 
 # ============================================================
 printf "\n\033[1m=== current ===\033[0m\n"
@@ -425,6 +477,90 @@ done
 # Invalid component fails
 out=$(run edit test-profile invalid-thing 2>&1 || true)
 assert_contains "edit rejects invalid component" "$out" "Unknown component"
+
+# ============================================================
+printf "\n\033[1m=== mcp helpers (Docker MCP Toolkit) ===\033[0m\n"
+# ============================================================
+
+# add: bare image ref gets a docker:// scheme
+: > "$DOCKER_LOG"
+out=$(run mcp test-profile add ghcr.io/acme/srv:latest 2>&1)
+assert_contains "mcp add calls profile server add" "$(cat "$DOCKER_LOG")" "profile server add test-profile"
+assert_contains "mcp add defaults bare ref to docker://" "$(cat "$DOCKER_LOG")" "--server docker://ghcr.io/acme/srv:latest"
+
+# add: an explicit scheme passes through untouched
+: > "$DOCKER_LOG"
+run mcp test-profile add catalog://mcp/docker-mcp-catalog/github > /dev/null 2>&1
+assert_contains "mcp add preserves catalog:// scheme" "$(cat "$DOCKER_LOG")" "--server catalog://mcp/docker-mcp-catalog/github"
+assert_not_contains "mcp add does not double-prefix" "$(cat "$DOCKER_LOG")" "docker://catalog"
+
+# rm: removes by name
+: > "$DOCKER_LOG"
+run mcp test-profile rm github > /dev/null 2>&1
+assert_contains "mcp rm calls profile server remove" "$(cat "$DOCKER_LOG")" "profile server remove test-profile github"
+
+# show (default action)
+: > "$DOCKER_LOG"
+run mcp test-profile > /dev/null 2>&1
+assert_contains "mcp <profile> shows servers" "$(cat "$DOCKER_LOG")" "profile show test-profile"
+
+# catalog import (the annoying store dialog, as one command)
+: > "$DOCKER_LOG"
+out=$(run mcp catalog mcp/community-registry:latest 2>&1)
+assert_contains "mcp catalog pulls the OCI reference" "$(cat "$DOCKER_LOG")" "catalog pull mcp/community-registry:latest"
+
+# manual-mode profile has no Docker servers to manage
+out=$(run mcp manual-profile add whatever 2>&1 || true)
+assert_contains "mcp on manual profile errors" "$out" "manual MCP mode"
+
+# edit mcp on a Docker-mode profile prints management hint (does not open editor)
+out=$(run edit test-profile mcp 2>&1)
+assert_contains "edit mcp (docker) prints helper hint" "$out" "claudio mcp test-profile add"
+
+# ============================================================
+printf "\n\033[1m=== mcp extras (mixed mode: Docker + non-Docker) ===\033[0m\n"
+# ============================================================
+
+run new mixed-profile > /dev/null 2>&1
+
+if command -v jq > /dev/null 2>&1; then
+  # A remote HTTP server that Docker isn't fit for
+  cat > "$PROFILES/mixed-profile/mcp.extra.json" <<'JSON'
+{
+  "mcpServers": {
+    "netdata-remote": {
+      "type": "http",
+      "url": "http://example.com:19999/mcp",
+      "headers": { "Authorization": "Bearer ${KEY}" }
+    }
+  }
+}
+JSON
+
+  # `mcp <profile> extra` regenerates mcp.json, merging gateway + extras
+  run mcp mixed-profile extra > /dev/null 2>&1
+  merged=$(cat "$PROFILES/mixed-profile/mcp.json")
+  assert_contains "extras: gateway entry still present" "$merged" "MCP_DOCKER"
+  assert_contains "extras: remote server merged in" "$merged" "netdata-remote"
+  assert_contains "extras: remote url merged" "$merged" "example.com"
+
+  # `use` regenerates the merged file into the active .mcp.json
+  cd "$WORKDIR"
+  rm -rf .claude .mcp.json .claudio CLAUDE.md CLAUDE.local.md
+  run use mixed-profile > /dev/null 2>&1
+  active_mcp=$(cat .mcp.json)
+  assert_contains "extras: active .mcp.json has gateway" "$active_mcp" "MCP_DOCKER"
+  assert_contains "extras: active .mcp.json has remote server" "$active_mcp" "netdata-remote"
+  run clean > /dev/null 2>&1
+
+  # show reflects extras
+  out=$(run show mixed-profile)
+  assert_contains "show notes extras" "$out" "mcp.extra.json"
+  out=$(run mcp mixed-profile show 2>&1)
+  assert_contains "mcp show lists extra server" "$out" "netdata-remote"
+else
+  printf "  (skipped — jq not installed)\n"
+fi
 
 # ============================================================
 printf "\n\033[1m=== error handling ===\033[0m\n"
