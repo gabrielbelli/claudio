@@ -4,11 +4,17 @@
 # Manages named profiles that bundle Claude Code's full project-level
 # configuration: MCP servers, permissions, hooks, skills, commands,
 # subagents, and instruction files. Activating a profile symlinks
-# everything into the current directory, then launches Claude Code.
+# everything into the current directory (it does NOT launch Claude Code
+# unless you pass -l/--launch).
+#
+# MCP servers are wired through the Docker MCP Toolkit by default: each
+# profile maps to a Docker MCP profile, and the generated .mcp.json just
+# runs the gateway. Pass --manual to hand-write .mcp.json the old way.
 #
 # Environment:
 #   CLAUDIO_PROFILES  Directory containing profile directories
 #                     (default: ~/.claude/profiles)
+#   CLAUDIO_DOCKER    Docker binary used for docker mcp calls (default: docker)
 #   EDITOR            Editor for new/edit commands (default: vim)
 
 PROFILES_DIR="${CLAUDIO_PROFILES:-$HOME/.claude/profiles}"
@@ -37,14 +43,22 @@ claudio — Claude Code profile manager
 Usage: claudio <command> [args]
 
 Commands:
-  list                       List available profiles (* = active in cwd)
-  use <profile> [-- <args>]  Activate profile and launch Claude Code
-  clean                      Deactivate profile, remove symlinks from cwd
-  new <profile>              Scaffold a new empty profile
-  edit <profile> [component] Open profile or component in $EDITOR
-  show <profile>             Display profile contents
-  current                    Show which profile is active in cwd
-  init <profile>             Capture current project config as a new profile
+  list                        List available profiles (* = active in cwd)
+  use <profile> [-l] [-- ...]  Activate profile in cwd (-l also launches Claude)
+  clean                       Deactivate profile, remove symlinks from cwd
+  new <profile> [--manual]    Scaffold a new profile (Docker MCP mode default)
+  edit <profile> [component]  Open profile or component in $EDITOR
+  show <profile>              Display profile contents
+  current                     Show which profile is active in cwd
+  init <profile>              Capture current project config as a new profile
+
+MCP servers (Docker MCP Toolkit — servers are managed by Docker):
+  mcp <profile> add <ref>...  Add server(s); bare refs default to docker://
+  mcp <profile> rm <name>...  Remove server(s) from the profile
+  mcp <profile> [show]        Show the profile's servers
+  mcp <profile> config ...    Pass through to `docker mcp profile config`
+  mcp catalog <oci-ref>       Import a catalog from an OCI reference
+  mcp catalog                 List imported catalogs
 
 Components for edit:
   mcp, settings, local-settings, claude, local-claude,
@@ -52,9 +66,10 @@ Components for edit:
 
 Examples:
   claudio new soc
-  claudio edit soc mcp
+  claudio mcp soc add ghcr.io/acme/my-server:latest
+  claudio mcp catalog mcp/community-registry:latest
   claudio use soc
-  claudio use soc -- -p "fix the bug"
+  claudio use soc -l -- -p "fix the bug"
   claudio init my-snapshot
   claudio clean
 EOF
@@ -126,6 +141,44 @@ _component_path() {
   esac
 }
 
+# --- Docker MCP Toolkit helpers ---
+
+_dockercmd() { echo "${CLAUDIO_DOCKER:-docker}"; }
+
+_docker_ok() { command -v "$(_dockercmd)" >/dev/null 2>&1; }
+
+# Run `docker mcp ...` with the configured docker binary.
+_dmcp() { "$(_dockercmd)" mcp "$@"; }
+
+# A profile is in Docker MCP mode if it carries an mcp.docker marker.
+_mcp_is_docker() { [ -f "$1/mcp.docker" ]; }
+
+# The Docker MCP profile id backing a claudio profile.
+_docker_id() { cat "$1/mcp.docker" 2>/dev/null; }
+
+# (Re)generate a profile's mcp.json as a gateway-runner for its Docker profile.
+_write_gateway_json() {
+  # $1 = profile path, $2 = docker profile id
+  cat > "$1/mcp.json" <<EOF
+{
+  "mcpServers": {
+    "MCP_DOCKER": {
+      "command": "docker",
+      "args": ["mcp", "gateway", "run", "--profile", "$2"]
+    }
+  }
+}
+EOF
+}
+
+# Normalise a server reference: add docker:// scheme to bare image refs.
+_mcp_ref() {
+  case "$1" in
+    *://*) printf '%s' "$1" ;;
+    *)     printf 'docker://%s' "$1" ;;
+  esac
+}
+
 # --- commands ---
 
 cmd_list() {
@@ -147,6 +200,18 @@ cmd_use() {
   profile_name="$1"
   shift
 
+  # Parse options: -l/--launch also starts Claude Code; -- ends option parsing
+  # and forwards remaining args to claude (only meaningful with --launch).
+  launch=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -l|--launch) launch=1; shift ;;
+      --)          shift; break ;;
+      -*)          echo "Unknown option: $1" >&2; exit 1 ;;
+      *)           break ;;
+    esac
+  done
+
   # Clean existing profile first if one is active
   if [ -f "$MARKER" ]; then
     _do_clean
@@ -154,6 +219,11 @@ cmd_use() {
 
   mkdir -p .claude
   _ensure_profile_items "$PROFILE_PATH"
+
+  # In Docker MCP mode, keep the gateway-runner mcp.json in sync with the id.
+  if _mcp_is_docker "$PROFILE_PATH"; then
+    _write_gateway_json "$PROFILE_PATH" "$(_docker_id "$PROFILE_PATH")"
+  fi
 
   echo "$CONFIG_MAP" | while IFS=: read -r item target; do
     [ -z "$item" ] && continue
@@ -176,9 +246,16 @@ cmd_use() {
 
   echo "$profile_name" > "$MARKER"
   echo "Activated profile '$profile_name'"
+  if _mcp_is_docker "$PROFILE_PATH"; then
+    echo "  MCP via Docker MCP Toolkit (docker profile: $(_docker_id "$PROFILE_PATH"))"
+  fi
 
-  # Launch claude with remaining args
-  exec claude "$@"
+  # Launch claude only when explicitly asked.
+  if [ "$launch" = 1 ]; then
+    exec claude "$@"
+  fi
+  [ $# -gt 0 ] && echo "  (extra args ignored — pass -l/--launch to start Claude Code with them)" >&2
+  echo "Run \`claude\` to start (or: claudio use $profile_name -l)."
 }
 
 cmd_clean() {
@@ -206,14 +283,37 @@ _do_clean() {
 }
 
 cmd_new() {
-  [ -z "$1" ] && { echo "Profile name required" >&2; exit 1; }
-  profile="$PROFILES_DIR/$1"
-  [ -d "$profile" ] && { echo "Profile '$1' already exists" >&2; exit 1; }
+  # Parse: name plus optional --manual (skip Docker MCP Toolkit wiring).
+  name=""
+  manual=0
+  for a in "$@"; do
+    case "$a" in
+      --manual) manual=1 ;;
+      -*)       echo "Unknown option: $a" >&2; exit 1 ;;
+      *)        [ -z "$name" ] && name="$a" ;;
+    esac
+  done
+  [ -z "$name" ] && { echo "Profile name required" >&2; exit 1; }
+
+  profile="$PROFILES_DIR/$name"
+  [ -d "$profile" ] && { echo "Profile '$name' already exists" >&2; exit 1; }
 
   mkdir -p "$profile"
   _ensure_profile_items "$profile"
 
-  echo "Created profile '$1' at $profile"
+  if [ "$manual" = 1 ]; then
+    echo "Created profile '$name' at $profile (manual MCP mode)"
+  elif _docker_ok && { _dmcp profile create --name "$name" --id "$name" >/dev/null 2>&1 || _dmcp profile show "$name" >/dev/null 2>&1; }; then
+    echo "$name" > "$profile/mcp.docker"
+    _write_gateway_json "$profile" "$name"
+    echo "Created profile '$name' at $profile (Docker MCP mode)"
+    echo "  Docker MCP profile: $name"
+    echo "  Add servers:   claudio mcp $name add <image-or-ref>"
+    echo "  Import a store: claudio mcp catalog <oci-ref>"
+  else
+    echo "Created profile '$name' at $profile (manual MCP mode — Docker MCP Toolkit unavailable)"
+  fi
+
   ${EDITOR:-vim} "$profile"
 }
 
@@ -224,21 +324,34 @@ cmd_edit() {
 
   if [ -z "$2" ]; then
     ${EDITOR:-vim} "$profile"
-  else
-    component=$(_component_path "$2")
-    target="$profile/$component"
-
-    # Create component if it doesn't exist
-    if [ ! -e "$target" ]; then
-      case "$component" in
-        *.json) printf '{}\n' > "$target" ;;
-        *.md)   touch "$target" ;;
-        *)      mkdir -p "$target" ;;
-      esac
-    fi
-
-    ${EDITOR:-vim} "$target"
+    return
   fi
+
+  # In Docker MCP mode the mcp.json is generated — servers live in Docker.
+  if [ "$2" = "mcp" ] && _mcp_is_docker "$profile"; then
+    id="$(_docker_id "$profile")"
+    echo "Profile '$1' uses the Docker MCP Toolkit (docker profile: $id)."
+    echo "Its .mcp.json is generated — manage servers with:"
+    echo "  claudio mcp $1 add <ref>     add a server"
+    echo "  claudio mcp $1 rm <name>     remove a server"
+    echo "  claudio mcp $1               show servers"
+    _docker_ok && _dmcp profile show "$id" 2>/dev/null
+    return 0
+  fi
+
+  component=$(_component_path "$2")
+  target="$profile/$component"
+
+  # Create component if it doesn't exist
+  if [ ! -e "$target" ]; then
+    case "$component" in
+      *.json) printf '{}\n' > "$target" ;;
+      *.md)   touch "$target" ;;
+      *)      mkdir -p "$target" ;;
+    esac
+  fi
+
+  ${EDITOR:-vim} "$target"
 }
 
 cmd_show() {
@@ -247,6 +360,11 @@ cmd_show() {
 
   echo "Profile: $1"
   echo "Path:    $profile"
+  if _mcp_is_docker "$profile"; then
+    echo "MCP:     Docker MCP Toolkit (docker profile: $(_docker_id "$profile"))"
+  else
+    echo "MCP:     manual (.mcp.json)"
+  fi
   echo ""
 
   echo "$CONFIG_MAP" | while IFS=: read -r item target; do
@@ -296,8 +414,63 @@ cmd_init() {
   done
 
   _ensure_profile_items "$profile"
-  echo "Created profile '$1' from current directory config"
+  echo "Created profile '$1' from current directory config (manual MCP mode)"
   echo "Path: $profile"
+}
+
+cmd_mcp() {
+  # Global catalog helper: `claudio mcp catalog [<oci-ref>]`
+  if [ "$1" = "catalog" ]; then
+    shift
+    _docker_ok || { echo "Docker MCP Toolkit (docker mcp) not available" >&2; exit 1; }
+    if [ $# -eq 0 ]; then
+      _dmcp catalog ls
+    else
+      _dmcp catalog pull "$@"
+    fi
+    return
+  fi
+
+  [ -z "$1" ] && {
+    echo "Usage: claudio mcp <profile> [add|rm|show|config] ...  |  claudio mcp catalog <oci-ref>" >&2
+    exit 1
+  }
+  _require_profile "$1"
+  pname="$1"
+
+  if ! _mcp_is_docker "$PROFILE_PATH"; then
+    echo "Profile '$pname' uses manual MCP mode — no Docker servers to manage." >&2
+    echo "Edit its .mcp.json directly:  claudio edit $pname mcp" >&2
+    exit 1
+  fi
+  _docker_ok || { echo "Docker MCP Toolkit (docker mcp) not available" >&2; exit 1; }
+
+  id="$(_docker_id "$PROFILE_PATH")"
+  action="${2:-show}"
+  shift 2 2>/dev/null || shift   # drop profile (+ action if present)
+
+  case "$action" in
+    show|ls)
+      _dmcp profile show "$id"
+      ;;
+    add)
+      [ $# -eq 0 ] && { echo "Usage: claudio mcp $pname add <image-or-ref>..." >&2; exit 1; }
+      set -- $(for ref in "$@"; do printf '%s %s ' "--server" "$(_mcp_ref "$ref")"; done)
+      _dmcp profile server add "$id" "$@"
+      ;;
+    rm|remove)
+      [ $# -eq 0 ] && { echo "Usage: claudio mcp $pname rm <name>..." >&2; exit 1; }
+      _dmcp profile server remove "$id" "$@"
+      ;;
+    config)
+      _dmcp profile config "$id" "$@"
+      ;;
+    *)
+      echo "Unknown mcp action: $action" >&2
+      echo "Valid: add, rm, show, config; or: claudio mcp catalog <oci-ref>" >&2
+      exit 1
+      ;;
+  esac
 }
 
 # --- dispatch ---
@@ -309,7 +482,8 @@ case $CMD in
   list)    cmd_list ;;
   use)     cmd_use "$@" ;;
   clean)   cmd_clean ;;
-  new)     cmd_new "$1" ;;
+  new)     cmd_new "$@" ;;
+  mcp)     cmd_mcp "$@" ;;
   edit)    cmd_edit "$1" "$2" ;;
   show)    cmd_show "$1" ;;
   current) cmd_current ;;
