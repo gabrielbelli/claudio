@@ -29,7 +29,23 @@ By default a profile's MCP servers are managed by the [Docker MCP Toolkit](https
 
 Server management lives in Docker — claudio just creates the Docker MCP profile and plugs the gateway into your directory. Add/remove servers with the `claudio mcp` helpers (thin wrappers over `docker mcp`) or Docker Desktop.
 
-Prefer the old hand-written `.mcp.json`? Create the profile with `claudio new <name> --manual`.
+**Docker is the base; extras cover the rest.** The Docker gateway is for *containerised* catalog servers. For MCPs Docker isn't fit for — remote HTTP/SSE endpoints, bespoke commands — keep a normal `mcp.extra.json` in the profile. claudio merges its `mcpServers` next to the gateway entry when generating `.mcp.json`:
+
+```
+profile/
+├── mcp.docker        # id of the backing Docker MCP profile
+└── mcp.extra.json    # { "mcpServers": { ... } } you maintain by hand
+
+generated .mcp.json:
+{ "mcpServers": {
+    "MCP_DOCKER":       { ...gateway runner... },   # container servers, via Docker
+    "netdata-hyperion": { "type": "http", "url": "…", "headers": { … } }
+} }
+```
+
+Edit extras with `claudio mcp <name> extra` (regenerates `.mcp.json` so active links update). Merging uses `jq` — only needed when a profile actually has extras.
+
+Prefer the old hand-written `.mcp.json` for the whole profile? Create it with `claudio new <name> --manual`.
 
 ## Configuration
 
@@ -111,7 +127,8 @@ Thin helpers over `docker mcp` for a Docker-mode profile's servers. Management s
 claudio mcp soc add ghcr.io/acme/my-server:latest   # bare refs default to docker://
 claudio mcp soc add catalog://mcp/docker-mcp-catalog/github
 claudio mcp soc rm github                            # remove a server
-claudio mcp soc                                      # show the profile's servers
+claudio mcp soc                                      # show the profile's servers (+ extras)
+claudio mcp soc extra                                # edit mcp.extra.json (non-Docker MCPs)
 claudio mcp soc config --set key=value               # passthrough to docker mcp profile config
 claudio mcp catalog mcp/community-registry:latest    # import a catalog from an OCI reference
 claudio mcp catalog                                  # list imported catalogs
@@ -196,7 +213,7 @@ claudio show soc
 sh test.sh
 ```
 
-Runs 124 tests covering all commands, live-link behaviour, Docker MCP mode, the `mcp` helpers, conflict detection, and error handling. Executes in a temp directory (with a stubbed `docker`) and cleans up after itself.
+Runs 131 tests covering all commands, live-link behaviour, Docker MCP mode, mixed mode (extras), the `mcp` helpers, conflict detection, and error handling. Executes in a temp directory (with a stubbed `docker`) and cleans up after itself. Mixed-mode tests self-skip when `jq` is not installed.
 
 ## Notes
 
@@ -205,5 +222,6 @@ Runs 124 tests covering all commands, live-link behaviour, Docker MCP mode, the 
 - `clean` only removes symlinks that point into the profiles directory — it won't touch files that aren't managed by claudio.
 - `use` activates only; it does not launch Claude Code unless you pass `-l`/`--launch` (which `exec`s `claude`, replacing the shell process).
 - Docker MCP mode stores the backing Docker profile id in a `mcp.docker` marker inside the profile, and (re)generates the gateway-runner `mcp.json` on each `use`. Server management is delegated to `docker mcp` / Docker Desktop.
+- A profile may also carry an `mcp.extra.json` (`{ "mcpServers": { … } }`) for MCPs Docker isn't fit for — remote HTTP/SSE servers, bespoke commands. Its entries are merged next to the gateway when `mcp.json` is generated. Merging needs `jq`, and only when extras are present; pure-Docker and manual profiles have no extra dependency.
 - `init` follows symlinks when copying, so it captures the resolved content (as a manual-mode profile).
 - POSIX sh — no bash required, no external dependencies beyond coreutils (plus Docker for MCP mode).

@@ -55,7 +55,9 @@ Commands:
 MCP servers (Docker MCP Toolkit — servers are managed by Docker):
   mcp <profile> add <ref>...  Add server(s); bare refs default to docker://
   mcp <profile> rm <name>...  Remove server(s) from the profile
-  mcp <profile> [show]        Show the profile's servers
+  mcp <profile> [show]        Show the profile's servers (+ extras)
+  mcp <profile> extra         Edit mcp.extra.json for non-Docker MCPs
+                              (e.g. remote HTTP servers) merged next to the gateway
   mcp <profile> config ...    Pass through to `docker mcp profile config`
   mcp catalog <oci-ref>       Import a catalog from an OCI reference
   mcp catalog                 List imported catalogs
@@ -156,19 +158,44 @@ _mcp_is_docker() { [ -f "$1/mcp.docker" ]; }
 # The Docker MCP profile id backing a claudio profile.
 _docker_id() { cat "$1/mcp.docker" 2>/dev/null; }
 
-# (Re)generate a profile's mcp.json as a gateway-runner for its Docker profile.
-_write_gateway_json() {
-  # $1 = profile path, $2 = docker profile id
-  cat > "$1/mcp.json" <<EOF
+# Write a plain gateway-runner mcp.json (no extras merged).
+_plain_gateway_json() {
+  # $1 = docker profile id, $2 = output path
+  cat > "$2" <<EOF
 {
   "mcpServers": {
     "MCP_DOCKER": {
       "command": "docker",
-      "args": ["mcp", "gateway", "run", "--profile", "$2"]
+      "args": ["mcp", "gateway", "run", "--profile", "$1"]
     }
   }
 }
 EOF
+}
+
+# (Re)generate a profile's mcp.json: the Docker gateway runner, plus any
+# servers hand-kept in mcp.extra.json (for MCPs Docker isn't fit for, e.g.
+# remote HTTP endpoints). The extras are merged next to the gateway entry.
+_write_gateway_json() {
+  # $1 = profile path, $2 = docker profile id
+  _wg_extra="$1/mcp.extra.json"
+  _wg_out="$1/mcp.json"
+
+  if [ -f "$_wg_extra" ]; then
+    if command -v jq >/dev/null 2>&1; then
+      _wg_base='{"mcpServers":{"MCP_DOCKER":{"command":"docker","args":["mcp","gateway","run","--profile","'"$2"'"]}}}'
+      if printf '%s' "$_wg_base" | jq --slurpfile e "$_wg_extra" \
+          '.mcpServers += ($e[0].mcpServers // {})' > "$_wg_out.tmp" 2>/dev/null; then
+        mv "$_wg_out.tmp" "$_wg_out"
+        return
+      fi
+      rm -f "$_wg_out.tmp"
+      echo "  warning: $_wg_extra is not valid JSON — writing gateway only" >&2
+    else
+      echo "  warning: $_wg_extra present but jq is not installed — extra MCP servers NOT merged (install jq)" >&2
+    fi
+  fi
+  _plain_gateway_json "$2" "$_wg_out"
 }
 
 # Normalise a server reference: add docker:// scheme to bare image refs.
@@ -308,8 +335,9 @@ cmd_new() {
     _write_gateway_json "$profile" "$name"
     echo "Created profile '$name' at $profile (Docker MCP mode)"
     echo "  Docker MCP profile: $name"
-    echo "  Add servers:   claudio mcp $name add <image-or-ref>"
-    echo "  Import a store: claudio mcp catalog <oci-ref>"
+    echo "  Add servers:    claudio mcp $name add <image-or-ref>"
+    echo "  Import a store:  claudio mcp catalog <oci-ref>"
+    echo "  Non-Docker MCPs: claudio mcp $name extra   (e.g. remote HTTP servers)"
   else
     echo "Created profile '$name' at $profile (manual MCP mode — Docker MCP Toolkit unavailable)"
   fi
@@ -332,8 +360,9 @@ cmd_edit() {
     id="$(_docker_id "$profile")"
     echo "Profile '$1' uses the Docker MCP Toolkit (docker profile: $id)."
     echo "Its .mcp.json is generated — manage servers with:"
-    echo "  claudio mcp $1 add <ref>     add a server"
-    echo "  claudio mcp $1 rm <name>     remove a server"
+    echo "  claudio mcp $1 add <ref>     add a Docker server"
+    echo "  claudio mcp $1 rm <name>     remove a Docker server"
+    echo "  claudio mcp $1 extra         edit non-Docker MCPs (remote HTTP, etc.)"
     echo "  claudio mcp $1               show servers"
     _docker_ok && _dmcp profile show "$id" 2>/dev/null
     return 0
@@ -362,6 +391,7 @@ cmd_show() {
   echo "Path:    $profile"
   if _mcp_is_docker "$profile"; then
     echo "MCP:     Docker MCP Toolkit (docker profile: $(_docker_id "$profile"))"
+    [ -f "$profile/mcp.extra.json" ] && echo "         + extras from mcp.extra.json"
   else
     echo "MCP:     manual (.mcp.json)"
   fi
@@ -452,6 +482,23 @@ cmd_mcp() {
   case "$action" in
     show|ls)
       _dmcp profile show "$id"
+      if [ -f "$PROFILE_PATH/mcp.extra.json" ]; then
+        echo ""
+        echo "extra (non-Docker) servers — $PROFILE_PATH/mcp.extra.json:"
+        if command -v jq >/dev/null 2>&1; then
+          jq -r '.mcpServers | keys[] | "  - " + .' "$PROFILE_PATH/mcp.extra.json" 2>/dev/null
+        else
+          sed 's/^/  /' "$PROFILE_PATH/mcp.extra.json"
+        fi
+      fi
+      ;;
+    extra)
+      extra_file="$PROFILE_PATH/mcp.extra.json"
+      [ -f "$extra_file" ] || printf '{\n  "mcpServers": {}\n}\n' > "$extra_file"
+      ${EDITOR:-vim} "$extra_file"
+      # Regenerate mcp.json so active symlinks pick up the change immediately.
+      _write_gateway_json "$PROFILE_PATH" "$id"
+      echo "Updated extras for '$pname' (regenerated mcp.json)."
       ;;
     add)
       [ $# -eq 0 ] && { echo "Usage: claudio mcp $pname add <image-or-ref>..." >&2; exit 1; }
@@ -467,7 +514,7 @@ cmd_mcp() {
       ;;
     *)
       echo "Unknown mcp action: $action" >&2
-      echo "Valid: add, rm, show, config; or: claudio mcp catalog <oci-ref>" >&2
+      echo "Valid: add, rm, show, extra, config; or: claudio mcp catalog <oci-ref>" >&2
       exit 1
       ;;
   esac
