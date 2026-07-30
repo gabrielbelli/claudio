@@ -518,6 +518,51 @@ out=$(run edit test-profile mcp 2>&1)
 assert_contains "edit mcp (docker) prints helper hint" "$out" "claudio mcp test-profile add"
 
 # ============================================================
+printf "\n\033[1m=== mcp extras (mixed mode: Docker + non-Docker) ===\033[0m\n"
+# ============================================================
+
+run new mixed-profile > /dev/null 2>&1
+
+if command -v jq > /dev/null 2>&1; then
+  # A remote HTTP server that Docker isn't fit for
+  cat > "$PROFILES/mixed-profile/mcp.extra.json" <<'JSON'
+{
+  "mcpServers": {
+    "netdata-remote": {
+      "type": "http",
+      "url": "http://example.com:19999/mcp",
+      "headers": { "Authorization": "Bearer ${KEY}" }
+    }
+  }
+}
+JSON
+
+  # `mcp <profile> extra` regenerates mcp.json, merging gateway + extras
+  run mcp mixed-profile extra > /dev/null 2>&1
+  merged=$(cat "$PROFILES/mixed-profile/mcp.json")
+  assert_contains "extras: gateway entry still present" "$merged" "MCP_DOCKER"
+  assert_contains "extras: remote server merged in" "$merged" "netdata-remote"
+  assert_contains "extras: remote url merged" "$merged" "example.com"
+
+  # `use` regenerates the merged file into the active .mcp.json
+  cd "$WORKDIR"
+  rm -rf .claude .mcp.json .claudio CLAUDE.md CLAUDE.local.md
+  run use mixed-profile > /dev/null 2>&1
+  active_mcp=$(cat .mcp.json)
+  assert_contains "extras: active .mcp.json has gateway" "$active_mcp" "MCP_DOCKER"
+  assert_contains "extras: active .mcp.json has remote server" "$active_mcp" "netdata-remote"
+  run clean > /dev/null 2>&1
+
+  # show reflects extras
+  out=$(run show mixed-profile)
+  assert_contains "show notes extras" "$out" "mcp.extra.json"
+  out=$(run mcp mixed-profile show 2>&1)
+  assert_contains "mcp show lists extra server" "$out" "netdata-remote"
+else
+  printf "  (skipped — jq not installed)\n"
+fi
+
+# ============================================================
 printf "\n\033[1m=== error handling ===\033[0m\n"
 # ============================================================
 
