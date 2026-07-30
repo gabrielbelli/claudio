@@ -1,1 +1,6 @@
 .claudio
+
+# Active-profile artefacts (created by claudio when a profile is live-linked here)
+.claude/
+.mcp.json
+CLAUDE.local.md
