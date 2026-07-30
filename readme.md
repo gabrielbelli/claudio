@@ -45,6 +45,8 @@ generated .mcp.json:
 
 Edit extras with `claudio mcp <name> extra` (regenerates `.mcp.json` so active links update). Merging uses `jq` — only needed when a profile actually has extras.
 
+> **Why extras rather than Docker for these?** The Docker MCP Toolkit can't yet add arbitrary remote/custom MCP servers (http/sse/ssh) by URL — you'd hand-author a catalog entry per server, and a generic shape can't be fanned across N targets (a catalog entry maps to one named server; re-adding just replaces it). That gap is tracked upstream in [docker/mcp-gateway#139](https://github.com/docker/mcp-gateway/issues/139), where the fan-out use cases and a couple of proposed shapes have been added. Until it lands, `mcp.extra.json` is the pragmatic route.
+
 Prefer the old hand-written `.mcp.json` for the whole profile? Create it with `claudio new <name> --manual`.
 
 ## Configuration
