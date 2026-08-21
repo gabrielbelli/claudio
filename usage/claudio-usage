@@ -1,0 +1,736 @@
+#!/usr/bin/env python3
+"""claudio usage - record what this machine sent, and what the plan says.
+
+Standard library only.  Two streams are recorded and neither is interpreted
+here: Claude Code's OTLP per-request export (tokens and metadata, tagged by
+claudio) and the plan percentages the status line sees.
+
+NOTHING IS ATTRIBUTED LOCALLY.  The plan percentage belongs to the account,
+not to this machine, and no local process can see the whole account: two
+machines each observe the same 5% -> 7% move and each claim the full 2pp, and
+browser, desktop and phone sessions are invisible from here.  Attribution needs
+every machine's requests reconciled against a closed window, with a check for
+percentage that moved while nobody was watching.  That is the server's job.
+"""
+
+import argparse
+import json
+import os
+import re
+import sys
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from cu import (collector, config, ingest, ledger,  # noqa: E402,F401
+                otlp, samples, tail)
+
+_REL = re.compile(r"^(\d+)([smhdw])$")
+_UNIT = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
+
+
+def parse_time(value, now=None):
+    """ISO-8601, a bare epoch, or a relative offset like `24h` / `7d`."""
+    if value is None:
+        return None
+    now = now if now is not None else time.time()
+    v = value.strip()
+    m = _REL.match(v)
+    if m:
+        return now - int(m.group(1)) * _UNIT[m.group(2)]
+    try:
+        return float(v)
+    except ValueError:
+        pass
+    import datetime
+    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+        try:
+            dt = datetime.datetime.strptime(v, fmt).replace(
+                tzinfo=datetime.timezone.utc)
+            return dt.timestamp()
+        except ValueError:
+            continue
+    raise SystemExit("cannot parse time: %r (use ISO-8601, epoch, or 24h/7d)" % value)
+
+
+# ---------------------------------------------------------------- ingest ----
+
+# Ingest itself lives in `cu/ingest.py` and is imported, not copied -- moved
+# there the moment a second caller needed it, exactly as `file_identity` /
+# `start_offset` were moved into `cu/tail.py` when the shipper needed the same
+# resume.  That second caller is the receiver's watchdog, and until it existed
+# NOTHING on any automatic path ingested at all: the receiver wrote `raw/`,
+# the shipper read `ledger.jsonl`, and the step between them ran only when
+# somebody typed it.  Re-exported under their old names so every existing
+# caller -- and every existing test -- is unchanged.
+file_identity = tail.file_identity
+start_offset = tail.start_offset
+ingest_lock = ingest.ingest_lock
+do_ingest = ingest.do_ingest
+_ingest_locked = ingest._ingest_locked
+_report_ingest = ingest._report_ingest
+
+
+def _offsets_path(cfg):
+    return tail.offsets_path(cfg)
+
+
+def load_offsets(cfg):
+    return tail.load_offsets(cfg)
+
+
+def save_offsets(cfg, offsets):
+    return tail.save_offsets(cfg, offsets)
+
+
+def _lock_path(cfg):
+    return ingest.lock_path(cfg)
+
+
+# ----------------------------------------------------------------- show ----
+
+def do_show(cfg, args):
+    """What this machine sent.  Nothing is attributed to plan movement.
+
+    There used to be a `report` here that split each interval's plan movement
+    across the requests inside it.  It is gone, and deliberately so: the plan
+    percentage is a property of the *account*, not of this machine, and no
+    local process can see the whole account.
+
+    Two machines on one account each observe the same 5% -> 7% move and each
+    attribute the full 2pp to their own traffic; summed, that is 4pp of a 2pp
+    move, and neither is wrong locally.  The same defect one step earlier is
+    the missing baseline: the first observation after any gap has nothing
+    before it, so its movement lands on whatever request happened to be near.
+    Browser sessions, the desktop app, a phone and any un-instrumented machine
+    are all invisible from here.
+
+    Attribution needs the macro view -- every machine's requests and the whole
+    window's movement, reconciled after the window closes, with a plausibility
+    check for percentage that moved while nobody was looking.  That belongs on
+    the central server.  Until it exists this prints facts and no inference: a
+    number labelled "estimate" still gets quoted as fact.
+    """
+    # THREE EMPTY ANSWERS, NOT ONE.  `--since` used to be applied before the
+    # emptiness test, so a filter that eliminated every row printed "No
+    # requests recorded yet." over a full ledger -- a false sentence, and the
+    # cardinal sin of this project: a plausible empty result.  The server half
+    # treats exactly this as a first-class rule (`no-data` vs
+    # `filtered-to-nothing`, with the clause that did it named); the rule was
+    # written for the client and was missing from it.
+    #
+    # So emptiness is tested twice, and the second test names the clause AND
+    # its value, because "your filter removed everything" with no filter quoted
+    # sends the reader looking for the wrong one.
+    rows = list(ledger.read(cfg.ledger))
+    if not rows:
+        print("No requests recorded yet.")
+        return 0
+    if args.since is not None:
+        kept = [r for r in rows if r.get("ts", 0) >= args.since]
+        if not kept:
+            print("%d request(s) are recorded and --since %s eliminated all of "
+                  "them." % (len(rows), _since_text(args)))
+            print("The ledger is not empty; widen or drop --since.")
+            return 0
+        rows = kept
+
+    key = args.by
+    # A THIRD ANSWER for a key nothing carries.  Arbitrary keys stay legal --
+    # a user's own `claudio --tag` label is a legitimate axis and it is the one
+    # they went to the trouble of inventing -- but `--by nonsense` used to
+    # render a confident table with one `(none)` bucket holding every row, and
+    # `--by profile` over rows that carry no profile renders EXACTLY the same
+    # thing.  A typo and a real column with absent values were byte-identical
+    # output, which is the whole objection: the third answer wearing the
+    # second one's face.
+    #
+    # Absent-everywhere is what is refused, not unknown-to-a-list: if one row
+    # carries the key, the table is about something and is printed.
+    if not any(key in r or key in (r.get("tags") or {}) for r in rows):
+        avail = set()
+        for r in rows:
+            avail.update(k for k, v in r.items()
+                         if k != "tags" and not isinstance(v, (dict, list)))
+            avail.update((r.get("tags") or {}))
+        print("No row carries %r, as a column or as a --tag key, so there is "
+              "nothing to group by." % key)
+        print("Available here: %s" % (", ".join(sorted(avail)) or "(nothing)"))
+        return 1
+
+    buckets = {}
+    for r in rows:
+        k = r.get(key) or (r.get("tags") or {}).get(key) or "(none)"
+        b = buckets.setdefault(k, {"n": 0, "cost": 0.0, "in": 0, "out": 0,
+                                   "cr": 0, "cw": 0})
+        b["n"] += 1
+        b["cost"] += r.get("cost_usd_reported") or 0.0
+        b["in"] += r.get("input_tokens") or 0
+        b["out"] += r.get("output_tokens") or 0
+        b["cr"] += r.get("cache_read_tokens") or 0
+        b["cw"] += r.get("cache_creation_tokens") or 0
+
+    print("Requests this machine sent, by %s\n" % key)
+    print("  %-22s %8s %10s %9s %9s %10s %10s"
+          % (key, "requests", "list $", "in", "out", "cache_rd", "cache_wr"))
+    for k in sorted(buckets, key=lambda x: -buckets[x]["cost"]):
+        b = buckets[k]
+        print("  %-22s %8d %10.4f %9d %9d %10d %10d"
+              % (k[:22], b["n"], b["cost"], b["in"], b["out"], b["cr"], b["cw"]))
+
+    # Overhead is a property of the single request -- `query_source` is on the
+    # record -- so it survives in a recorder.  It is counted and named, never
+    # filtered out from under a total: excluding it used to reweight the
+    # survivors' share of plan movement, and there is no share any more.
+    over = [r for r in rows if r.get("query_source") in config.OVERHEAD_SOURCES]
+    work = sorted({r.get("query_source") for r in rows
+                   if r.get("query_source") not in config.OVERHEAD_SOURCES}
+                  - {None})
+    # Name the sources these rows actually contain, not the whole deny-list:
+    # printing both constants beside a count only one of them produced reads
+    # as evidence of a request that was never made.
+    seen = sorted(s for s in {r.get("query_source") for r in over} if s)
+    print("\n  %d of %d request(s), $%.4f, were Claude Code's own overhead%s."
+          % (len(over), len(rows), sum(r.get("cost_usd_reported") or 0.0
+                                       for r in over),
+             (" (%s)" % ", ".join(seen)) if seen else ""))
+    print("  counted as your work: %s" % (", ".join(work) or "(none)"))
+
+    obs = list(samples.read(cfg.samples))
+    print("  %d plan observation(s) recorded, unattributed." % len(obs))
+    print("\n  `list $` is Claude Code's own cost_usd at API list rates.  On a Pro")
+    print("  or Max plan you are not charged it -- it is a relative size, not a")
+    print("  bill.  Plan percentages are recorded for the server to attribute")
+    print("  once it can see every machine on the account.")
+    return 0
+
+
+def _since_text(args):
+    """What the user typed for --since, not the float it parsed into.
+
+    `parse_time` runs in argparse's `type=`, so by the time `do_show` sees it
+    the string is gone.  Quoting `1787258397.0` back at somebody who typed
+    `1h` names a bound they did not write.
+    """
+    raw = getattr(args, "since_raw", None)
+    if raw:
+        return raw
+    return "%d" % args.since
+
+
+def claudio_path():
+    """The claudio to ask, and it is not necessarily the one on $PATH.
+
+    `claudio usage` execs this program after resolving itself through
+    `_tool_path`'s three layouts, and it exports `CLAUDIO_SELF` on the way --
+    the resolved path of the claudio that is actually running.  Asking a bare
+    name instead asked whichever claudio is first on $PATH, which on a
+    developer's machine is a different build reading a different config:
+    reproduced as `./claudio statusline` reporting `Recording plan usage: on
+    (logging=local)` while `./usage/claudio-usage doctor`, run from the same
+    checkout in the same environment, printed `WARN recording is OFF -- claudio
+    reports nothing configured at all; add logging=local to <conf>` and named
+    the very file that already contained that line.
+
+    The fallback is the bare name, which is right for the one case that has no
+    parent to inherit from: running `usage/claudio-usage` directly.
+    """
+    return os.environ.get("CLAUDIO_SELF") or "claudio"
+
+
+def _claudio(*args):
+    """`claudio <args>` as (stdout, stderr, rc), or None when it cannot be run.
+
+    None means claudio is absent or hung; a non-zero rc means it ran and
+    refused, which is a different answer and gets a different message.
+    """
+    import subprocess
+    try:
+        p = subprocess.run([claudio_path()] + list(args), capture_output=True,
+                           text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return p.stdout, p.stderr, p.returncode
+
+
+def _claudio_otel(cfg):
+    """(ok-or-None, detail) for stream A's export, from claudio itself.
+
+    `doctor` used to close by *printing the instruction* -- "claudio must
+    export otel=1 with OTEL_EXPORTER_OTLP_ENDPOINT=...; check with `claudio env
+    | grep OTEL`" -- which is a check the user then has to run and interpret.
+    Every other line here is a verdict; this one was homework.  `claudio env`
+    launches nothing and costs no session, so ask it and report the answer.
+
+    It is read in the *current directory*, which is the right scope: `otel=`
+    layers global -> profile -> project, so the answer genuinely differs
+    between directories and the one you are standing in is the one you can act
+    on.
+
+    The **protocol** is checked as well as the endpoint, and that is
+    load-bearing even now that the defaults agree.  claudio defaults to
+    `http/json` on 4318, which is what this receiver speaks -- but either key
+    can be set by hand in any of three config layers, and an export aimed at a
+    port nothing listens on, or in a framing nothing can decode, fails
+    **quietly**: Claude Code's exporter is silent by design.  So a mismatch has
+    to be a verdict here, not a surprise six sessions later.
+    """
+    got = _claudio("env")
+    if got is None:
+        return None, "claudio not on PATH"
+    out, err, rc = got
+    if rc != 0:
+        return False, ("claudio env failed here: %s"
+                       % (" ".join(err.split()) or "exit %d" % rc))
+    ep = proto = None
+    for ln in out.splitlines():
+        k, _, v = ln.partition("export ")[2].partition("=")
+        if k == "OTEL_EXPORTER_OTLP_ENDPOINT":
+            ep = v.strip().strip('"')
+        elif k == "OTEL_EXPORTER_OTLP_PROTOCOL":
+            proto = v.strip().strip('"')
+    if ep is None:
+        return False, ("no OTEL_EXPORTER_OTLP_ENDPOINT here -- add "
+                       "logging=local to %s" % config.conf_display())
+    if ep.rstrip("/") != cfg["endpoint"].rstrip("/"):
+        return False, ("claudio exports %s but the receiver listens on %s -- "
+                       "set otel_endpoint=%s in %s"
+                       % (ep, cfg["endpoint"], cfg["endpoint"],
+                          config.conf_display()))
+    if proto and proto != "http/json":
+        return False, ("claudio exports otel_protocol=%s; this receiver speaks "
+                       "OTLP/HTTP JSON only -- set otel_protocol=http/json in "
+                       "%s" % (proto, config.conf_display()))
+    return True, ("claudio exports OTEL_EXPORTER_OTLP_ENDPOINT=%s (%s)"
+                  % (ep, proto or "http/json"))
+
+
+def _claudio_recording():
+    """(state, why): True, False, or None when claudio cannot be ASKED.
+
+    `claudio statusline` prints "Recording plan usage: on|off".  Asking the
+    owner beats re-deriving its config layering here, which includes a
+    per-account inversion we would get subtly wrong.
+
+    FOUR answers, and two of them used to wear a third one's face.  On a
+    machine with nothing configured yet -- the exact state of every fresh
+    install -- `claudio statusline` prints "No status line configured", exits 1
+    and never reaches its recording line, because there is genuinely nothing
+    set up.  This returned a bare `None` for that, and `doctor` rendered it as
+    `WARN recording: claudio not on PATH`: a confident diagnosis of a problem
+    the user does not have, printed by the one command whose job is to say what
+    is wrong, at the one moment they are most likely to run it.  It sends them
+    to fix their `$PATH` while the actual remedy is one config line.
+
+    So the reason travels with the state.  The "nothing configured" case is
+    reported as recording OFF and named from claudio's OWN words rather than
+    inferred from the absence of a line -- an inference across two programs is
+    how the wrong reason got here in the first place.  A claudio that WAS found
+    and exited non-zero is the fourth answer and quotes its own stderr: saying
+    it "ran but reported no recording state" would be the same invented cause
+    one step milder, because it asserts the process succeeded.
+
+    All four are stubbed as real `claudio` scripts on `$PATH` in the suite,
+    which is the only way to hold them still on one machine.
+    """
+    got = _claudio("statusline")
+    if got is None:
+        return None, "claudio is not on PATH, so it could not be asked"
+    out, err, _rc = got
+    both = out + "\n" + err
+    for ln in both.splitlines():
+        if ln.lower().startswith("recording plan usage:"):
+            said = ln.split(":", 1)[1].strip()      # "on (logging=local)"
+            return "on" in said.lower(), said
+    if "no status line configured" in both.lower():
+        return False, ("OFF -- claudio reports nothing configured at all; add "
+                       "logging=local to %s" % config.conf_display())
+    if _rc != 0:
+        # It was found and it did not work: a broken install, a broken shebang,
+        # a claudio too old to have this verb. Quote what it said rather than
+        # inventing a cause -- "not on PATH" was exactly that mistake, and
+        # "reported no recording state" would be the same mistake one step
+        # milder, since it implies claudio ran successfully.
+        return None, ("`claudio statusline` exited %d: %s"
+                      % (_rc, " ".join(err.split())[:160] or "no output"))
+    return None, ("claudio ran but reported no recording state; "
+                  "check `claudio statusline` by hand")
+
+
+# The pre-rename data directory.  `~/.claude-usage` became `~/.claudio-usage`
+# in the same pass that folded these tools into claudio as subcommands, and
+# nothing looked at the old path: a machine that had been recording for months
+# and had not pinned `usage_dir=` got a fresh empty directory, and then `show`
+# printed "No requests recorded yet." and `doctor` printed `WARN plan samples:
+# 0` and `WARN ledger rows: 0` -- byte-identical to a machine that never
+# recorded anything.  Two states, one message, and the message asserts the
+# false one.
+#
+# Nothing is moved automatically: this is somebody's data and a `mv` decided by
+# a diagnostic command is the wrong shape.  It is NAMED, which is the whole
+# difference between an empty reader and an explained one.
+LEGACY_DATA_DIR = ".claude-usage"
+
+
+def _has_data(d):
+    for name in ("ledger.jsonl", "samples.jsonl"):
+        try:
+            if os.path.getsize(os.path.join(d, name)) > 0:
+                return True
+        except OSError:
+            pass
+    return False
+
+
+def _predecessor_dir(cfg):
+    """`~/.claude-usage`, when it holds records and this directory does not.
+
+    Both conditions matter.  A machine that has already been migrated has data
+    in the new place, and warning it about the old one would be noise; a
+    machine that never used the old name has no such directory at all.
+    """
+    home = os.path.expanduser("~")
+    if os.path.abspath(cfg.dir) != os.path.join(home, ".claudio-usage"):
+        return None                 # usage_dir= names somewhere deliberate
+    old = os.path.join(home, LEGACY_DATA_DIR)
+    if not os.path.isdir(old) or _has_data(cfg.dir) or not _has_data(old):
+        return None
+    return old
+
+
+def _sample_count(cfg):
+    try:
+        with open(cfg.samples, "r", encoding="utf-8", errors="replace") as fh:
+            return sum(1 for l in fh if l.strip().startswith("{"))
+    except OSError:
+        return 0
+
+
+def _receiver_state(cfg):
+    """(verdict, detail) for the receiver process itself.
+
+    Absent is **not** a fault: the receiver is spawned on demand and exits by
+    itself after an idle half hour, so "not running" is the normal state of a
+    machine nobody is using.  What would be a fault is not being able to run it
+    at all, or a `recv.err` left behind by a start that failed -- that file is
+    the whole reason a failed spawn is not silent.  (A fault a *running*
+    receiver reported goes to `recv.warn`, which is printed but is not a
+    verdict on the process: it was up when it wrote it.)
+    """
+    if not collector.available():
+        return False, collector.receiver_missing()
+    got = collector.running(cfg)
+    if got:
+        # `verify_running` asks the process for the token in its own pidfile.
+        # A `kill -0` alone answers "alive" for a recycled pid, and reporting a
+        # stranger's process as the receiver is worse than reporting nothing.
+        ok = collector.verify_running(cfg)
+        if ok is False:
+            return False, ("pid %d is alive but is not the receiver (its "
+                           "pidfile is stale) -- delete %s"
+                           % (got["pid"], cfg.recv_pid))
+        return True, ("receiver running: pid %d on 127.0.0.1:%s%s"
+                      % (got["pid"], got["port"],
+                         "" if ok else " (not answering /healthz)"))
+    return True, ("receiver not running (spawned on demand by `claudio run`; "
+                  "it exits after %s idle minutes)" % cfg["idle_minutes"])
+
+
+def do_doctor(cfg):
+    ok = True
+
+    def line(good, text):
+        """Print a verdict.  A WARN *is* a failure -- there is no third state.
+
+        Every line here was already a verdict, but only some of them set the
+        exit status, so `doctor` printed `WARN ledger rows: 0` and exited 0.
+        A warning nobody's script can see is a warning nobody acts on, and it
+        trains the reader to skim past the ones that matter.  Anything that is
+        genuinely informational is printed with `line(True, ...)`.
+        """
+        nonlocal ok
+        if not good:
+            ok = False
+        print("%s %s" % ("ok  " if good else "WARN", text))
+
+    print("data root: %s" % cfg.dir)
+    # WHICH claudio, beside WHERE the data is.  Two of the verdicts below are
+    # claudio's own answers, read out of a subprocess, so an answer that is
+    # attributable to no particular binary is an answer nobody can check --
+    # and the fallback below (a bare name, resolved through $PATH) is exactly
+    # the case where it might not be the one the reader thinks.
+    _cp = claudio_path()
+    print("asking claudio: %s%s"
+          % (_cp, "" if _cp != "claudio" else " (first on $PATH)"))
+    # Named BEFORE every verdict below it, because it is the cause of most of
+    # them: two zeroes with no explanation is what this line exists to replace.
+    _old = _predecessor_dir(cfg)
+    if _old:
+        line(False, "this directory is empty and %s is not -- claudio's data "
+                    "directory was renamed. Move it:  mv %s %s   (or keep the "
+                    "old path with usage_dir=%s in %s)"
+                    % (_old, _old, cfg.dir, _old, config.conf_display()))
+
+    # Recording is claudio's to enable, not ours: the status-line shim lives in
+    # claudio and reads `logging=` from ~/.claudio/claudio.conf.  This used to
+    # check our own `record=` key, which gated a second recorder in this repo
+    # -- so it reported OFF while samples were arriving through the shim.  Both
+    # that key and that recorder are deleted.  Ask the tool that owns the
+    # decision; fall back to the evidence (are samples being written?) rather
+    # than to a key we control.
+    rec, why = _claudio_recording()
+    if rec is None:
+        # Cannot be asked is not the same answer as off, so fall back to the
+        # evidence -- are samples being written? -- and say which question was
+        # actually answered.
+        n = _sample_count(cfg)
+        line(n > 0, "recording: %s; %d sample(s) present" % (why, n))
+    else:
+        line(rec, "recording is %s" % why)
+
+    line(*_receiver_state(cfg))
+
+    # `recv.err` is the receiver's own account of why it could not START, and
+    # printing it here is half of what makes a failed spawn non-silent (the
+    # other half is `claudio run` printing it).  It is cleared by the next
+    # successful bind, so a stale one is at most one receiver-lifetime old.
+    #
+    # `recv.warn` is the same shape for a receiver that was up: an undecodable
+    # body, a write that failed.  Two files rather than one because claudio's
+    # supervisor stands down while `recv.err` exists, so a running receiver
+    # writing there disarmed the respawn -- and because this used to report a
+    # perfectly healthy receiver as one that "could not start".
+    err = collector.read_error(cfg)
+    if err:
+        line(False, "recv.err (start): %s" % err)
+    warn = collector.read_warning(cfg)
+    if warn:
+        line(False, "recv.warn (while running): %s" % warn)
+
+    # The shipper's pair, the same shape and here for the same reason: half of
+    # what makes a non-delivery non-silent is `claudio run` printing it, and
+    # the other half is the command whose entire job is to answer "is this
+    # working".  `ship.err` means nothing was delivered and the offsets are
+    # unchanged, so it is a retry; `ship.warn` means delivery worked and some
+    # rows can never be placed against an account.  Both fail the exit status,
+    # because a WARN that does not is what `doctor` was fixed for.
+    serr = collector.read_ship_error(cfg)
+    if serr:
+        line(False, "ship.err (nothing delivered): %s" % serr)
+    swarn = collector.read_ship_warning(cfg)
+    if swarn:
+        line(False, "ship.warn (delivered, unplaceable rows): %s" % swarn)
+
+    st = collector.status(cfg)
+    line(True, "capture: raw %d bytes, %d live session(s)"
+         % (st["raw_bytes"], st["sessions"]))
+
+    # The counters are the only artefact on this machine that can tell
+    # "nothing arrived" from "everything was dropped", and they are read live
+    # off /healthz when the receiver is up and out of the last snapshot when it
+    # is not -- which, for a process that leaves after half an idle hour, is
+    # most of the time anyone runs `doctor`.
+    counters = collector.read_counters(cfg)
+    line(counters is not None, "counters: %s"
+         % collector.reconcile_text(counters))
+
+    n_s = sum(1 for _ in samples.read(cfg.samples))
+    line(n_s > 0, "plan samples: %d" % n_s)
+
+    lstats = {}
+    rows = list(ledger.read(cfg.ledger, lstats))
+    line(len(rows) > 0, "ledger rows: %d" % len(rows))
+
+    # The two numbers that used to sit three lines apart in this very function
+    # with nothing comparing them: `ok counters: records: 6000 accepted -> 6000
+    # written; events: api_request 6000` directly above `ok ledger rows: 1900`,
+    # exit 0.  4100 records had been rotated out of `raw/` before anything
+    # ingested them, and every check on the screen was green.  The door's count
+    # is per receiver LIFETIME and the ledger is cumulative, so the ledger is
+    # normally the larger of the two -- which is exactly what makes the other
+    # direction worth a WARN.
+    at_door = ((counters or {}).get("events") or {}).get(otlp.EVENT_NAME)
+    if isinstance(at_door, int) and at_door > len(rows):
+        line(False, "%d %s record(s) reached the door and the ledger holds %d "
+                    "row(s) -- %d have not become rows. Run `claudio usage "
+                    "ingest`; if that does not close the gap they were rotated "
+                    "out of raw/ before anything read them. (A retried export "
+                    "can also collapse: two identical records dedupe to one "
+                    "row.)" % (at_door, otlp.EVENT_NAME, len(rows),
+                               at_door - len(rows)))
+    # Duplicates are repaired on read; the file itself is still doubled, and
+    # anything reading it with other tooling still sees both copies.
+    if lstats.get("duplicates"):
+        line(False, "ledger duplicates: %d row(s) are a second copy of a row "
+                    "already present -- suppressed on read, still on disk "
+                    "(two ingests ran concurrently before the lock existed)"
+                    % lstats["duplicates"])
+    # Collisions are not repairable and not housekeeping: two different
+    # requests hashed to one id, so the second is dropped and its tokens are
+    # missing from every total.
+    if lstats.get("collisions"):
+        line(False, "ledger collisions: %d row(s) share a request_id with a "
+                    "DIFFERENT request and are being suppressed -- those "
+                    "records are lost from every total" % lstats["collisions"])
+    if lstats.get("malformed"):
+        line(False, "ledger: %d unparseable line(s)" % lstats["malformed"])
+
+    accts = samples.accounts(list(samples.read(cfg.samples)))
+    line(True, "accounts seen: %d (%s)"
+         % (len(accts), ", ".join(str(a) for a in accts.values()) or "none"))
+    if len(accts) > 1:
+        line(True, "multiple accounts: claudio `email=` tags say which rows "
+                   "belong to which")
+
+    nocost = [r for r in rows if r.get("cost_usd_reported") is None]
+    # There is no local rate table any more, so "are all models priced" is not
+    # a question we can or should answer. What matters is whether Claude Code
+    # gave us a cost, because a row without one records none.
+    line(not nocost, "cost on every row: %s"
+         % ("yes" if not nocost
+            else "%d of %d row(s) carry no cost_usd" % (len(nocost), len(rows))))
+
+    # A running receiver's span is open, not unclean: `up_spans` cannot tell
+    # the two apart (it never asks about the process), so the trailing span is
+    # excluded while it is up.  Without this, starting the receiver immediately
+    # made `doctor` warn about a failed shutdown that had not happened, and it
+    # kept warning for as long as it ran.
+    spans = collector.up_spans(cfg)
+    live = st["state"] == "running" and bool(spans) and not spans[-1][2]
+    unclean = [s for s in (spans[:-1] if live else spans) if not s[2]]
+    line(not unclean, "uptime ledger: %d span%s, %d unclean%s"
+         % (len(spans), "" if len(spans) == 1 else "s", len(unclean),
+            " (the last is open: the receiver is running now)" if live else ""))
+
+    # `None` is "claudio could not be asked", which is not the same answer as
+    # "claudio is misconfigured" and must not be reported as one.
+    otel_ok, detail = _claudio_otel(cfg)
+    line(otel_ok is not False, "stream A export: %s" % detail)
+
+    return 0 if ok else 1
+
+
+def do_install(cfg):
+    """Optional.  Nothing here has to be installed; this prints the setup.
+
+    There is no collector.yaml to write any more and no image to pull: the
+    receiver is a file in this repo, spawned on demand.  What no command here
+    can do for you is edit claudio's config, so that is what this prints.  The
+    protocol and endpoint lines are claudio's own defaults now and are printed
+    as a statement of what will happen rather than as a correction; they are
+    still printed, because either can be overridden in three config layers and
+    an export aimed at the wrong port is lost in silence.
+    """
+    cfg.ensure_dirs()
+    if not os.path.exists(cfg.path):
+        with open(cfg.path, "w", encoding="utf-8") as fh:
+            fh.write("# claudio usage configuration.  Every key has a working\n"
+                     "# default; this file exists only for overrides.\n"
+                     "endpoint=%s\n" % cfg["endpoint"])
+        print("wrote %s" % cfg.path)
+    print("data root: %s" % cfg.dir)
+    print("\nAdd to %s:" % config.conf_display())
+    print("    logging=local                # BOTH streams: per-request export")
+    print("                                 # and the plan percentages")
+    print("    otel_protocol=http/json      # claudio's default; here for the record")
+    print("    otel_endpoint=%s   # claudio's default; here for the record"
+          % cfg["endpoint"])
+    print("\nThen just use claude: `claudio run` starts the receiver itself.")
+    print("`claudio usage collect start` runs one by hand; `doctor` checks the lot.")
+    return 0
+
+
+# ------------------------------------------------------------------- main ----
+
+def main(argv=None):
+    # Raw, because this description is three paragraphs and argparse's
+    # default formatter reflows them into one wall with the blank lines
+    # taken out.  The middle paragraph is the honesty claim the whole
+    # program rests on; running it into the other two is how it stops
+    # being read.
+    p = argparse.ArgumentParser(
+        prog="claudio usage", description=__doc__.strip(),
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd")
+
+    c = sub.add_parser("collect", help="start/stop the on-demand receiver by hand")
+    c.add_argument("action", choices=["start", "stop", "status"],
+                   help="start: spawn one in the background; stop: shut it "
+                        "down and ingest what it captured; status: where it "
+                        "is, what it has and how much")
+
+    ing = sub.add_parser("ingest", help="normalise the receiver's capture into the ledger")
+    ing.add_argument("--from-zero", action="store_true",
+                     help="ignore stored byte offsets and re-read every raw "
+                          "file from the start; safe at any time because rows "
+                          "dedupe on content")
+
+    r = sub.add_parser("show", help="what this machine sent (no attribution)")
+    r.add_argument("--since", type=parse_time, metavar="WHEN",
+                   help="ISO-8601, a bare epoch, or a relative offset like "
+                        "24h / 7d; only requests at or after this time")
+    # Not a fixed `choices` list: a user's own `claudio --tag` label is a
+    # legitimate axis, and it is the axis they went to the trouble of
+    # inventing.  The half of that argument this comment used to make -- that
+    # an unknown key grouping everything under `(none)` is "visible and
+    # self-explanatory" -- is withdrawn: `--by profile`, the DEFAULT and a
+    # perfectly real column, renders one `(none)` bucket over the same fixture,
+    # so a typo and a real column with absent values were byte-identical
+    # output.  `do_show` refuses on the one condition that separates them, no
+    # row carrying the key at all, and names what is available.  See CLAUDE.md,
+    # which named this behaviour as a defect while this comment defended it.
+    r.add_argument("--by", default="profile", metavar="COLUMN|TAG",
+                   help="prompt_id (one user turn, including every subagent "
+                        "request it spawned), profile, account, model, "
+                        "session_id, query_source, agent_name, host, "
+                        "terminal_type, or any claudio --tag key")
+
+    sub.add_parser("doctor", help="check the setup end to end")
+    sub.add_parser("install", help="print the claudio setup and write a default config")
+
+    argv_seen = list(sys.argv[1:] if argv is None else argv)
+    args = p.parse_args(argv)
+    if not args.cmd:
+        p.print_help()
+        return 1
+    # The literal `--since` the user typed, kept beside the parsed float so a
+    # refusal can quote what they wrote rather than the epoch it became.
+    for i, tok in enumerate(argv_seen):
+        if tok == "--since" and i + 1 < len(argv_seen):
+            args.since_raw = argv_seen[i + 1]
+        elif tok.startswith("--since="):
+            args.since_raw = tok.split("=", 1)[1]
+
+    cfg = config.Config()
+
+    if args.cmd == "collect":
+        if args.action == "start":
+            ok, msg = collector.start(cfg)
+            print(msg)
+            return 0 if ok else 1
+        if args.action == "stop":
+            ok, msg = collector.stop(cfg)
+            print(msg)
+            if ok:
+                do_ingest(cfg)
+            return 0 if ok else 1
+        st = collector.status(cfg)
+        for k in ("state", "pid", "port", "sessions", "raw_bytes", "endpoint",
+                  "spans"):
+            print("%-12s %s" % (k, st[k]))
+        return 0
+
+    if args.cmd == "ingest":
+        do_ingest(cfg, from_zero=args.from_zero)
+        return 0
+    if args.cmd == "show":
+        return do_show(cfg, args)
+    if args.cmd == "doctor":
+        return do_doctor(cfg)
+    if args.cmd == "install":
+        return do_install(cfg)
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

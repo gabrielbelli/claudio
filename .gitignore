@@ -1,6 +1,16 @@
 .claudio
+.claudio.local
 
 # Active-profile artefacts (created by claudio when a profile is live-linked here)
 .claude/
 .mcp.json
 CLAUDE.local.md
+
+# `server/README.md` tells you to build a venv here for DuckDB. It is a
+# 50MB build artefact of a documented command, so it does not belong in
+# `git status` — and a stranger following that command should not have to
+# find that out.
+/env/
+/.venv/
+__pycache__/
+*.pyc

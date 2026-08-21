@@ -1,0 +1,1029 @@
+#!/usr/bin/env python3
+"""The OTLP receiver: stream A's only door onto this machine.
+
+This was a debugging aid -- "is anything coming out at all" -- next to a Docker
+collector that did the real capture.  The container is gone and this is the
+real capture now.  What that promotion demands, and what the rest of this file
+is about, is that a receiver nobody watches must never lose a record quietly.
+
+**Spawned on demand, never installed.**  `claudio run` starts it before
+`exec claude`, the status-line shim keeps it alive, and it exits by itself when
+the work stops.  There is no launchd or systemd unit, for three reasons that
+are settled: the flush argument for a resident daemon was measured false (see
+`cu/collector.py`); stream A does not exist outside claudio-launched sessions,
+because the OTLP variables are written only into the environment of the
+`exec`ed claude, so an always-on service listens to an unplugged wire; and
+`launchctl`/`systemctl` cannot be stubbed in a hermetic test suite, while every
+promise in this repo is pinned by one.
+
+**Why this and not otelcol-contrib.**  The design requires idle self-exit,
+which the collector cannot do without a second watcher process -- the daemon
+coming back in through the side door.  The binary is 93-107MB with no Homebrew
+formula.  Python is already a dependency of `usage/`, and it is testable here.
+otelcol wins the argument back the day remote mTLS and a durable retry queue
+matter; that is a separate decision, made later, on its own evidence.
+
+Protocol: **OTLP/HTTP with a JSON body**, on loopback only.  gRPC is HTTP/2
+framing plus protobuf and `http.server` cannot be talked into it, so Claude
+Code is pointed here with:
+
+    logging=local
+    otel_protocol=http/json      # claudio's default
+    otel_endpoint=http://localhost:4318   # claudio's default
+
+`logging=local` alone is now enough: claudio's defaults *are* these two lines,
+which they were not while it defaulted to the Docker collector's `grpc`.  An
+export aimed at a port nothing listens on fails **quietly** -- by design, in
+Claude Code -- so a default that starts nothing and records nothing was the
+one failure this project exists to prevent, shipped as the feature's normal
+behaviour.  `claudio usage doctor` still checks both values, because anyone may
+have set them by hand.
+
+Four properties carry the design:
+
+  * **Durable before the 200.**  Every accepted payload is appended with
+    O_APPEND and one `write(2)` *before* the response is sent, and a write that
+    fails answers 503 so the client keeps its copy and retries.  Nothing is
+    ever held only in memory, which is what makes the shutdown path irrelevant
+    to data integrity -- the whole basis of an on-demand receiver.
+  * **Verbatim in, counted at the door.**  See `Capture` for why nothing is
+    filtered or allow-listed here.
+  * **Idle exit needs both conditions.**  No records for `idle_minutes` AND no
+    live pid under `<usage_dir>/sessions/`.  Either alone is wrong: a user
+    thinking for 40 minutes mid-task would be orphaned by the timer, and a
+    session file left by a crashed claude would keep the receiver up for ever.
+  * **A crash loop refuses itself.**  A receiver that cannot bind dies
+    instantly, and a supervisor firing several times a second would fork-bomb.
+    Starts that never reached a successful bind are counted in a window; past
+    the cap it writes `recv.err` and exits without binding.  The supervisor
+    carries the cheap half of this cap; this half is the backstop that works
+    even if the supervisor is wrong.
+
+The contract with claudio (POSIX sh, which cannot import any of this) is eight
+paths, all defined in `cu/config.py` so that they are spelled once:
+`recv.pid`, `recv.lock`, `recv.err`, `recv.warn`, `recv.starts`,
+`recv-counters.json`, `sessions/<pid>` and `raw/api_request.jsonl`.
+
+`recv.err` and `recv.warn` are two files because they answer two questions.
+claudio's supervisor spawns when the receiver is dead **and** `recv.err` is
+absent, so that file means "a start fault is already reported, do not chase
+it".  A running receiver's own faults -- an undecodable body, a failed write --
+are neither reported starts nor reasons to stop respawning, and writing them
+into `recv.err` disarmed the supervisor for every later session.
+"""
+
+import argparse
+import datetime
+import gzip
+import json
+import os
+import signal
+import sys
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+# `cu` is imported rather than copied.  This file is one directory below it in
+# the same repo and is never installed anywhere else, and the alternative --
+# a second host_slug, a second uptime writer, a second config reader -- is the
+# duplication that has already cost this project three silently dropped fields.
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+
+from cu import collector, config, ingest, otlp, ship, tail   # noqa: E402
+
+DEFAULT_HOST = "127.0.0.1"
+
+# Requirement, not a default: this receiver holds an unauthenticated firehose of
+# one person's request metadata, including their email address.  `0.0.0.0` would
+# publish it to the network.  There is no flag that reaches it.
+LOOPBACK = ("127.0.0.1", "::1", "localhost")
+
+SIGNALS = {
+    "/v1/logs": "logs",
+    "/v1/metrics": "metrics",
+    "/v1/traces": "traces",
+}
+
+# Cap a single body so a malformed or hostile client cannot exhaust memory.
+MAX_BODY = 32 * 1024 * 1024
+
+# The crash-loop cap and the lock's staleness live in `cu/collector.py` with
+# the files they govern: `collector.MAX_STARTS`, `collector.START_WINDOW`,
+# `collector.LOCK_STALE`.
+
+
+# --------------------------------------------------------------------------
+# counters
+# --------------------------------------------------------------------------
+
+class Counters:
+    """What arrived, what was written, and what nothing downstream will keep.
+
+    This is the replacement for otelcol's `:8888` scrape, and it exists for the
+    same one reason: it is the only artefact on this machine that can tell
+    *nothing arrived* apart from *everything was dropped*.  Every bug this
+    project has had was the second wearing the first's face.
+
+    It answers one question the scrape could not.  `raw/api_request.jsonl` used
+    to be the collector's own **output**, so nothing downstream could ever see
+    what never arrived -- a field deleted by `keep_keys` was invisible in the
+    only file anyone read, and that is how `prompt.id`, every user `--tag` and
+    `agent.name` were each lost in silence.  Counting at the door closes that
+    blind spot structurally: `events` names every distinct `event.name` seen,
+    and `unknown_attributes` names every attribute key that arrived and that
+    the ledger has no column for.  A field nothing keeps is now *countable*,
+    which was the standing requirement.
+    """
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.started_at = time.time()
+        self.last_record_at = self.started_at
+        self.payloads = {"logs": 0, "metrics": 0, "traces": 0}
+        self.dropped = {"metrics": 0, "traces": 0}
+        self.accepted = 0           # log records parsed out of a logs payload
+        self.written = 0            # log records durably on disk
+        self.bytes = 0
+        self.undecodable = 0        # a body we could not parse (protobuf, junk)
+        self.write_failed = 0       # answered 503; the client still holds it
+        self.rejected = 0           # 404/400: not ours, or no body
+        self.events = {}            # {event.name: count}
+        self.unknown_attributes = {}    # {key: count} -- arrived, nothing keeps
+
+    def snapshot(self, extra=None):
+        with self.lock:
+            out = {
+                "version": 1,
+                "started_at": self.started_at,
+                "last_record_at": self.last_record_at,
+                "payloads": dict(self.payloads),
+                "dropped": dict(self.dropped),
+                "accepted": self.accepted,
+                "written": self.written,
+                "bytes": self.bytes,
+                "undecodable": self.undecodable,
+                "write_failed": self.write_failed,
+                "rejected": self.rejected,
+                "events": dict(self.events),
+                "unknown_attributes": dict(self.unknown_attributes),
+            }
+        if extra:
+            out.update(extra)
+        return out
+
+
+def _count_records(counters, payload):
+    """Count one logs payload's records, by event name and by unknown key.
+
+    Returns the number of log records seen.  `otlp.STORED_ATTRS` is imported
+    rather than restated: the ledger's column list is the definition of "kept",
+    and a copy of it here would be a second allow-list, which is precisely the
+    shape of bug this counter exists to expose.
+    """
+    n = 0
+    with counters.lock:
+        for rl in payload.get("resourceLogs") or []:
+            for sl in rl.get("scopeLogs") or []:
+                for rec in sl.get("logRecords") or []:
+                    n += 1
+                    name = None
+                    for a in rec.get("attributes") or []:
+                        k = a.get("key")
+                        if not k:
+                            continue
+                        if k == "event.name":
+                            v = a.get("value") or {}
+                            name = v.get("stringValue")
+                        elif k not in otlp.STORED_ATTRS:
+                            counters.unknown_attributes[k] = \
+                                counters.unknown_attributes.get(k, 0) + 1
+                    counters.events[name] = counters.events.get(name, 0) + 1
+        counters.accepted += n
+        if n:
+            counters.last_record_at = time.time()
+    return n
+
+
+# --------------------------------------------------------------------------
+# the capture file
+# --------------------------------------------------------------------------
+
+class Capture:
+    """Append-only JSONL of every accepted logs payload, one payload per line.
+
+    **Nothing is filtered and nothing is allow-listed here, deliberately.**
+    The Docker collector did both -- `filter/only_api_request` and a `keep_keys`
+    over the attributes -- and `cu/otlp.py` then did the same two jobs again one
+    layer in, because it stores exactly the columns the ledger has and skips
+    every record whose `event.name` is not `api_request`, counting and *naming*
+    what it skipped.  One decision implemented twice is how three fields were
+    silently dropped: each half looked right beside the other, and the file
+    everyone read was the output of both.
+
+    So the keeping decision stays in `cu/otlp.py`, which is the only place that
+    knows what a ledger row is, and this file becomes what no downstream reader
+    could otherwise have: the bytes as they arrived.  The blind spot the audit
+    named -- "raw/api_request.jsonl is the collector's own OUTPUT, so nothing
+    downstream can see what never arrived" -- is closed by construction, and
+    `Counters` names the drift at the door as well.
+
+    Two costs of that choice, stated rather than buried.  The file now holds
+    `user_prompt` and `assistant_response` records too, so it grows faster --
+    hence the rotation below, at the figures lumberjack was configured with.
+    And the log record *body* is stored as it arrives: Claude Code leaves it
+    empty unless `OTEL_LOG_USER_PROMPTS=1`, which is the user's own opt-in, and
+    a silent redaction here would be exactly the second, invisible policy this
+    docstring is arguing against.  Mode 0600, in a 0700 directory, on loopback.
+
+    The line is re-serialised rather than echoed byte for byte, and that is
+    load-bearing twice over: a pretty-printed body would otherwise put newlines
+    inside a JSONL record, and `cu/otlp.py` recovers a torn write by cutting
+    back to the last `{"resourceLogs"` in the line, which requires the payload
+    to start with exactly that key.
+    """
+
+    HEAD = "resourceLogs"
+
+    def __init__(self, path, max_bytes, max_backups, unread=None, note=None):
+        self.path = path
+        self.max_bytes = max_bytes
+        self.max_backups = max_backups
+        # `unread(path) -> bool`: does that file still hold bytes no ingest has
+        # turned into ledger rows?  See `_rotate`.
+        self.unread = unread
+        self.note = note
+        self.lock = threading.Lock()
+
+    def _line(self, payload):
+        if self.HEAD in payload:
+            # `resourceLogs` first, whatever order it arrived in.
+            rest = {k: v for k, v in payload.items() if k != self.HEAD}
+            payload = dict([(self.HEAD, payload[self.HEAD])] + list(rest.items()))
+        return json.dumps(payload, separators=(",", ":"), default=str) + "\n"
+
+    def append(self, payload):
+        """Write one payload durably.  Returns the byte count, or raises.
+
+        One `write(2)` on a regular file opened `O_APPEND` is atomic at any
+        size, so a concurrent writer cannot interleave and a process killed
+        after this call cannot lose the record.  There is no `fsync`: that
+        defends against the host losing power, not against this process dying,
+        and the client's own retry queue is a better answer to a machine that
+        went down mid-write than a 5ms stall on every record.
+        """
+        data = self._line(payload).encode("utf-8")
+        with self.lock:
+            fd = os.open(self.path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+            try:
+                written = 0
+                while written < len(data):
+                    written += os.write(fd, data[written:])
+                size = os.lseek(fd, 0, os.SEEK_END)
+            finally:
+                os.close(fd)
+            if self.max_bytes and size >= self.max_bytes:
+                self._rotate()
+        return len(data)
+
+    def _rotate(self):
+        """Rename the live file aside.  Called with the lock held.
+
+        Ingest copes by construction: `otlp.raw_files` picks up every
+        `api_request*.jsonl`, the rotated name is new so it is read from byte
+        0, and `ledger.request_id` dedupes on content -- a re-read costs one
+        parse, never a duplicate row.
+
+        **It copes only if ingest has actually run.**  There was no interlock
+        at all between this unlink and the ingest offset, and while nothing on
+        any automatic path ingested (see `cu/ingest.py`), the deletion was not
+        an edge case -- it was where the records went.  Reproduced with real
+        processes at `raw_max_megabytes=1`, `raw_max_backups=2`: 6000 real
+        payloads POSTed, then one `claudio usage ingest` -> 1900 rows, 4100
+        records gone for good, with `doctor` printing "6000 accepted -> 6000
+        written" directly above "ledger rows: 1900" and exiting 0.  A tight
+        ingest loop still lost 830 of 9000, because rotation outran the reader.
+
+        So a backup whose stored ingest offset is short of its size is KEPT and
+        said out loud.  The raw directory then grows past `raw_max_backups`,
+        which is visible in a byte count and recoverable by ingesting; a
+        deleted record is neither.  Cannot-tell answers "keep", for the same
+        reason `_recv_is_receiver` answers "alive": the safe direction is the
+        one that costs disk rather than data.
+        """
+        # `splitext` on the *stem*, never `path.replace(".jsonl", ...)`: that
+        # would rewrite the first match anywhere in the string, including a
+        # directory component, and silently rename into a path that does not
+        # exist.
+        stem, ext = os.path.splitext(self.path)
+        stamp = datetime.datetime.now().strftime("%Y%m%dT%H%M%S")
+        aside = "%s-%s%s" % (stem, stamp, ext)
+        n = 0
+        while os.path.exists(aside):
+            n += 1
+            aside = "%s-%s.%d%s" % (stem, stamp, n, ext)
+        try:
+            os.rename(self.path, aside)
+        except OSError:
+            return
+        if not self.max_backups:
+            return
+        d = os.path.dirname(self.path)
+        live = os.path.basename(self.path)
+        old = sorted(f for f in os.listdir(d)
+                     if f.startswith("api_request") and f.endswith(".jsonl")
+                     and f != live)
+        kept = []
+        for f in old[:max(0, len(old) - self.max_backups)]:
+            full = os.path.join(d, f)
+            if self.unread is not None and self.unread(full):
+                kept.append(f)
+                continue
+            try:
+                os.unlink(full)
+            except OSError:
+                pass
+        if kept and self.note:
+            self.note("kept %d rotated capture file(s) past raw_max_backups "
+                      "because ingest has not read them: %s. Run "
+                      "`claudio usage ingest` -- they are deleted on the next "
+                      "rotation once their records are in the ledger."
+                      % (len(kept), ", ".join(kept)))
+
+
+# --------------------------------------------------------------------------
+# serve
+# --------------------------------------------------------------------------
+
+class Receiver(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    # `Server:` -- the stdlib default is `BaseHTTP/0.6 Python/3.14.6`, which
+    # names a program that does not exist in this project and publishes the
+    # machine's exact Python patch version from a listening socket.  The door
+    # (server/srv/serve.py) was fixed and this, the half that runs on EVERY
+    # user's machine rather than on one receiving host, was not -- and
+    # recv/README.md tells people to curl its /healthz.
+    server_version = "claudio-recv/1"
+    sys_version = ""
+
+    def version_string(self):
+        # BaseHTTPRequestHandler joins server_version and sys_version with a
+        # space unconditionally, so an empty sys_version -- which is what
+        # suppresses the "Python/3.x" half -- leaves a trailing space on every
+        # response.  Harmless on the wire and pinned in every capture and
+        # scrollback that quotes it.  Return the one field.
+        return self.server_version
+
+    capture = None
+    counters = None
+    ident = None            # {"pid":..., "token":..., "port":...}
+    quiet = False
+    note = None             # callable(text) -> writes recv.WARN, never recv.err
+
+    def log_message(self, fmt, *args):          # silence the default access log
+        pass
+
+    def _respond(self, code, body=b"{}", ctype="application/json"):
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if body:
+            self.wfile.write(body)
+
+    def _ok(self, protobuf=False):
+        """An OTLP success, in the shape the client asked for.
+
+        OTLP/HTTP says the response carries the same content type as the
+        request.  An `ExportLogsServiceResponse` with no `partialSuccess` is
+        full success, and that message encodes to `{}` in JSON and to **zero
+        bytes** in protobuf -- so a protobuf client gets a valid empty message
+        even though nothing here can build one.  Getting this wrong is not
+        cosmetic: an OTLP client treats 4xx/5xx as retryable and spins.
+        """
+        if protobuf:
+            self._respond(200, b"", "application/x-protobuf")
+        else:
+            self._respond(200, b"{}", "application/json")
+
+    def do_GET(self):
+        if self.path.split("?")[0] in ("/", "/healthz"):
+            body = self.counters.snapshot(dict(self.ident or {}, status="ok"))
+            self._respond(200, json.dumps(body).encode())
+        else:
+            self._respond(404, b"{}")
+
+    def do_POST(self):
+        signal_name = SIGNALS.get(self.path.split("?")[0])
+        if signal_name is None:
+            with self.counters.lock:
+                self.counters.rejected += 1
+            self._respond(404, b"{}")
+            return
+
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = 0
+        if length <= 0 or length > MAX_BODY:
+            with self.counters.lock:
+                self.counters.rejected += 1
+            self._respond(400, b"{}")
+            return
+
+        raw = self.rfile.read(length)
+        if (self.headers.get("Content-Encoding") or "").lower() == "gzip":
+            try:
+                raw = gzip.decompress(raw)
+            except OSError:
+                pass
+        ctype = (self.headers.get("Content-Type") or "").lower()
+        protobuf = "protobuf" in ctype
+
+        with self.counters.lock:
+            self.counters.payloads[signal_name] += 1
+
+        # Metrics and traces are **accepted and discarded**, and the discard is
+        # the design rather than a limitation.  Claude Code's metrics are
+        # pre-aggregated: they carry no per-request granularity, so there is
+        # nothing in them a ledger row could be made of, and `session.id` on
+        # them would make unbounded-cardinality series.  Traces it does not
+        # send at all.  Answering 404 instead would be honest and useless --
+        # the client would retry the same body for ever -- so they are counted
+        # and dropped, which is what stops the retry.
+        if signal_name != "logs":
+            with self.counters.lock:
+                self.counters.dropped[signal_name] += 1
+            self._ok(protobuf)
+            return
+
+        payload = None
+        if protobuf:
+            note = ("a protobuf OTLP body arrived and cannot be decoded: set "
+                    "otel_protocol=http/json in %s "
+                    "(this receiver speaks OTLP/HTTP JSON only)"
+                    % config.conf_display())
+        else:
+            try:
+                payload = json.loads(raw.decode("utf-8", errors="replace"))
+                note = None
+            except ValueError as exc:
+                note = "undecodable OTLP body: %s" % exc
+
+        if payload is None:
+            # Counted, named on stderr, and written to `recv.warn` -- which the
+            # next `claudio run` prints.  This is a real data loss with a
+            # user-side cause, so it may not be answered by a silent 200 and a
+            # counter nobody reads.  The status is still 200 on purpose: a 4xx
+            # makes the OTLP client retry a body we will never decode.
+            #
+            # `recv.warn` and NOT `recv.err`: this receiver is running, and
+            # claudio's supervisor reads recv.err as "a fault is already
+            # reported, do not spawn".  Writing it from here meant one bad
+            # body disarmed the respawn for good -- the receiver would later
+            # be killed and nothing would ever bring it back.
+            with self.counters.lock:
+                self.counters.undecodable += 1
+            if self.note:
+                self.note(note)
+            sys.stderr.write("[claudio recv] WARNING %s (%d bytes)\n" % (note, len(raw)))
+            sys.stderr.flush()
+            self._ok(protobuf)
+            return
+
+        # Durable BEFORE the 200.  A write that fails answers 503 so the client
+        # keeps the batch and retries it; returning 200 over a failed write is
+        # the silent loss this whole file is arranged against.
+        try:
+            n_bytes = self.capture.append(payload)
+        except OSError as exc:
+            with self.counters.lock:
+                self.counters.write_failed += 1
+            if self.note:
+                self.note("could not write %s: %s" % (self.capture.path, exc))
+            sys.stderr.write("[claudio recv] WRITE FAILED %s\n" % exc)
+            sys.stderr.flush()
+            self._respond(503, b"{}")
+            return
+
+        n = _count_records(self.counters, payload)
+        with self.counters.lock:
+            self.counters.written += n
+            self.counters.bytes += n_bytes
+
+        if not self.quiet:
+            rows = flatten_logs(payload)
+            names = sorted({r["name"] for r in rows})
+            sys.stderr.write("[claudio recv] logs  %d record(s)  %s\n"
+                             % (len(rows), ", ".join(names) or "-"))
+            sys.stderr.flush()
+
+        self._ok(protobuf)
+
+
+# --------------------------------------------------------------------------
+# process lifecycle
+#
+# The pidfile, the lock, `recv.err`, the start accounting and the session sweep
+# all live in `cu/collector.py` and are only *called* here.  They are one half
+# of a contract whose other half is written in POSIX sh, so the shape of every
+# one of those files is a shared fact; a private copy in this file would be a
+# second definition of the thing claudio hardcodes, which is how a rename
+# becomes a silent no-op on one side of a seam.
+# --------------------------------------------------------------------------
+
+_LAST_SAVED = {}
+
+
+def _unread_by_ingest(cfg):
+    """`unread(path)` for `Capture`: has ingest read every byte of that file?
+
+    Answers True -- keep it -- for anything it cannot answer exactly.  A file
+    with no offset entry has never been ingested at all, which is the state
+    this guard exists for.
+    """
+    def unread(path):
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            return True
+        entry = tail.load_offsets(cfg).get(path)
+        if isinstance(entry, dict):
+            off = entry.get("offset")
+        elif isinstance(entry, int) and not isinstance(entry, bool):
+            off = entry                       # a legacy integer offset
+        else:
+            off = None
+        if not isinstance(off, int) or isinstance(off, bool):
+            return True
+        return off < size
+    return unread
+
+
+def _ingest_then_ship(cfg, counters=None):
+    """The tick's data path, in the one order that can be right.
+
+    Ingest first, because the shipper reads `ledger.jsonl` and the receiver
+    writes `raw/`: with nothing in between, a fully configured `logging=remote`
+    machine shipped plan percentages and zero request rows, which on the server
+    is indistinguishable from a machine that made no requests.  Nothing on any
+    automatic path called ingest at all -- `claudio run` did not, this watchdog
+    did not, `ship.tick` did not.
+
+    Both halves swallow their own faults and write down what they swallowed:
+    an exception escaping into the watchdog thread would end the tick loop, and
+    with it the idle exit and the session sweep.
+    """
+    ingest.tick(cfg)
+    if counters is not None:
+        _note_uningested(cfg, counters)
+    ship.tick(cfg)
+
+
+def _note_uningested(cfg, counters):
+    """Captured records, no ledger: named rather than left to read as idle.
+
+    This is the belt to the ingest tick's braces.  If records have arrived and
+    the ledger still does not exist, stream A cannot ship -- and the shipper
+    cannot say so, because from where it stands an absent `ledger.jsonl` is
+    indistinguishable from a machine that has never recorded anything.  The
+    receiver is the one process that knows both facts, so it is the one that
+    says it.
+    """
+    with counters.lock:
+        written = counters.written
+    if not written or os.path.exists(cfg.ledger):
+        return
+    collector.note_warning(
+        cfg, "%d log record(s) have been captured and %s does not exist, so "
+             "nothing of stream A can be shipped or read. Run `claudio usage "
+             "ingest` and check its output." % (written, cfg.ledger))
+
+
+def _save_counters(cfg, counters, ident, force=False):
+    """Snapshot to disk, so the counters outlive the process that made them.
+
+    `doctor` runs when the receiver is usually *not* up -- it exits by itself
+    after half an hour -- and counters that die with the process would answer
+    "nothing arrived" for every session already finished, which is the exact
+    ambiguity they exist to remove.
+
+    Skipped when nothing has changed: the watchdog ticks every 15 seconds for
+    up to half an hour of silence, and rewriting an identical file 120 times to
+    record that nothing happened is a laptop's disk paying for a fact already
+    on it.  `force` covers the exit, where the file must be current whatever
+    the last tick thought.
+    """
+    key = (counters.accepted, counters.written, counters.undecodable,
+           counters.write_failed, sum(counters.payloads.values()))
+    if not force and _LAST_SAVED.get("key") == key:
+        return
+    _LAST_SAVED["key"] = key
+    try:
+        tmp = cfg.recv_counters + ".%d.tmp" % os.getpid()
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(counters.snapshot(dict(ident or {})), fh)
+        os.replace(tmp, cfg.recv_counters)
+    except OSError:
+        pass
+
+
+def cmd_serve(args):
+    cfg = config.Config()
+    cfg.ensure_dirs()
+
+    host = args.host
+    if host not in LOOPBACK:
+        # Refused rather than clamped: a caller asking for 0.0.0.0 has a reason
+        # in mind, and silently binding somewhere else would leave them
+        # believing the wrong thing about a listener holding their email
+        # address.
+        collector.note_error(
+            cfg, "refusing to bind %s: this receiver is loopback only (%s)"
+                 % (host, ", ".join(LOOPBACK)))
+        collector.release_lock(cfg)
+        sys.stderr.write("[claudio recv] refusing to bind %s (loopback only)\n" % host)
+        return 2
+
+    attempts = collector.note_start_attempt(cfg)
+    if attempts > collector.MAX_STARTS:
+        collector.note_error(
+            cfg, "refusing to start: %d starts in %ds never reached a "
+                 "successful bind. Something is holding the port or the data "
+                 "dir. Fix it, then delete %s."
+                 % (attempts, collector.START_WINDOW, cfg.recv_starts))
+        collector.release_lock(cfg)
+        sys.stderr.write("[claudio recv] refusing to start: %d failed starts in %ds\n"
+                         % (attempts, collector.START_WINDOW))
+        return 3
+
+    port = args.port if args.port is not None else int(cfg["http_port"])
+    counters = Counters()
+    try:
+        srv = ThreadingHTTPServer((host, port), Receiver)
+    except OSError as exc:
+        # The one failure the next `claudio run` has to be able to explain.
+        collector.note_error(cfg, "cannot bind %s:%d: %s" % (host, port, exc))
+        collector.release_lock(cfg)
+        sys.stderr.write("[claudio recv] cannot bind %s:%d: %s\n" % (host, port, exc))
+        return 1
+
+    srv.daemon_threads = True
+    bound = srv.server_address[1]
+    token = os.urandom(8).hex()
+    ident = {"pid": os.getpid(), "token": token, "port": bound,
+             "host": collector.host_slug()}
+
+    out = args.out or cfg.raw_file
+    os.makedirs(os.path.dirname(out), mode=0o700, exist_ok=True)
+    Receiver.capture = Capture(out,
+                               int(cfg["raw_max_megabytes"]) * 1024 * 1024,
+                               int(cfg["raw_max_backups"]),
+                               unread=_unread_by_ingest(cfg),
+                               note=lambda text: collector.note_warning(cfg,
+                                                                       text))
+    Receiver.counters = counters
+    Receiver.ident = ident
+    Receiver.quiet = args.quiet
+    # `staticmethod`, and not decoration: a bare function assigned to a class
+    # attribute becomes a *method* on instance access, so `self.note(text)`
+    # would pass the handler as the first argument and raise inside the request
+    # -- which the client sees as a dropped connection, i.e. a retry, on
+    # exactly the paths that exist to report a problem.
+    #
+    # `note_warning`, never `note_error`: everything the handler can report is
+    # a fault of a receiver that is up and serving, and `recv.err` is the
+    # supervisor's "do not spawn" flag.
+    Receiver.note = staticmethod(lambda text: collector.note_warning(cfg, text))
+
+    # Bound: the start is not a failure any more, and nothing about the last one
+    # is worth carrying forward.
+    collector.clear_start_attempts(cfg)
+    collector.clear_error(cfg)
+    collector.clear_warning(cfg)
+    collector.write_pidfile(cfg, os.getpid(), token, bound, counters.started_at)
+    collector.release_lock(cfg)
+
+    # An unclosed previous span means the last receiver was killed rather than
+    # asked to stop.  Recorded on the *start* record, because by the time
+    # anyone looks the span is indistinguishable from a live one.
+    spans = collector.up_spans(cfg)
+    unclean_previous = bool(spans) and not spans[-1][2]
+    collector.log_event(cfg, "start", clean=not unclean_previous,
+                        extra={"unclean_shutdown": unclean_previous,
+                               "port": bound, "pid": os.getpid(),
+                               "token": token})
+
+    idle_seconds = (args.idle_seconds if args.idle_seconds is not None
+                    else float(cfg["idle_minutes"]) * 60)
+    stopping = threading.Event()
+    state = {"graceful": False, "reason": None}
+
+    def shutdown(reason):
+        if stopping.is_set():
+            return
+        state["graceful"] = True
+        state["reason"] = reason
+        stopping.set()
+        # From another thread, always: `srv.shutdown()` waits for
+        # `serve_forever` to return, so calling it from inside a signal handler
+        # -- which runs in the thread that is *in* `serve_forever` -- deadlocks
+        # the process into exactly the unkillable state the supervisor cannot
+        # fix.
+        threading.Thread(target=srv.shutdown, daemon=True).start()
+
+    def watchdog():
+        """Idle exit, and the session sweep that makes it safe.
+
+        BOTH conditions, and the `and` is the whole design.  A timer alone
+        orphans a user who is reading for 40 minutes with claude still open;
+        a session check alone never exits at all once a session file is
+        stranded.  The sweep runs on every tick regardless, because a stranded
+        entry that is never cleaned is a permanent hold.
+
+        And the session count is asked for a **second time, immediately before
+        the decision**, because the first answer is a snapshot with a race
+        under it: `claudio run` checks that this receiver is alive and only
+        then registers its session, so a tick landing between those two writes
+        used to end a receiver a launching session had just been told it could
+        export to -- reproduced as `connection refused` two seconds after
+        `alive: True`.  claudio now registers before it checks, which removes
+        the tick-sized half of the window; this removes the rest.  A re-sweep
+        costs one `listdir` on a path taken once per idle receiver, and it is
+        the difference between an on-demand process and a lost session.
+        """
+        while not stopping.wait(args.check_seconds):
+            live = collector.sweep_sessions(cfg)
+            _save_counters(cfg, counters, ident)
+            # Ingest and then ship, because this process is alive exactly when
+            # there is data -- no cron, no launchd, no systemd, none of which
+            # claudio has or is gaining.  Both swallow everything and record
+            # what they could not do: a traceback escaping here would end the
+            # tick loop, and with it the idle exit and the session sweep,
+            # leaving a receiver that runs for ever for a reason nobody can
+            # see.  A pass with no destination configured -- the normal case --
+            # reads three config keys and returns.
+            _ingest_then_ship(cfg, counters)
+            with counters.lock:
+                quiet_for = time.time() - counters.last_record_at
+            if live == 0 and quiet_for >= idle_seconds:
+                if collector.sweep_sessions(cfg):
+                    continue
+                shutdown("idle: no records for %ds and no live session"
+                         % int(quiet_for))
+                return
+
+    def on_signal(signum, _frame):
+        shutdown("signal %d" % signum)
+
+    signal.signal(signal.SIGTERM, on_signal)
+    signal.signal(signal.SIGINT, on_signal)
+    # A closed terminal must not take the receiver with it: claudio detaches it
+    # with setsid, and this is the belt to that pair of braces.
+    try:
+        signal.signal(signal.SIGHUP, on_signal)
+    except (AttributeError, ValueError):
+        pass
+
+    threading.Thread(target=watchdog, daemon=True).start()
+
+    if not args.quiet:
+        sys.stderr.write(
+            "[claudio recv] listening on http://%s:%d  (/v1/logs /v1/metrics)\n"
+            "[claudio recv] writing   %s\n"
+            "[claudio recv] idle exit after %ds with no records and no live session\n"
+            % (host, bound, out, idle_seconds))
+        sys.stderr.flush()
+
+    try:
+        srv.serve_forever()
+    finally:
+        # THE SOCKET AND THE PIDFILE GO FIRST, and the order is a fix rather
+        # than tidiness.  `serve_forever` has returned, so nothing is being
+        # served -- but the listening socket was still bound and `recv.pid`
+        # still named a live pid, which is exactly what claudio's supervisor
+        # (`kill -0` on the render path) and `claudio run` read as "the
+        # receiver is up, export away".  Measured: 0.7 s after SIGTERM the
+        # pidfile was present, `kill -0` said alive, and a POST to /v1/logs
+        # died with ConnectionResetError after 3.3 s -- records Claude Code's
+        # exporter drops in silence.  Before the shipper existed that window
+        # was two small file writes; the final pass below is a network call
+        # bounded only by TIMEOUT x MAX_BATCHES_PER_PASS per destination per
+        # stream, so a slow door could hold the receiver half-dead for hours.
+        # Socket first so a replacement can bind, pidfile second so the
+        # supervisor spawns one, and only then the data path.
+        srv.server_close()
+        collector.clear_pidfile(cfg, token)
+        # ONE UNCONDITIONAL FINAL PASS.  The tick above is opportunistic -- it
+        # runs every `check_seconds` and can be up to a tick behind -- so
+        # without this, everything written between the last tick and the idle
+        # exit would sit on disk until the next session happened to start a
+        # receiver, which on a machine that ships once a day is a day.  It is
+        # unconditional (a signal, an idle exit and a crash-with-a-handler all
+        # reach here) and it comes before the two writes below, because those
+        # are labels and this one is records.
+        _ingest_then_ship(cfg, counters)
+        # `clean` is OBSERVED, exactly as it was for the container: this record
+        # is written only on a path that actually ran, so a SIGKILL leaves the
+        # span open and `up_spans` reports it unclean.  There is no data in the
+        # difference -- every record is already on disk -- but the label is what
+        # a server is told about which machines were listening.
+        _save_counters(cfg, counters, ident, force=True)
+        # `sessions_at_exit` is the last word on the race above.  The watchdog
+        # re-asks before deciding, so this should always be 0 on an idle exit;
+        # if a session appeared during the shutdown itself there is nothing
+        # left to do about it here -- the socket is closed -- but a non-zero
+        # value in the uptime ledger is the difference between a loss that can
+        # be explained afterwards and one that cannot.
+        collector.log_event(cfg, "stop", clean=state["graceful"],
+                            extra={"reason": state["reason"],
+                                   "records": counters.written,
+                                   "sessions_at_exit": collector.sweep_sessions(cfg),
+                                   "pid": os.getpid()})
+        if not args.quiet:
+            sys.stderr.write("[claudio recv] stopped (%s). %s\n"
+                             % (state["reason"] or "unknown",
+                                collector.reconcile_text(counters.snapshot())))
+            sys.stderr.flush()
+    return 0
+
+
+# --------------------------------------------------------------------------
+# OTLP/JSON unwrapping (for `tail`, and for the per-payload stderr line)
+# --------------------------------------------------------------------------
+
+def attr_value(v):
+    """Unwrap one OTLP AnyValue.
+
+    `intValue` arrives as a JSON *string* on the wire; `doubleValue` as a
+    number.  Coercing is not optional -- see cu/otlp.py, same finding.
+    """
+    if not isinstance(v, dict):
+        return None
+    if "stringValue" in v:
+        return v["stringValue"]
+    if "intValue" in v:
+        try:
+            return int(v["intValue"])
+        except (TypeError, ValueError):
+            return None
+    if "doubleValue" in v:
+        try:
+            return float(v["doubleValue"])
+        except (TypeError, ValueError):
+            return None
+    if "boolValue" in v:
+        return bool(v["boolValue"])
+    if "arrayValue" in v:
+        return [attr_value(x) for x in (v["arrayValue"] or {}).get("values") or []]
+    return None
+
+
+def attrs_to_dict(attrs):
+    out = {}
+    for a in attrs or []:
+        k = a.get("key")
+        if k:
+            out[k] = attr_value(a.get("value"))
+    return out
+
+
+def _ts(nano):
+    try:
+        n = int(nano or 0)
+    except (TypeError, ValueError):
+        return ""
+    if not n:
+        return ""
+    return datetime.datetime.fromtimestamp(n / 1e9).strftime("%H:%M:%S")
+
+
+def flatten_logs(payload):
+    """-> [{ts, name, body, attrs, resource}]"""
+    rows = []
+    for rl in payload.get("resourceLogs") or []:
+        res = attrs_to_dict((rl.get("resource") or {}).get("attributes"))
+        for sl in rl.get("scopeLogs") or []:
+            for rec in sl.get("logRecords") or []:
+                a = attrs_to_dict(rec.get("attributes"))
+                rows.append({
+                    "ts": _ts(rec.get("timeUnixNano")),
+                    "name": a.get("event.name") or "(no event.name)",
+                    "body": attr_value(rec.get("body")),
+                    "attrs": a,
+                    "resource": res,
+                })
+    return rows
+
+
+# --------------------------------------------------------------------------
+# tail
+# --------------------------------------------------------------------------
+
+def _fmt_row(r):
+    res = r.get("resource") or {}
+    ident = " ".join(
+        "%s=%s" % (k, res[k]) for k in ("profile", "account", "host", "email")
+        if res.get(k) is not None
+    )
+    a = r.get("attrs") or {}
+    keys = ("prompt.id", "session.id", "model", "cost_usd",
+            "input_tokens", "output_tokens", "duration_ms")
+    detail = " ".join("%s=%s" % (k, a[k]) for k in keys if a.get(k) is not None)
+    return "%-8s %-22s %s %s" % (r["ts"] or "-", r["name"], detail, ident)
+
+
+def cmd_tail(args):
+    cfg = config.Config()
+    path = args.out or cfg.raw_file
+    if not os.path.exists(path):
+        # Prefixed like every other line this program writes: the VERB is
+        # `claudio recv`, and a diagnostic that names no program is a
+        # diagnostic the reader cannot attribute.  A remedy rather than a
+        # question, too -- "has anything been recorded yet?" is the reader's
+        # own question handed back to them, and this is a first-run command.
+        sys.stderr.write("[claudio recv] no capture at %s\n"
+                         "[claudio recv] nothing has been recorded here yet: "
+                         "run `claudio run` to record, or `claudio usage "
+                         "doctor` to see why nothing is\n" % path)
+        return 1
+
+    def drain(fh):
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                payload = json.loads(line)
+            except ValueError:
+                continue
+            for r in flatten_logs(payload):
+                print(_fmt_row(r))
+            sys.stdout.flush()
+
+    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+        drain(fh)
+        if not args.follow:
+            return 0
+        try:
+            while True:
+                where = fh.tell()
+                line = fh.readline()
+                if not line:
+                    time.sleep(0.3)
+                    fh.seek(where)
+                else:
+                    fh.seek(where)
+                    drain(fh)
+        except KeyboardInterrupt:
+            return 0
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(prog="claudio recv",
+                                description=__doc__.splitlines()[0])
+    sub = p.add_subparsers(dest="cmd")
+
+    # `--out` is declared on the subcommands only.  It used to be declared on
+    # the top-level parser as well, and argparse writes both into one
+    # namespace: the subparser's default of None ran last, so
+    # `otlp-recv --out FILE serve` was accepted, advertised in `--help`, and
+    # then silently wrote to the default path.
+    OUT = "capture file (default $CLAUDIO_USAGE_DIR/raw/api_request.jsonl)"
+
+    s = sub.add_parser("serve", help="accept OTLP/HTTP JSON on loopback")
+    s.add_argument("--host", default=DEFAULT_HOST,
+                   help="loopback only: %s" % ", ".join(LOOPBACK))
+    s.add_argument("--port", type=int, default=None,
+                   help="default http_port (4318); 0 picks a free port and "
+                        "records it in recv.pid")
+    s.add_argument("--quiet", action="store_true", help="no per-payload stderr line")
+    s.add_argument("--idle-seconds", type=float, default=None,
+                   help="override idle_minutes, in seconds")
+    s.add_argument("--check-seconds", type=float, default=15.0,
+                   help="how often the idle/session watchdog ticks")
+    s.add_argument("--out", help=OUT)
+
+    t = sub.add_parser("tail", help="render the capture readably")
+    t.add_argument("-f", "--follow", action="store_true",
+                   help="keep reading as the receiver appends, like tail -f")
+    t.add_argument("--out", help=OUT)
+
+    args = p.parse_args(argv)
+    if args.cmd == "serve":
+        return cmd_serve(args)
+    if args.cmd == "tail":
+        return cmd_tail(args)
+    p.print_help()
+    # 1, not 2, and that is claudio's convention rather than argparse's:
+    # `claudio usage` with no subcommand returns 1, and so do `claudio mcp`,
+    # `claudio default`, `claudio show` and `Unknown command:`.  Two verbs of
+    # one tool answering the same situation with two statuses is a difference
+    # a wrapper's `|| handle` sees and nothing else explains.
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,11 @@
+{"ts":1786400000,"five_hour_pct":90,"five_hour_resets_at":1,"seven_day_pct":40,"seven_day_resets_at":null}
+{"ts":1786400100,"five_hour_pct":2,"five_hour_resets_at":1786424400,"seven_day_pct":40,"seven_day_resets_at":null}
+{"ts":1786430000,"five_hour_pct":3,"five_hour_resets_at":1786442400,"seven_day_pct":40,"seven_day_resets_at":null}
+{"ts":1786450000,"five_hour_pct":9,"five_hour_resets_at":1786460400,"seven_day_pct":40,"seven_day_resets_at":null}
+{"ts":1786460000,"five_hour_pct":12,"five_hour_resets_at":1786460400,"seven_day_pct":40,"seven_day_resets_at":null}
+{"ts":1786460200,"five_hour_pct":15,"five_hour_resets_at":1786478400000,"seven_day_pct":40,"seven_day_resets_at":null}
+{"ts":1786460300,"five_hour_pct":16,"five_hour_resets_at":1786478400,"seven_day_pct":40,"seven_day_resets_at":null}
+{"ts":1786460400,"five_hour_pct":"n/a","five_hour_resets_at":1786478400,"seven_day_pct":41,"seven_day_resets_at":null}
+{"ts":1786460500,"five_hour_pct":{"a":1},"five_hour_resets_at":1786478400,"seven_day_pct":42,"seven_day_resets_at":null}
+{"ts":1786460600,"five_hour_pct":1e30,"five_hour_resets_at":1786478400,"seven_day_pct":43,"seven_day_resets_at":null}
+{"ts":1786460700,"five_hour_pct":18,"five_hour_resets_at":1786478400,"seven_day_pct":43,"seven_day_resets_at":null}

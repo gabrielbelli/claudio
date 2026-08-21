@@ -1,0 +1,121 @@
+# One obvious command per job, for the server's DuckDB dependency.
+#
+#   docker compose -f server/compose.yml run --rm suite     # the suite, with the engine
+#   docker compose -f server/compose.yml run --rm mutate    # break each behaviour, require a failure
+#   docker compose -f server/compose.yml up door            # the door, on 127.0.0.1:8787
+#
+# The repository is bind-mounted, so a developer edits on the host and runs in
+# the container.  Nothing is copied into the image and nothing is rebuilt to run
+# a test; `--build` is only needed when the pinned DuckDB version changes.
+#
+# There is no `version:` key: it has been obsolete since Compose v2 and current
+# versions warn about it.
+#
+# NONE OF THIS IS REQUIRED TO USE THE PROJECT.  `claudio` is POSIX sh with no
+# dependency at all, and everything under `usage/` reads the same JSONL with the
+# standard library, offline.  A developer with no container runtime runs both of
+# those and both of their suites exactly as before.  This file exists for one
+# thing: `server/`, which needs DuckDB, and whose suite otherwise self-skips its
+# entire storage half.
+
+name: claudio-server
+
+services:
+
+  # THE SUITE, RUN PROPERLY.  This is the command the README points at, and it
+  # is the strict one on purpose: `--require-duckdb` turns a self-skip into a
+  # failure, so this service cannot report success over a run that did not
+  # exercise the engine.  A machine without duckdb is entitled to a skipping
+  # run; a container built specifically to provide it is not.
+  suite:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: claudio-server:duckdb-1.5.5
+    # Read-only.  The suite writes only under `tempfile.mkdtemp()`, so it has no
+    # business touching the developer's checkout, and mounting it `ro` makes
+    # that structural rather than a habit.  It also means a mutation harness
+    # cannot leave a half-patched module behind in the working tree.
+    volumes:
+      - ..:/repo:ro
+    command: ["python", "server/tests/test_all.py", "--require-duckdb"]
+
+  # THE MUTATION MATRIX.  It copies `srv/` to a temp tree, so it needs no write
+  # access to the checkout either.  It refuses a skipping baseline by itself --
+  # measured, over the identical matrix and identical source: 118 caught / 42
+  # SURVIVED / 1 bad patch without duckdb, against 161 caught / 0 survived / 0
+  # bad patches with it, and all 42 were false.  (That pair was taken over the
+  # matrix as it then stood, 161 rows; it is 169 now and still 169 caught / 0 /
+  # 0.  The no-duckdb half cannot be re-measured, because the refusal those
+  # numbers argued for is now in force -- which is the point of it.)  Minutes,
+  # not seconds.
+  mutate:
+    image: claudio-server:duckdb-1.5.5
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - ..:/repo:ro
+    command: ["python", "server/tests/mutate.py"]
+
+  # THE DOOR.  Two things about the binding, and both matter.
+  #
+  # `--host 0.0.0.0` is not a relaxation of the loopback rule: inside a
+  # container that address is the container's own network namespace, and what
+  # decides who can reach the port is the PUBLISH mapping below, which is
+  # pinned to `127.0.0.1` on the host.  Binding `127.0.0.1` INSIDE the container
+  # would simply make the port unreachable from the host, which reads as a
+  # broken door rather than a safe one.
+  #
+  # The consequence is honest and stated: because the process sees a
+  # non-loopback bind, it prints its two trust warnings on stderr on every
+  # start, and they remain true of the container's network.  The read API asks
+  # for no token and serves every record in the store, email addresses
+  # included.  This is for a trusted network.  It must never face the internet.
+  # Publishing this as `8787:8787` instead of `127.0.0.1:8787:8787` is exactly
+  # how it would.
+  door:
+    image: claudio-server:duckdb-1.5.5
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      # The code, read-only: the door writes to the store, never to the source.
+      - ..:/repo:ro
+      # The store is the record of truth -- append-only JSONL the door writes
+      # and a Wazuh agent may one day tail.  It is a bind mount rather than a
+      # named volume so it is visible, greppable and backup-able on the host
+      # with no container command; `SERVER_STORE` moves it anywhere.
+      #
+      # Deliberately NOT called `CLAUDIO_USAGE_DIR`, which is a real setting
+      # meaning something else entirely: the CLIENT's `usage_dir`, the
+      # directory the shim writes samples into and `claudio usage` reads.  This
+      # is the server's store root, on a different machine in every deployment
+      # this is for.  Two directories with one name is how somebody points the
+      # door at their own samples.
+      - ${SERVER_STORE:-./.store}:/var/lib/claudio-usage
+    ports:
+      - "127.0.0.1:8787:8787"
+    command:
+      - python
+      - server/srv/serve.py
+      - --root
+      - /var/lib/claudio-usage
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8787"
+
+  # A shell in the same image, for `python -c "import duckdb; ..."` and for
+  # running one test file.  Named rather than left to `docker run` so that the
+  # mount, the workdir and the pinned engine are the same ones the suite used.
+  shell:
+    image: claudio-server:duckdb-1.5.5
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - ..:/repo
+    command: ["bash"]
+    stdin_open: true
+    tty: true

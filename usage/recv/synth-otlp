@@ -1,0 +1,309 @@
+#!/usr/bin/env python3
+"""Synthesise and POST Claude Code OTLP/JSON payloads.  **Not authoritative.**
+
+This exists for exactly one job: proving a socket is listening, without
+running `claude` and spending real plan quota.  It may never be used to prove
+that a shape, a field name, a rate or a label is handled correctly.
+
+That rule was learned the hard way.  This generator was hand-written to match
+the collector's filters, so the two agreed with each other and neither matched
+Claude Code.  Two bugs hid behind that agreement for an evening -- the filter
+matched `claude_code.api_request` while the real event name is `api_request`,
+and a resource allow-list deleted every user `--tag` -- and six more were
+found afterwards only by reconciling against captured bytes.  Anything that
+must be *correct* is tested against `tests/fixtures/real-payloads/`, never
+against this file.
+
+Two things now make that failure mode structurally harder:
+
+  * The api_request record below is copied from a captured payload
+    (tests/fixtures/real-payloads/02-sonnet-repl-main-thread.json) rather than
+    invented, so what this posts is a shape Claude Code has really emitted --
+    including `query_source: repl_main_thread`, where this file used to say
+    `user_prompt`, a value Claude Code has never sent.
+  * Every payload carries a `synthetic=1` resource attribute.  `cu/otlp.py`
+    turns that into `source: "synthetic"` on the ledger row, so anything
+    reading the ledger can exclude them by name.  Before that, two rows from
+    this generator sat in the live ledger indistinguishable from real ones
+    and became the top consumer of a real account's report.  That marker
+    carries more weight now than it did: there is no separate debug capture
+    to POST at any more, so what this sends lands in the file the ledger is
+    built from.  Use a throwaway CLAUDIO_USAGE_DIR if that matters to you.
+
+It is a development tool and NOT a `claudio` verb, so it is run by path:
+`usage/recv/synth-otlp` in a checkout, `$PREFIX/libexec/claudio/recv/synth-otlp`
+once installed.
+
+    usage/recv/synth-otlp                   # metrics + logs to localhost:4318
+    usage/recv/synth-otlp --signal metrics --endpoint http://localhost:4318
+
+Shapes follow code.claude.com/docs/en/monitoring-usage:
+
+  metrics  claude_code.session.count, .token.usage, .cost.usage,
+           .active_time.total  (token.usage is split by `type`, which is what
+           makes it four data points rather than one).  Still hand-written:
+           no metrics payload has been captured, and saying so is better than
+           implying otherwise.
+  logs     user_prompt, api_request, assistant_response, all three carrying
+           the same `prompt.id` -- the attribute that groups one user turn
+           together within stream A.  All three are stored verbatim by the
+           receiver and only api_request becomes a ledger row; the other two
+           are counted and named by `ingest`, which is the design, not a
+           fault.
+
+Resource attributes are the four claudio injects via OTEL_RESOURCE_ATTRIBUTES:
+profile, account, host, email -- plus the synthetic marker.
+"""
+
+import argparse
+import json
+import sys
+import time
+import urllib.error
+import urllib.request
+import uuid
+
+SESSION_ID = "2f0eb9cf-cfd1-4185-8af8-550391549707"
+PROMPT_ID = str(uuid.uuid4())
+
+# Copied from tests/fixtures/real-payloads/02-sonnet-repl-main-thread.json --
+# a real request Claude Code logged on 2026-08-12.  Every value here has been
+# observed; none is a plausible-looking invention.  In particular `cost_usd` is
+# Claude Code's own figure for exactly these token counts -- nothing here or in
+# `cu/` recomputes one, so a synthetic row carries the same kind of number a
+# real one does.
+REAL_API_REQUEST = {
+    "model": "claude-sonnet-5",
+    "input_tokens": 2,
+    "output_tokens": 893,
+    "cache_read_tokens": 30954,
+    "cache_creation_tokens": 9816,
+    "cost_usd": 0.08158320000000001,
+    "duration_ms": 17902,
+    "query_source": "repl_main_thread",
+}
+MODEL = REAL_API_REQUEST["model"]
+
+
+def s(v):
+    return {"stringValue": str(v)}
+
+
+def i(v):
+    # intValue is a JSON *string* on the wire.  Emitting a number here would
+    # make this generator a worse liar than the real client.
+    return {"intValue": str(int(v))}
+
+
+def d(v):
+    return {"doubleValue": float(v)}
+
+
+def kv(pairs):
+    return [{"key": k, "value": v} for k, v in pairs]
+
+
+def resource(profile, account, host, email):
+    return {"attributes": kv([
+        ("service.name", s("claude-code")),
+        ("service.version", s("2.1.229")),
+        ("profile", s(profile)),
+        ("account", s(account)),
+        ("host", s(host)),
+        ("email", s(email)),
+        # The self-declaration.  The receiver stores resource attributes
+        # verbatim and cu/otlp.py turns this one into
+        # `source: "synthetic"` on the row, so every consumer -- `show` here,
+        # the server later -- can exclude them by name.  Without it these rows
+        # are indistinguishable from real consumption, which is not
+        # hypothetical: two of them ended up in the live ledger and dominated a
+        # real account's report.
+        ("synthetic", s("1")),
+    ])}
+
+
+def _sum(name, unit, points, monotonic=True):
+    return {
+        "name": name,
+        "unit": unit,
+        "sum": {
+            "dataPoints": points,
+            "aggregationTemporality": 2,      # CUMULATIVE
+            "isMonotonic": monotonic,
+        },
+    }
+
+
+def _point(value, attrs, now_ns, start_ns):
+    p = {
+        "startTimeUnixNano": str(start_ns),
+        "timeUnixNano": str(now_ns),
+        "attributes": kv(attrs),
+    }
+    p.update(value)
+    return p
+
+
+def metrics_payload(res, now_ns):
+    start_ns = now_ns - 300 * 1_000_000_000
+    common = [("session.id", s(SESSION_ID)), ("terminal.type", s("iTerm.app"))]
+
+    # Same token counts as the captured api_request above, so the two signals
+    # tell one consistent story rather than two invented ones.
+    token_points = [
+        _point({"asInt": str(n)}, common + [("type", s(t)), ("model", s(MODEL))],
+               now_ns, start_ns)
+        for t, n in (("input", REAL_API_REQUEST["input_tokens"]),
+                     ("output", REAL_API_REQUEST["output_tokens"]),
+                     ("cacheRead", REAL_API_REQUEST["cache_read_tokens"]),
+                     ("cacheCreation", REAL_API_REQUEST["cache_creation_tokens"]))
+    ]
+
+    return {"resourceMetrics": [{
+        "resource": res,
+        "scopeMetrics": [{
+            "scope": {"name": "com.anthropic.claude_code", "version": "2.1.229"},
+            "metrics": [
+                _sum("claude_code.session.count", "count",
+                     [_point({"asInt": "1"}, common, now_ns, start_ns)]),
+                _sum("claude_code.token.usage", "tokens", token_points),
+                _sum("claude_code.cost.usage", "USD",
+                     [_point({"asDouble": REAL_API_REQUEST["cost_usd"]},
+                             common + [("model", s(MODEL))],
+                             now_ns, start_ns)]),
+                _sum("claude_code.active_time.total", "s",
+                     [_point({"asDouble": 184.2}, common, now_ns, start_ns)]),
+            ],
+        }],
+    }]}
+
+
+def _log(event, now_ns, attrs):
+    return {
+        "timeUnixNano": str(now_ns),
+        "observedTimeUnixNano": str(now_ns),
+        "severityNumber": 9,
+        "severityText": "INFO",
+        "body": s(""),
+        "attributes": kv([
+            ("event.name", s(event)),
+            ("event.timestamp", s(time.strftime("%Y-%m-%dT%H:%M:%S%z"))),
+            ("session.id", s(SESSION_ID)),
+            ("prompt.id", s(PROMPT_ID)),
+            ("terminal.type", s("iTerm.app")),
+        ] + attrs),
+    }
+
+
+def logs_payload(res, now_ns):
+    return {"resourceLogs": [{
+        "resource": res,
+        "scopeLogs": [{
+            "scope": {"name": "com.anthropic.claude_code", "version": "2.1.229"},
+            "logRecords": [
+                _log("user_prompt", now_ns, [
+                    ("prompt_length", i(214)),
+                ]),
+                # Captured, not invented.  See REAL_API_REQUEST.
+                _log("api_request", now_ns + 1_000_000_000, [
+                    ("model", s(REAL_API_REQUEST["model"])),
+                    ("cost_usd", d(REAL_API_REQUEST["cost_usd"])),
+                    ("duration_ms", i(REAL_API_REQUEST["duration_ms"])),
+                    ("input_tokens", i(REAL_API_REQUEST["input_tokens"])),
+                    ("output_tokens", i(REAL_API_REQUEST["output_tokens"])),
+                    ("cache_read_tokens", i(REAL_API_REQUEST["cache_read_tokens"])),
+                    ("cache_creation_tokens",
+                     i(REAL_API_REQUEST["cache_creation_tokens"])),
+                    ("query_source", s(REAL_API_REQUEST["query_source"])),
+                ]),
+                _log("assistant_response", now_ns + 2_000_000_000, [
+                    ("model", s(MODEL)),
+                    ("duration_ms", i(8_600)),
+                ]),
+            ],
+        }],
+    }]}
+
+
+def post(endpoint, path, payload, timeout=10):
+    body = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        endpoint.rstrip("/") + path, data=body, method="POST",
+        headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status, resp.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.read().decode("utf-8", errors="replace")
+    except OSError as exc:
+        return None, str(exc)
+
+
+# The docstring above is Markdown, because it is written for whoever opens the
+# file.  `--help` is a terminal, where `**Not authoritative.**` renders as
+# literal asterisks -- so the description argparse prints is its own plain
+# string.  Taking it from `__doc__.splitlines()[0]` is what leaked the emphasis,
+# and this file IS installed (`$PREFIX/libexec/claudio/recv/synth-otlp`), so
+# that is a user-visible string and not an internal one.
+DESCRIPTION = ("Synthesise and POST Claude Code OTLP/JSON payloads. NOT "
+               "AUTHORITATIVE: this proves a socket is listening and nothing "
+               "else -- never that a shape, a field name or a label is "
+               "handled correctly. Rows land in the ledger as "
+               "source=synthetic so they can be excluded by name.")
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(prog="synth-otlp", description=DESCRIPTION)
+    p.add_argument("--endpoint", default="http://localhost:4318",
+                   help="OTLP/HTTP base URL to POST to (default: %(default)s)")
+    p.add_argument("--signal", choices=["metrics", "logs", "both"], default="both",
+                   help="which signal to send (default: %(default)s)")
+    p.add_argument("--profile", default="work",
+                   help="value for the profile resource attribute claudio "
+                        "tags exports with (default: %(default)s)")
+    p.add_argument("--account", default="agent",
+                   help="value for the account resource attribute (default: "
+                        "%(default)s)")
+    p.add_argument("--host", default="mba-gabriel",
+                   help="value for the host resource attribute (default: "
+                        "%(default)s)")
+    p.add_argument("--email", default="user@example.invalid",
+                   help="value for the email resource attribute; the default "
+                        "is a .invalid address on purpose (default: "
+                        "%(default)s)")
+    p.add_argument("--print", dest="dump", action="store_true",
+                   help="print the payload instead of POSTing it")
+    args = p.parse_args(argv)
+
+    now_ns = int(time.time() * 1_000_000_000)
+    res = resource(args.profile, args.account, args.host, args.email)
+
+    jobs = []
+    if args.signal in ("metrics", "both"):
+        jobs.append(("/v1/metrics", metrics_payload(res, now_ns)))
+    if args.signal in ("logs", "both"):
+        jobs.append(("/v1/logs", logs_payload(res, now_ns)))
+
+    if args.dump:
+        for path, payload in jobs:
+            print("== POST %s" % path)
+            print(json.dumps(payload, indent=2))
+        return 0
+
+    rc = 0
+    print("SYNTHETIC payload - proves the socket is listening, proves nothing else.")
+    print("Rows land in the ledger as source=synthetic, so they can be excluded")
+    print("by name.  Never quote a number derived from these.")
+    print("prompt.id = %s   (joins the three log records above)" % PROMPT_ID)
+    for path, payload in jobs:
+        status, body = post(args.endpoint, path, payload)
+        if status == 200:
+            print("POST %-12s -> 200 %s" % (path, body.strip()))
+        else:
+            print("POST %-12s -> %s %s" % (path, status, body.strip()))
+            rc = 1
+    return rc
+
+
+if __name__ == "__main__":
+    sys.exit(main())

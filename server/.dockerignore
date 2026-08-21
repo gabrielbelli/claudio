@@ -1,0 +1,10 @@
+# The image carries no source: the repository is bind-mounted at run time (see
+# the Dockerfile, which has no `COPY`).  So nothing needs to reach the build,
+# and sending the context would upload the fixtures and the 300 kB test file to
+# the daemon on every build for nothing.
+#
+# `*` here is not a tidiness rule with exceptions to remember.  It is the
+# statement that this image is a Python and a pinned DuckDB and nothing else --
+# which is what makes "edit on the host, run in the container" true rather than
+# aspirational, because there is no copy of the source that can go stale.
+*

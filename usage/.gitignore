@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+
+# A dev run with CLAUDIO_USAGE_DIR=. lands the collector's raw capture here.
+# It is machine state, never source.
+/data/
