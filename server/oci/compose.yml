@@ -1,0 +1,273 @@
+# THE FOUR-WAY SPLIT, AS A RUNNING STACK.  One published port; three services
+# behind it that publish nothing at all.
+#
+#   docker compose -f server/oci/compose.yml up --build
+#
+#   https://localhost:8443/sender   -> ingest  POST /v1/ship
+#   https://localhost:8443/api/v1/  -> api     GET  /api/v1/*
+#   https://localhost:8443/mcp      -> mcp     POST /mcp
+#
+# WHAT THIS FILE IS AND WHAT `server/compose.yml` IS
+#
+#   That one is the DEVELOPER's: it runs the suite and the mutation matrix in a
+#   container with the checkout bind-mounted, and it has one whole-door service
+#   for poking at.  This one is the DEPLOYMENT: four images, each carrying only
+#   what it needs, wired the way a real host would wire them.  Two jobs, two
+#   files, and neither has to hedge.
+#
+# THE FOUR SERVICES, AND WHAT EACH ONE IS *NOT* GIVEN
+#
+#   ingest   POST /v1/ship. The ONLY writer. Holds `door.lock` and the store
+#            READ-WRITE. No DuckDB in the image at all.
+#   api      GET /api/v1/*. DuckDB plus the pure reconciler. Takes NO lock and
+#            has the store READ-ONLY -- `:ro` below, and `--no-ship` in the
+#            image's CMD, and `Store(create=False)` behind that. Three layers,
+#            because a `:ro` somebody deletes must not become a second writer.
+#   mcp      POST /mcp. An HTTP client of the api. NO volume of any kind, not
+#            even read-only, and no token in its environment: it forwards the
+#            caller's and holds none.
+#   proxy    The only `ports:` in this file.
+#
+# THE TWO NUMBERS YOU CHANGE, AND THEY ARE BOTH IN ONE PLACE
+#
+#   CLAUDIO_DOMAIN   the name a generated self-signed certificate is for.
+#   CLAUDIO_TLS_DIR  a host directory holding `fullchain.pem` and
+#                    `privkey.pem`, if you have real ones. Leave it unset and a
+#                    named volume is used, into which the proxy generates a
+#                    self-signed pair on first start and says so, loudly, on
+#                    every start after it.
+#
+#   Put them in a `.env` beside this file:
+#
+#       CLAUDIO_DOMAIN=claudio.example.com
+#       CLAUDIO_TLS_DIR=/etc/letsencrypt/live/claudio.example.com
+#
+# BEFORE THE FIRST RUN, TWO TOKEN FILES.  Both are gitignored, because a token
+# in a repository is not a token:
+#
+#   echo '["<account-uuid>.<secret>"]' > server/tokens.json    # who may SHIP
+#   echo '{"<reader-token>": "*"}'     > server/readers.json   # who may READ
+#
+# Without `readers.json` the api service REFUSES TO START and exits 4, and that
+# is the intended first experience rather than a fault: it binds `0.0.0.0`
+# inside this network, `_is_loopback` reads that as exposed -- correctly, since
+# every other container here can reach it -- and an unauthenticated read API
+# serves every record in the store, email addresses included. The exposure and
+# the auth are decided together or not at all.
+
+name: claudio
+
+x-common: &common
+  restart: unless-stopped
+  # The compose network and nothing else. No service here needs to reach the
+  # internet, and the proxy is the only one anything reaches from outside.
+  networks: [claudio]
+
+services:
+
+  # ---- the writer --------------------------------------------------------
+  ingest:
+    <<: *common
+    build:
+      context: ../..
+      dockerfile: server/oci/Containerfile.linux.ingest
+    image: claudio-ingest:local
+    volumes:
+      # READ-WRITE, and this is the only service that gets it that way.
+      - ${CLAUDIO_STORE:-../.store}:/var/lib/claudio-usage
+      # SHIPPING tokens only. The api never sees this file -- `serve()` does not
+      # even open it with `--no-ship` -- because a machine that ships is not
+      # thereby entitled to read.
+      - ${CLAUDIO_TOKENS:-../tokens.json}:/etc/claudio/tokens.json:ro
+    healthcheck:
+      # `/healthz` is unversioned, unenveloped and served BEFORE reader auth, so
+      # it needs no credential. There is no curl in this base and there is not
+      # going to be; use the Python that is already here.
+      test: ["CMD", "python", "-c",
+             "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8787/healthz',timeout=5).status==200 else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  # ---- the reader --------------------------------------------------------
+  api:
+    <<: *common
+    build:
+      context: ../..
+      dockerfile: server/oci/Containerfile.linux.api
+    image: claudio-api:local
+    volumes:
+      # `:ro`, AND THE PREFLIGHT WARNS IF IT IS NOT.  The service writes nothing
+      # either way -- that is enforced in `serve.py` -- but a mount that was
+      # meant to say `:ro` and does not is the day somebody starts this image
+      # without `--no-ship` and gets a second writer.
+      - ${CLAUDIO_STORE:-../.store}:/var/lib/claudio-usage:ro
+      # READER tokens only.
+      - ${CLAUDIO_READERS:-../readers.json}:/etc/claudio/readers.json:ro
+    depends_on:
+      ingest:
+        # NOT `service_started`.  A reader refuses to start (exit 9) when
+        # `<root>/accounts` does not exist, and the writer is what creates it --
+        # so on a fresh store the api would crash-loop until the ingest service
+        # happened to get there first. Waiting for the writer's own health check
+        # removes the race rather than papering over it with a restart policy.
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8787/healthz',timeout=5).status==200 else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  # ---- the agent surface -------------------------------------------------
+  mcp:
+    <<: *common
+    build:
+      context: ../..
+      dockerfile: server/oci/Containerfile.linux.mcp
+    image: claudio-mcp:local
+    environment:
+      CLAUDIO_API: http://api:8787
+      # THERE IS DELIBERATELY NO `CLAUDIO_API_TOKEN` HERE, AND SETTING ONE MAKES
+      # THIS SERVICE REFUSE TO START (exit 7). Served over HTTP every caller
+      # presents their own bearer token and the api applies that reader's scope;
+      # an ambient token would be inherited by a caller who sent none, so this
+      # surface would answer questions the caller was never entitled to ask.
+      # It belongs to the stdio transport, where the launcher IS the caller:
+      #   docker run -i --rm -e CLAUDIO_API_TOKEN=... claudio-mcp:local stdio
+    # NO `volumes:` AT ALL. Not the store, not read-only, not the token files.
+    # A directory that is not mounted cannot be read by accident.
+    depends_on:
+      api:
+        condition: service_healthy
+
+  # ---- the only published port -------------------------------------------
+  proxy:
+    <<: *common
+    build:
+      context: ../..
+      dockerfile: server/oci/Containerfile.linux.proxy
+    image: claudio-proxy:local
+    environment:
+      CLAUDIO_DOMAIN: ${CLAUDIO_DOMAIN:-localhost}
+      # The upstream watcher (see `depends_on` below and
+      # `entrypoint-proxy.sh`). Passed through so the kill switch is reachable
+      # from a `.env` rather than only from `docker run` -- a documented switch
+      # that does nothing in the supported way of starting this stack is a
+      # documented switch nobody can use.
+      CLAUDIO_PROXY_WATCH: ${CLAUDIO_PROXY_WATCH:-1}
+      CLAUDIO_PROXY_WATCH_SECONDS: ${CLAUDIO_PROXY_WATCH_SECONDS:-15}
+    volumes:
+      # If CLAUDIO_TLS_DIR is set it is a host directory holding your real
+      # `fullchain.pem` and `privkey.pem`; if it is not, this is a named volume
+      # the proxy generates a self-signed pair into on first start. Either way
+      # nothing in the nginx configuration changes -- the paths are fixed and
+      # the domain is an environment variable.
+      - ${CLAUDIO_TLS_DIR:-claudio-tls}:/etc/claudio/tls
+      # The operator's own server blocks, if any. A glob matching nothing is
+      # not an error, so this is optional in practice.
+      - ${CLAUDIO_NGINX_D:-./nginx/nginx.d.empty}:/etc/claudio/nginx.d:ro
+    ports:
+      # PINNED TO 127.0.0.1, and that is not a formality. This stack has no
+      # transport security worth the name behind the proxy: the bearer tokens
+      # are ROUTING LABELS, there is no token expiry and no rate limiting, and
+      # the read API serves every record in the store including email addresses
+      # to anyone holding a reader token. Publishing `8443:8443` instead of
+      # `127.0.0.1:8443:8443` puts that on every interface of the host.
+      # Change it deliberately, for a network you trust, and read
+      # `server/README.md`'s trust section first.
+      - "127.0.0.1:${CLAUDIO_HTTP_PORT:-8080}:8080"
+      - "127.0.0.1:${CLAUDIO_HTTPS_PORT:-8443}:8443"
+    depends_on:
+      # nginx resolves an upstream name ONCE, when the configuration loads, and
+      # EXITS if it cannot -- so this ordering is what makes the proxy start at
+      # all. It is a loud refusal rather than a steady 502, which is the
+      # direction this project wants.
+      #
+      # THAT SENTENCE IS ABOUT STARTUP, AND THE OTHER DIRECTION IS THE ONE THAT
+      # BITES YOU LATER. Because the name is resolved once, an address that
+      # MOVES afterwards is never noticed. Docker reassigns container addresses
+      # on restart: restarting one service alone reclaims the same address, but
+      # restarting TWO at once races them and they can swap. Reproduced on the
+      # third attempt of `docker compose restart ingest api` -- ingest and api
+      # exchanged 172.28.0.2 and 172.28.0.3, nginx kept the old pair, and both
+      # routes crossed. Every service here is `restart: unless-stopped`, so a
+      # crashed or recreated backend reaches that state with nobody watching.
+      #
+      # TWO THINGS ADDRESS IT AND NEITHER IS A CONFIGURATION CHANGE TO NGINX.
+      # The proxy's entrypoint runs an upstream watcher that re-resolves the
+      # three names every 15s and reloads nginx when one moves (see
+      # `entrypoint-proxy.sh`; `CLAUDIO_PROXY_WATCH=0` turns it off). The
+      # health check below is the second half, and it is DETECTION, not repair:
+      # plain `docker compose` does not restart an unhealthy container -- that
+      # is a Swarm and Kubernetes behaviour -- so an `unhealthy` proxy here is
+      # a red line in `docker compose ps` and nothing more.
+      #
+      # THE MANUAL REMEDY, WHICH STILL WORKS AND IS STILL WORTH KNOWING:
+      #
+      #     docker compose -f server/oci/compose.yml exec proxy nginx -s reload
+      #
+      # `docker compose up -d` does not do it for you, because the proxy is not
+      # recreated when its dependency is.
+      - ingest
+      - api
+      - mcp
+    healthcheck:
+      # ONE ROUTE PER UPSTREAM, and the thing being asserted is that a BACKEND
+      # answered -- not that it answered 200. `GET /sender` is a 404 from the
+      # ingest door (it is POST /v1/ship), `GET /api/v1/health` is a 401 from
+      # the api once readers.json is mounted, and `GET /mcp` is a 404 from the
+      # mcp: all three are the correct answers and all three prove the hop.
+      # What is unhealthy is nginx answering for them.
+      #
+      # AN ANSWER IS REQUIRED, NOT MERELY THE ABSENCE OF A BAD ONE. The first
+      # draft was `... | grep -qE ' (502|504) ' && exit 1`, unhealthy only on a
+      # bad gateway -- and proven inside the running proxy against a port
+      # nothing listens on, it reported HEALTHY. Worse, with the mcp stopped
+      # the real answer for `/mcp` was an EMPTY status line and not a 502,
+      # because nginx dropped the connection. So the `*)` arm below is not a
+      # hypothetical: it is the arm the real failure takes.
+      #
+      # `nc` and not `wget`: busybox `wget` exits non-zero on any 4xx, so it
+      # cannot tell a correct 404 from a bad gateway, which is the single
+      # distinction this check exists to make.
+      #
+      # THE `sleep 1` IS LOAD-BEARING AND IS NOT A DELAY. busybox `nc` exits as
+      # soon as its stdin reaches EOF, so a bare `printf | nc` sends the
+      # request, closes and reads nothing -- measured as three empty status
+      # lines against a perfectly healthy stack, with nginx logging `499` for
+      # each. Holding stdin open past the write is what lets the response
+      # arrive; `-w 3` bounds it either way.
+      #
+      # A BLOCK SCALAR, not a quoted flow sequence: the command contains
+      # carriage returns, and inside a double-quoted YAML scalar those are
+      # escapes YAML consumes before the shell ever sees them.
+      #
+      # WHAT THIS DOES NOT CATCH: a crossed pair. Through the reproduced
+      # address swap it reported `healthy`, correctly -- both backends were
+      # answering and nothing was 502. An upstream that is ABSENT is this
+      # check's; one that has MOVED is the watcher's.
+      test:
+        - CMD-SHELL
+        - >-
+          for r in /sender /api/v1/health /mcp; do
+          s=$$({ printf 'GET %s HTTP/1.0\r\nHost: hc\r\nConnection: close\r\n\r\n' "$$r"; sleep 1; }
+          | nc -w 3 127.0.0.1 8080 | head -n 1);
+          case "$$s" in
+          HTTP/*50[24]*) exit 1 ;;
+          HTTP/*) ;;
+          *) exit 1 ;;
+          esac; done; exit 0
+      interval: 15s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+networks:
+  claudio:
+    driver: bridge
+
+volumes:
+  claudio-tls:

@@ -1,0 +1,53 @@
+# The ignore file for `Containerfile.linux.api`, and it is deliberately NOT at
+# the repository root.
+#
+# IT IS A SEPARATE FILE FROM `Containerfile.linux.ingest.dockerignore` AND THE TWO
+# ARE BYTE-IDENTICAL TODAY.  That is not an oversight to be tidied into a
+# shared file: BuildKit finds an ignore file by the Dockerfile's own name, so
+# there is nowhere shared to put it that is not the context root -- and a root
+# `.dockerignore` is refused by a test in `usage/tests/test_all.py` on the
+# grounds that a root-level container file reads as the way to run the
+# project.  The mcp and proxy images' ignore files are genuinely different
+# from these two and from each other, which is the whole mechanism the split
+# rests on.
+#
+# BuildKit looks for `<dockerfile>.dockerignore` beside the Dockerfile before
+# it looks for `.dockerignore` at the context root, so this scopes the rules to
+# this one image and leaves the root alone.  That matters twice.  A test in
+# `usage/tests/test_all.py` walks the repository root for container files by
+# NAME and refuses `.dockerignore` among them -- "a root-level compose file is
+# worse than one under usage/: it reads as the way to run the project" -- and
+# that guard is right, so the answer is to not put one there rather than to
+# widen it.  And the two published images stage genuinely different things, so
+# one shared list at the root would have to be the union of both, which is a
+# list that describes neither.
+#
+# The context is the REPOSITORY ROOT, because the image needs `server/srv/` and
+# `server/oci/` and neither is a parent of the other.  Everything else is
+# excluded rather than merely unused: `test.sh` alone is 300 kB, `fixtures/`
+# carries captured payloads, and `server/README.md` documents building a venv
+# in the checkout -- 50 MB of build artefact that would otherwise be uploaded
+# to the daemon on every build.
+#
+# This does NOT affect `server/Dockerfile`, the development image.  That one
+# takes `server/` as its context, so `server/.dockerignore` is what applies
+# there -- a bare `*`, because that image contains no source at all and
+# bind-mounts the working tree instead.
+#
+# Last match wins, so the `__pycache__` line at the bottom is what keeps a
+# developer's stale byte-code out of a published image.
+# WHAT THIS CONTEXT CONTAINS, NAMED RATHER THAN SWEPT IN.
+#
+# `!/server/oci/**` used to re-include the whole directory, which was harmless
+# while `server/oci/` held one image's files.  It now holds four images' files,
+# including the proxy's nginx configuration and (on a FreeBSD builder) staged
+# package trees of hundreds of megabytes.  Named explicitly instead, so this
+# image's context is exactly the four things it COPYs and a fifth has to be
+# added here on purpose.
+*
+!/LICENCE
+!/server/srv/**
+!/server/oci/entrypoint.sh
+!/server/oci/preflight.py
+!/server/oci/requirements-linux.txt
+**/__pycache__

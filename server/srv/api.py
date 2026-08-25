@@ -107,6 +107,11 @@ TRANSPORT_REASONS = (
     # account this token may not read must not look like an account that has
     # shipped nothing, which is the distinction the whole vocabulary exists for.
     "account-not-permitted",
+    # The other half of the same rule, and the half that was missing.
+    # `account-not-permitted` only ever fired against a caller who NAMED an
+    # account it could not read; a caller that named none was answered in
+    # full.  See `SCOPE_FREE_ROUTES`.
+    "account-required-for-this-token",
     "unauthorised",
     "duckdb-missing",
     "engine-disagreement",
@@ -123,6 +128,65 @@ TRANSPORT_REASONS = (
 )
 
 REFUSAL_REASONS = tuple(sorted(set(query.REASONS) | set(TRANSPORT_REASONS)))
+
+# ---------------------------------------------------------------------------
+# what a SCOPED reader token may ask
+# ---------------------------------------------------------------------------
+#
+# A reader token is either `"*"` -- everything, the ordinary case a front end
+# holds -- or a list of account UUIDs.  The list form was gated on the
+# `account` QUERY PARAMETER alone, and `Readers.permits` returned True whenever
+# the caller named no account at all, delegating the omitted case to "the route
+# ... and `store` already refuses to total across accounts".  THAT DELEGATION
+# IS FALSE, and it was measured against the running stack rather than reasoned
+# about: `store` refuses to TOTAL across accounts; it returns ROWS across them
+# happily.  With a token scoped to one account,
+#
+#   GET /api/v1/search?text=<other account's email>   -> 200 ok, their rows
+#   GET /api/v1/lookup?field=session_id&value=<theirs> -> 200 ok, their rows
+#   GET /api/v1/accounts                               -> 200 ok, both
+#   GET /api/v1/diagnostics                            -> 200 ok, both
+#
+# and identically through the MCP surface, which forwards the caller's token:
+# `tools/call search` returned `isError: false` and another account's rows to
+# the agent.  So the scope held only against a caller who cooperated by naming
+# the account it was not allowed to read.
+#
+# SCOPE IS DECIDED FROM THE TOKEN NOW, NOT FROM THE PARAMETER, and it is
+# applied AS A REFUSAL, never as a filter -- an account outside the scope is
+# named, because a silently narrowed answer is indistinguishable from an
+# account that has shipped nothing, and telling those two apart is the whole
+# reason this API spells `no-data`, `filtered-to-nothing` and `unanswerable` as
+# three different words.
+#
+# These three routes are the exception, and each earns it: none of them reads a
+# record.  `openapi` and `capabilities` describe the server itself -- and
+# `capabilities` is how a client learns what a null means here, so refusing it
+# would make a scoped token unable to read its own answers.  `health` is a
+# liveness question whose result carries a COUNT of accounts and no identity;
+# `meta` is narrowed for it exactly as for everything else.
+SCOPE_FREE_ROUTES = ("capabilities", "health", "openapi")
+
+# And these two cannot be scoped AT ALL, so each gets its own sentence rather
+# than the generic remedy.  `aggregate/per-account` fans out over every account
+# by design and REFUSES `?account=`; `accounts` reads no `account` parameter, so
+# passing one is `unknown-query-key`.  Telling either caller to "pass
+# ?account=<uuid>" would be a confidently wrong instruction that produces a
+# second refusal -- which is the exact failure a remedy exists to avoid, and
+# `_refusal`'s docstring calls a remedy that is really a complaint the one
+# thing it must never return.  The value is the sentence; `%s` is the covered
+# UUIDs, which is also how a scoped caller discovers its own scope.
+SCOPE_UNSCOPEABLE_ROUTES = {
+    "aggregate/per-account":
+        "this route fans out over every account by design and refuses "
+        "`?account=`, so it cannot be narrowed to a token's scope. Ask it once "
+        "per account you cover: GET " + PATH_V1 + "aggregate?account=<uuid>"
+        "&by=<column>. This token covers %s",
+    "accounts":
+        "this route lists every account in the store and reads no `?account=`, "
+        "so it cannot be narrowed to a token's scope. For one account use GET "
+        + PATH_V1 + "windows?account=<uuid>. This token covers %s",
+}
 
 CATALOGUE = PATH_V1 + "capabilities"
 
@@ -170,6 +234,52 @@ WIRE_SPELLINGS = (
     ("call breakdown_per_account()",
      "call GET " + PATH_V1 + "aggregate/per-account"),
 )
+
+
+def _scoped_meta(body, scope):
+    """Narrow `meta.accounts` to what this token covers, and SAY it is narrow.
+
+    `Api._meta` attaches `accounts` -- identity, email address,
+    `organization_uuid`, `account_uuid` -- for every account in the snapshot,
+    on EVERY payload, built from the store and never from the caller.
+    Measured: a token scoped to one account asking `/api/v1/search?limit=100`
+    got rows from its own account and a `meta.accounts` naming the other one,
+    that account's address and both its UUIDs.
+
+    It is the one leak no per-route gate closes, because it is attached AFTER
+    a route has correctly answered about the account it was allowed to answer
+    about -- so it is closed here, once, on the way out, rather than in
+    fourteen routes that would each be a place to forget.
+
+    NARROWED WITH A NOTE, not silently.  An unqualified short list is a second
+    wrong answer: "this store holds one account" is a claim, and a scoped
+    reader has no way to tell it from the truth.  `scope is None` -- the
+    ordinary `"*"` token a front end holds -- returns the payload untouched,
+    byte for byte.
+    """
+    if scope is None or not isinstance(body, dict):
+        return body
+    meta = body.get("meta")
+    if not isinstance(meta, dict):
+        return body
+    allowed = set(scope)
+    accounts = meta.get("accounts")
+    if isinstance(accounts, list):
+        meta["accounts"] = [a for a in accounts
+                            if not isinstance(a, dict)
+                            or a.get("account_uuid") in allowed]
+    # The store's absolute path travels with the identity list it used to sit
+    # beside: a scoped token is by definition a narrower consumer -- a
+    # reporting script, a per-team reader -- and a filesystem path on the
+    # server tells it nothing it can act on.
+    if "root" in meta:
+        meta["root"] = None
+    meta["scope"] = sorted(allowed)
+    meta["accounts_are"] = (
+        "the accounts THIS TOKEN covers, not every account in the store. A "
+        "short list here is a statement about the token and not about the "
+        "store, and `root` is null for the same reason.")
+    return body
 
 
 def wire_remedy(remedy):
@@ -616,11 +726,168 @@ ROUTE_PARAMS = {
     "health": (),
     "histogram": SPEC_PARAMS + ("interval", "metric"),
     "lookup": ("account", "field", "value"),
+    "openapi": (),
     "search": SPEC_PARAMS + ("stream", "cursor", "verify"),
     "values": SPEC_PARAMS + ("fields",),
     "window": ("account", "kind", "resets_at"),
     "windows": ("account", "kind"),
 }
+
+
+# The TYPE of every parameter above, in one table beside the names, so the
+# OpenAPI document is derived rather than hand-written.  A hand-written spec
+# would be a fourth place to forget -- this package already derives the route
+# list, the refusal vocabulary and the coverage bases from source, with tests,
+# for exactly that reason -- and a drifted spec is worse than none, because
+# people trust it.
+#
+# `schema` is the OpenAPI fragment; `about` is the one-line description.  Both
+# are consumed by `openapi()` below and by `/api/v1/capabilities`, so the two
+# cannot disagree about what a parameter is.
+PARAM_TYPES = {
+    "account":   ({"type": "string", "format": "uuid"},
+                  "one account UUID; most routes refuse to answer across "
+                  "accounts because different plans have different denominators"),
+    "by":        ({"type": "string"},
+                  "the column or tag to group by; `tag:<key>` groups by a user tag"),
+    "cursor":    ({"type": "string"},
+                  "an opaque page cursor from a previous response; keyset over "
+                  "(ts, request_id), so a row appended into a served page cannot "
+                  "shift the ones after it"),
+    "field":     ({"type": "string"},
+                  "which identifier to look up by: request_id, session_id or prompt_id"),
+    "fields":    ({"type": "string"},
+                  "comma-separated column names to report value distributions for"),
+    "interval":  ({"type": "integer", "minimum": 1},
+                  "histogram bucket width in seconds"),
+    "kind":      ({"type": "string", "enum": ["five_hour", "seven_day"]},
+                  "which plan window"),
+    "limit":     ({"type": "integer", "minimum": 1},
+                  "maximum rows or buckets to return"),
+    "metric":    ({"type": "string"},
+                  "what each histogram bucket measures"),
+    "order":     ({"type": "string", "enum": ["asc", "desc"]}, "sort direction"),
+    "resets_at": ({"type": "number"},
+                  "the window's reset epoch, in seconds"),
+    "since":     ({"type": "number"},
+                  "lower time bound, epoch seconds; -inf is an accepted spelling "
+                  "of no bound, NaN is refused"),
+    "stream":    ({"type": "string", "enum": ["a", "b"]},
+                  "a = one row per API request, b = one row per plan observation"),
+    "text":      ({"type": "string"}, "free-text match over the string columns"),
+    "until":     ({"type": "number"},
+                  "upper time bound, epoch seconds; +inf is an accepted spelling "
+                  "of no bound, NaN is refused"),
+    "value":     ({"type": "string"}, "the identifier to look up"),
+    "verify":    ({"type": "string"},
+                  "ask the reader to cross-check the engine against the pure "
+                  "predicate and report any disagreement"),
+}
+
+
+def openapi(routes, base=PATH_V1):
+    """An OpenAPI 3.1 document, DERIVED from the tables above.
+
+    Never hand-written, and never the authority on meaning.  OpenAPI has no
+    field for the things that make this API safe to consume: that `outcome` is
+    a closed set of four values, three of which are DIFFERENT KINDS OF EMPTY;
+    that a null coverage means "nobody said" and never zero; that no
+    cross-account total exists anywhere.  A client generated from this document
+    alone would render `no-data` and `filtered-to-nothing` identically, which is
+    the exact failure the envelope exists to prevent.
+
+    So the description points at `/api/v1/capabilities` as the authority and
+    says so in the first paragraph, rather than pretending to replace it.
+    """
+    paths = {}
+    for full in routes:
+        route = full[len(base):]
+        params = []
+        for name in ROUTE_PARAMS.get(route, ()):
+            schema, about = PARAM_TYPES.get(name, ({"type": "string"}, ""))
+            params.append({"name": name, "in": "query", "required": False,
+                           "schema": dict(schema), "description": about})
+        paths[full] = {"get": {
+            "operationId": route.replace("/", "_").replace("-", "_"),
+            "parameters": params,
+            "security": [{"readerToken": []}],
+            "responses": {
+                "200": {"description":
+                        "an envelope whose `outcome` is ok, no-data or "
+                        "filtered-to-nothing; the last two are DIFFERENT and a "
+                        "client must not conflate them",
+                        "content": {"application/json": {
+                            "schema": {"$ref": "#/components/schemas/Envelope"}}}},
+                "400": {"description": "unanswerable; carries a refusal with a "
+                                       "reason and a remedy that is never null",
+                        "content": {"application/json": {
+                            "schema": {"$ref": "#/components/schemas/Refusal"}}}},
+                "401": {"description": "no usable reader token"},
+                "403": {"description": "this token may not read that account"},
+                "503": {"description": "the engine is absent; named, never an "
+                                       "empty result"},
+            }}}
+    return {
+        "openapi": "3.1.0",
+        "info": {
+            "title": "claudio store, read API",
+            "version": API_VERSION,
+            "description":
+                "GET %scapabilities FIRST and treat it as the authority. This "
+                "document describes paths, parameters and types; it cannot "
+                "express the semantics that make the API safe to consume -- the "
+                "closed `outcome` vocabulary, which of its values are different "
+                "kinds of empty, what a null means at a given JSON path, or "
+                "that no total spanning two accounts exists anywhere. A client "
+                "built from this file alone will render an unknown coverage as "
+                "zero and an excluded-everything filter as no-data."
+                % base,
+        },
+        "components": {
+            "securitySchemes": {"readerToken": {
+                "type": "http", "scheme": "bearer",
+                "description": "a token from the server's readers file; its "
+                               "scope is a set of accounts or \"*\""}},
+            "schemas": {
+                "Envelope": {
+                    "type": "object",
+                    "required": ["outcome", "api_version"],
+                    "properties": {
+                        "outcome": {"type": "string", "enum": list(OUTCOMES)},
+                        "api_version": {"type": "string"},
+                        "result": {"type": "object",
+                                   "description": "ABSENT on any refusal, "
+                                                  "deliberately: iterating it "
+                                                  "must raise rather than "
+                                                  "render an empty table"},
+                        "meta": {"type": "object"},
+                        "empty": {"type": "object",
+                                  "description": "present when outcome is "
+                                                 "no-data or "
+                                                 "filtered-to-nothing"},
+                    }},
+                "Refusal": {
+                    "type": "object",
+                    "required": ["outcome", "refusal"],
+                    "properties": {
+                        "outcome": {"type": "string",
+                                    "enum": [OUTCOME_UNANSWERABLE]},
+                        "refusal": {
+                            "type": "object",
+                            "required": ["reason", "remedy"],
+                            "properties": {
+                                "reason": {"type": "string",
+                                           "enum": list(REFUSAL_REASONS)},
+                                "detail": {"type": ["string", "null"]},
+                                "remedy": {"type": "string",
+                                           "description": "never null: a "
+                                                          "refusal with no "
+                                                          "action in it reads "
+                                                          "as a fault"},
+                            }}}},
+            }},
+        "paths": paths,
+    }
 
 
 def unknown_params(route, multi):
@@ -732,7 +999,17 @@ class Api(object):
         return sorted(PATH_V1 + self._route_name(n[len("_v1_"):])
                       for n in dir(self) if n.startswith("_v1_"))
 
-    def handle(self, path, params, multi, now=None):
+    def handle(self, path, params, multi, now=None, scope=None):
+        """Answer one question.
+
+        `scope` is the CALLER's authority: `None` means every account, which
+        is the ordinary `"*"` reader token and is the default so that every
+        existing caller behaves exactly as it did.  A list means this token
+        may read those accounts and no others.  It is `None` rather than a
+        `"*"` sentinel because this module is pure and holds no copy of
+        `serve.ALL_ACCOUNTS`: the door translates its own spelling once, where
+        it already knows what a token is.
+        """
         if path.startswith(PATH_LEGACY) and not path.startswith(PATH_V1):
             # Named, with the version AND the replacement in the remedy.  A 404
             # with no route out of it is how a client author concludes the
@@ -756,6 +1033,15 @@ class Api(object):
             return _refusal(
                 "unknown-endpoint", path,
                 "endpoints: " + ", ".join(self.routes()), status=404)
+        # THE TOKEN'S SCOPE, BEFORE THE QUESTION IS EVEN PARSED.  See
+        # `SCOPE_FREE_ROUTES` for the measurement; the short version is that
+        # this was gated on `?account=` and a caller who named no account read
+        # the whole store.  A 404 still wins over it, because an endpoint that
+        # does not exist does not exist for anybody and the route list is
+        # public at `/api/v1/openapi`.
+        denied = self._scope_refusal(slug, params, scope)
+        if denied is not None:
+            return denied
         # Per DERIVATION, before anything is read.  `meta.store_problems`
         # describes THIS store as of THIS answer; a list accumulated on a
         # process-lifetime store handle described how many queries somebody
@@ -780,15 +1066,65 @@ class Api(object):
             # a different sentence.  It is the single most useful thing to say
             # where it IS true, because `account_uuid=` is the module spelling
             # a client following an older remedy would have sent.
-            scope = (" Scope with ?account=<uuid> -- account_uuid= is the "
-                     "module spelling and is not read here."
-                     if "account" in known else "")
+            # NAMED `scoping`, not `scope`, and that is not a style
+            # preference. `scope` is now this function's PARAMETER -- the
+            # caller's account list -- and rebinding it to a sentence works
+            # today only because this branch returns immediately. A later edit
+            # that fell through would hand `_scoped_meta` a string, whose
+            # `set()` is a set of CHARACTERS, and every account would be
+            # filtered out of `meta` in silence.
+            scoping = (" Scope with ?account=<uuid> -- account_uuid= is the "
+                       "module spelling and is not read here."
+                       if "account" in known else "")
             return _refusal(
                 "unknown-query-key", ", ".join(stray),
                 "%s reads: %s%s.%s"
                 % (path, ", ".join(sorted(known)) or "no parameters",
-                   filters, scope))
-        return route(params, multi or {}, now)
+                   filters, scoping))
+        status, body = route(params, multi or {}, now)
+        return status, _scoped_meta(body, scope)
+
+    @staticmethod
+    def _scope_refusal(slug, params, scope):
+        """(status, body) when this token may not ask THIS question, else None.
+
+        Three answers, in the order a caller meets them:
+
+          the account it named is outside the scope   -> account-not-permitted
+          it named none, and the route reads records  -> account-required-...
+          the route cannot be scoped to one account   -> ...with its own remedy
+        """
+        if scope is None:
+            return None
+        asked = params.get("account")
+        if asked:
+            if asked in scope:
+                return None
+            return _refusal(
+                "account-not-permitted",
+                "this token may not read account %s" % asked,
+                "ask for an account this token covers (%s), or ask the door's "
+                "operator to widen the token's scope" % ", ".join(scope),
+                status=403)
+        if slug in SCOPE_FREE_ROUTES:
+            return None
+        if slug in SCOPE_UNSCOPEABLE_ROUTES:
+            return _refusal(
+                "account-required-for-this-token",
+                "%s answers about every account in the store and this token "
+                "covers %d of them" % (slug, len(scope)),
+                SCOPE_UNSCOPEABLE_ROUTES[slug] % (", ".join(scope),),
+                status=403)
+        return _refusal(
+            "account-required-for-this-token",
+            "%s can return rows and identities from any account in the store, "
+            "and this token covers only some of them" % slug,
+            "pass ?account=<uuid> naming one of the accounts this token "
+            "covers: " + ", ".join(scope) + ". A scoped token is refused by "
+            "name rather than answered with a narrowed result, because a "
+            "narrowed result is indistinguishable from an account that has "
+            "shipped nothing",
+            status=403)
 
     # -- shared ------------------------------------------------------------
 
@@ -895,6 +1231,11 @@ class Api(object):
                               + (", ".join(listed) or "(none)"), status=404)
 
     # -- 3.1 capabilities --------------------------------------------------
+
+    def _v1_openapi(self, params, multi, now):
+        """The OpenAPI document, derived.  See `openapi()` for why it is not
+        the authority on meaning."""
+        return _ok(openapi(self.routes()))
 
     def _v1_capabilities(self, params, multi, now):
         """The self-description.  omini hardcodes nothing.
@@ -1728,7 +2069,21 @@ class Api(object):
             if refused(sel):
                 return _as_refusal(sel)
             inside = sorted(sel.rows, key=lambda r: r.get("ts") or 0)
-        cov = query.coverage_for(snap.report, uuid, inside)
+        # COMPUTED ONLY WHEN THE ROWS WERE READ.  `query.coverage_for` counts
+        # placement PER ROW, so handing it the empty list the refusal branch
+        # leaves behind produced a full census of zeros --
+        # `placement.rows_total: 0` about a set this payload says three keys
+        # earlier it could not read, `windows.touched: 0` about the window
+        # sitting in `result.window` beside it, and
+        # `basis: "no-window-touched"`, which is a POSITIVE claim that none of
+        # these rows fell in any window.  Measured: byte-identical to the
+        # answer for a window that genuinely holds no requests, so two states
+        # produced one object and it asserted the false one.  `_v1_windows`
+        # contradicted it in the same breath, reporting `rows_total: 3` for
+        # the same account at the same moment, because it builds coverage from
+        # `snap.rows(uuid)` -- the reconciler's rows, which need no engine.
+        cov = (None if requests_unavailable
+               else query.coverage_for(snap.report, uuid, inside))
 
         reset_key = window.KINDS[kind][1]
         samples = [{"record": rec, "shipping_host": host}
@@ -1768,7 +2123,33 @@ class Api(object):
                         "one real record names a window that had already "
                         "closed 9 h 49 m earlier.",
             },
-            "coverage": coverage_payload(cov, "the rows inside this window"),
+            # The same treatment `requests` has six keys above, and for the
+            # same sentence: there is deliberately no `placement` and no
+            # `windows` here, because a client reading
+            # `coverage.placement.rows_total` should raise rather than render
+            # a zero about rows nobody read.  The fraction half is safe today
+            # only by luck -- nothing emits an attestation, so `fraction` is
+            # `None` whatever row set is passed -- and the moment one exists
+            # this would have become a `known: true` measurement computed from
+            # an empty list.
+            # Keyed on `cov`, not on `requests_unavailable` again.  The two
+            # are the same condition -- `cov` is None exactly when the rows
+            # were not read -- and asking it once means the whole decision
+            # lives on the `cov = ...` line above, where `mutate.py` can undo
+            # it in a single substitution.  Spread over two conditions, no
+            # single mutation could restore the census, and the row would have
+            # read `caught` for a guard nothing had actually exercised.
+            "coverage": coverage_payload(cov, "the rows inside this window")
+            if cov is not None else {
+                "unavailable": requests_unavailable,
+                "note": "coverage here describes the rows inside this window, "
+                        "and they could not be read. There is deliberately no "
+                        "`placement` and no `windows` key: a census of zeros "
+                        "is indistinguishable from a window that genuinely "
+                        "holds no requests. `/api/v1/windows` reports "
+                        "placement for this account from the reconciler's own "
+                        "rows, which need no engine.",
+            },
             "provisional_note": attribute.PROVISIONAL_NOTE,
             "lower_bound_note": LOWER_BOUND_NOTE,
         }
@@ -1856,8 +2237,14 @@ class Api(object):
                                        else store.INSTALL_HINT},
             "derived_ms": snap.derived_ms,
             "note": "`/healthz` is the unenveloped, unversioned shape "
-                    "operators and scripts read; this is the same question "
-                    "asked through the API envelope.",
+                    "operators and scripts read, and it names "
+                    "`engine.available` too -- it has to, because it is the "
+                    "only surface that answers without a reader token. This "
+                    "is the same question in MORE DETAIL, behind that token: "
+                    "the engine version and, when it is missing, the command "
+                    "that installs it. A 200 from either is the door being up "
+                    "and taking shipments; whether stream A can be queried is "
+                    "`engine.available` and nothing else.",
         }
         return _ok(result, self._meta(snap))
 
@@ -1970,10 +2357,24 @@ def _wire_window(row):
     if not isinstance(row, dict):
         return row
     out = dict(row)
-    for key in ("by", "by_tag"):
-        if isinstance(out.get(key), dict):
-            out[key] = {dim: bucketise(vals)
-                        for dim, vals in out[key].items()}
+    # TWO SHAPES, NOT ONE, AND THE LOOP THAT TREATED THEM AS ONE KILLED THE
+    # ROUTE.  `attribute._buckets` returns a NESTED `{dimension: {value:
+    # stats}}`, so iterating its keys as dimensions is right.
+    # `attribute._tag_buckets` returns a FLAT `{"k=v" or None: stats}` --
+    # deliberately not a partition -- so the same loop iterated the tag VALUES
+    # as if they were dimension names, handed each `stats` dict to
+    # `bucketise`, and produced a dict still keyed by `str` and `None`
+    # together: exactly the object `bucketise` exists to eliminate.
+    # `serve._respond`'s `json.dumps(obj, sort_keys=True)` then raised
+    # `TypeError: '<' not supported between instances of 'str' and 'NoneType'`
+    # inside the handler and the client got the connection dropped with NO
+    # RESPONSE AT ALL -- below even a named 500, on the one route that carries
+    # `by_tag`, for any window holding both a tagged and an untagged request,
+    # which is the ordinary state of every real machine.
+    if isinstance(out.get("by"), dict):
+        out["by"] = {dim: bucketise(vals) for dim, vals in out["by"].items()}
+    if isinstance(out.get("by_tag"), dict):
+        out["by_tag"] = bucketise(out["by_tag"])
     # The one number on this row that must not be readable as zero when it is
     # unknown -- and it sits beside `attributed_pp` and `residual_pp`.
     out["coverage"] = window_coverage_payload(out.get("coverage"))

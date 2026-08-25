@@ -1,0 +1,25 @@
+# The ignore file for `Containerfile.freebsd.proxy`.  Passed explicitly, for
+# the reason its two siblings give: buildah has no
+# `<dockerfile>.dockerignore` lookup, and a root-level `.containerignore` would
+# satisfy the letter of the "no container file at the repository root" guard in
+# `usage/tests/test_all.py` while defeating it.
+#
+#   buildah bud --ignorefile server/oci/Containerfile.freebsd.proxy.containerignore ...
+#
+# WHAT IS NOT IN THIS CONTEXT, AND WHY THAT IS THE POINT
+#
+#   `server/srv/` in its entirety.  This image proxies bytes: it parses no
+#   record, holds no token, opens no store and has no interpreter to do any of
+#   it with.  Leaving the package out of the CONTEXT rather than merely out of
+#   the COPY list means a later edit cannot put it back without also editing
+#   this file, which is a decision somebody has to make on purpose.
+#
+# The context is the REPOSITORY ROOT, because the image needs `LICENCE`, the
+# configuration under `server/oci/nginx/` and the staged FreeBSD tree, and no
+# one of them is a parent of the others.
+*
+!/LICENCE
+!/server/oci/nginx/**
+!/server/oci/entrypoint-proxy.sh
+!/server/oci/stage-freebsd-proxy/**
+**/__pycache__

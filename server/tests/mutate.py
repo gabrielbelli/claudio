@@ -510,9 +510,14 @@ MUTATIONS = [
      "        status, ack = self.door.ship(bearer(self.headers.get(\"Authorization\")),",
      "        status, ack = self.door.ship(next(iter(self.door.tenants.map), None),"),
 
+    # Re-anchored when the split gave `do_POST` a `path` local (the ship-off
+    # refusal needs the same value): the old row quoted
+    # `self.path.split("?")[0]` inline and silently stopped matching, which
+    # `mutate.py` reports as BAD PATCH rather than as caught -- the one verdict
+    # that is neither, and the reason it exists.
     ("door-http-any-path", "the door is one path; anything else is 404",
      "serve.py",
-     "        if self.path.split(\"?\")[0] != PATH_SHIP:",
+     "        if path != PATH_SHIP:",
      "        if False:"),
 
     # ------------------------------------------------------- the query layer
@@ -595,6 +600,37 @@ MUTATIONS = [
      "query.py",
      "        if col in INDEX_COLUMNS and None not in vals:",
      "        if True:"),
+
+    # ------------------------------------------ the read API's own two halves
+
+    ("window-by-tag-nested", "`by_tag` is FLAT and `by` is nested -- treating "
+     "them as one shape produces a dict keyed by str and None together, which "
+     "`json.dumps(sort_keys=True)` cannot order, so the handler raises and the "
+     "client gets NO response at all (measured: HTTP 000)",
+     "api.py",
+     '    if isinstance(out.get("by"), dict):\n'
+     '        out["by"] = {dim: bucketise(vals) for dim, vals in out["by"].items()}\n'
+     '    if isinstance(out.get("by_tag"), dict):\n'
+     '        out["by_tag"] = bucketise(out["by_tag"])',
+     '    for key in ("by", "by_tag"):\n'
+     '        if isinstance(out.get(key), dict):\n'
+     '            out[key] = {dim: bucketise(vals)\n'
+     '                        for dim, vals in out[key].items()}'),
+
+    ("window-coverage-census", "with no engine the window's coverage is "
+     "REFUSED, never a placement census of zeros about rows nobody read -- "
+     "which is byte-identical to a window that genuinely holds no requests",
+     "api.py",
+     "        cov = (None if requests_unavailable\n"
+     "               else query.coverage_for(snap.report, uuid, inside))",
+     "        cov = query.coverage_for(snap.report, uuid, inside)"),
+
+    ("healthz-no-engine", "`/healthz` names the engine, because it is the only "
+     "surface served before reader auth -- without it a door whose entire "
+     "stream-A half refuses every question reports healthy to monitoring",
+     "serve.py",
+     '        out["engine"] = {"name": "duckdb", "available": duckstore.available()}\n',
+     ''),
 
     # ------------------------------------------------------- the front end
     #
@@ -1099,7 +1135,16 @@ MUTATIONS = [
      "be read carries no `rows` key: an empty list reads as a window with no "
      "requests in it",
      "api.py",
+     # ANCHORED ON THE `requests` KEY, not on the bare `"unavailable":` line.
+     # The bare line stopped being unique the moment `coverage` beside it was
+     # given the same refusal shape, and `mutate.py` reported BAD PATCH rather
+     # than counting a guard it had not exercised -- which is the whole reason
+     # each `old` must match exactly once. A harness that silently patched the
+     # first of two matches would have tested the wrong object and called it
+     # caught.
+     '            "requests": {\n'
      '                "unavailable": requests_unavailable,',
+     '            "requests": {\n'
      '                "rows": [], "n": 0,\n'
      '                "unavailable": requests_unavailable,'),
 
@@ -1321,6 +1366,116 @@ MUTATIONS = [
      '        if account_uuid:\n            spec["account_uuid"] = account_uuid',
      '        if False:\n            spec["account_uuid"] = account_uuid'),
 
+    # ------------------------------------------------------------ the split
+    # The door became two processes over one store. These five are the edits
+    # that can lose data or manufacture a plausible zero, and each is here
+    # because it is invisible at the time: a stack with any of them still comes
+    # up, still answers, and still looks healthy.
+
+    ("split-lock-never-taken", "the WRITER's lock is still taken, so two "
+     "ingest processes cannot interleave the offsets an ack promises",
+     "serve.py",
+     "    fd = None\n    if ship_enabled:\n        fd = lock_root(root)",
+     "    fd = None\n    if False:\n        fd = lock_root(root)"),
+
+    ("split-lock-taken-by-reader", "the reader takes NO lock, so the api runs "
+     "beside the ingest service instead of refusing to start next to it",
+     "serve.py",
+     "    fd = None\n    if ship_enabled:\n        fd = lock_root(root)",
+     "    fd = None\n    if True:\n        fd = lock_root(root)"),
+
+    ("split-both-halves-off", "--no-api with --no-ship is refused by name; it "
+     "would bind a port and answer /healthz while serving nothing",
+     "serve.py",
+     "    if not api_enabled and not ship_enabled:",
+     "    if False and not api_enabled and not ship_enabled:"),
+
+    ("split-reader-blind-root", "a reader over a root with no accounts/ "
+     "refuses; accounts_in and Paths.accounts both swallow OSError, so it "
+     "would answer no-data about a store it is not looking at",
+     "serve.py",
+     '    if not ship_enabled and not os.path.isdir(os.path.join(root, "accounts")):',
+     "    if False:"),
+
+    ("split-reader-acks-a-shipment", "a reader refuses POST /v1/ship by name "
+     "(503 no-ship) rather than 404ing a route that exists or acking a write "
+     "it never made",
+     "serve.py",
+     "        if not self.door.ship_enabled:",
+     "        if False:"),
+
+    ("split-mcp-refusal-not-an-error", "a refusal reaches an MCP client as "
+     "isError, never as a successful empty answer a model reads as 'no data'",
+     "mcp.py",
+     'env.get("outcome") == "unanswerable"',
+     "False"),
+
+    # ---- concurrency and reader scope ------------------------------------
+    #
+    # The first of these is the one this matrix could not previously produce a
+    # finding for at all: nothing in the suite issued two API requests at the
+    # same moment, so a shared connection changed no assertion.
+
+    ("split-one-connection-for-every-thread", "each request thread gets its "
+     "own DuckDB cursor; one shared handle makes two concurrent readers "
+     "consume each other's rows -- 30 of 480 answered 200 ok carrying another "
+     "question's figures",
+     "store.py",
+     '        c = getattr(self._tl, "con", None)\n'
+     "        if c is None:\n"
+     "            c = base.cursor()\n"
+     "            self._tl.con = c\n"
+     "        return c",
+     "        return base"),
+
+    ("split-scope-decided-by-the-token", "a scoped reader token that names no "
+     "account is refused by name; gating on ?account= alone let it read every "
+     "other account's rows, identities and addresses",
+     "api.py",
+     "        if slug in SCOPE_FREE_ROUTES:\n            return None",
+     "        return None\n        if slug in SCOPE_FREE_ROUTES:\n"
+     "            return None"),
+
+    ("split-scope-reaches-the-api", "the door hands the caller's account list "
+     "to api.handle; without it every scope refusal is unreachable and the "
+     "gate is decorative",
+     "serve.py",
+     "        return None, list(scope)",
+     "        return None, None"),
+
+    ("split-meta-accounts-scoped", "meta.accounts is narrowed to the token's "
+     "scope; it enumerated every account's identity and email address on every "
+     "payload, after the route had correctly answered about one",
+     "api.py",
+     "    if scope is None or not isinstance(body, dict):\n        return body",
+     "    return body\n    if scope is None or not isinstance(body, dict):\n"
+     "        return body"),
+
+    ("split-duckdb-spill-is-absolute", "the spill directory is an absolute "
+     "path; DuckDB's own default is `.tmp` relative to the CWD, which in the "
+     "api container is `/` and unwritable",
+     "store.py",
+     '    return os.path.join(tempfile.gettempdir(), "claudio-duckdb")',
+     '    return ".tmp"'),
+
+    ("split-duckdb-spill-probed", "an unusable spill directory is named at "
+     "boot; unprobed it is an unexplained reader-failed on the first large "
+     "aggregation, and the cause is a directory name",
+     "store.py",
+     "        except OSError as exc:\n            return (",
+     "        except OSError as exc:\n            return None\n"
+     "            return (",),
+
+    ("split-reader-writes-nothing", "srv/store.py writes nothing outside the "
+     "spill probe, so an api handed a writable store by mistake still cannot "
+     "touch it",
+     "store.py",
+     '    def _rel(self, paths, stream="a"):',
+     "    def _touch(self):\n"
+     '        with open(os.path.join(self.root, "x"), "a") as fh:\n'
+     '            fh.write("x")\n\n'
+     '    def _rel(self, paths, stream="a"):'),
+
 ]
 
 
@@ -1373,7 +1528,7 @@ def main(argv=None):
     # SURVIVED, 1 BAD PATCH without duckdb against 161 caught, 0 survived, 0
     # bad patches with it, over the identical matrix and the identical source.
     # That pair was taken over the matrix AS IT THEN STOOD, 161 rows.  It is
-    # 169 now and still 169 caught / 0 survived / 0 bad patches; the no-duckdb
+    # 172 now and still 172 caught / 0 survived / 0 bad patches; the no-duckdb
     # half is deliberately not re-measurable, because the refusal below is the
     # thing those numbers bought.
     # All 42 were false.  They did not survive because nothing asserts the

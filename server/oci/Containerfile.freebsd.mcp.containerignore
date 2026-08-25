@@ -1,0 +1,49 @@
+# The ignore file for `Containerfile.freebsd.mcp`, and it is the strongest
+# statement this repository makes about what the mcp component is.
+#
+# buildah has no equivalent of BuildKit's `<dockerfile>.dockerignore` lookup,
+# so this one is not found by being beside the Containerfile: it is passed
+# explicitly, and the build command in the Containerfile's header does so.
+#
+#   buildah bud --ignorefile server/oci/Containerfile.freebsd.mcp.containerignore ...
+#
+# It could have gone at the context root under the name `.containerignore`,
+# which is what buildah looks for there.  It does not, for the reason
+# `Containerfile.linux.dockerignore` gives: a test in `usage/tests/test_all.py`
+# walks the repository root for container files by NAME and refuses them, on
+# the grounds that a root-level container file "reads as the way to run the
+# project".  `.containerignore` is not on that test's list today -- which makes
+# putting one there a way of satisfying the letter of a guard while defeating
+# it, and this repository has audited itself for exactly that shape more than
+# once.
+#
+# THE BOUNDARY IS STRUCTURAL, NOT A PROMISE.
+#
+#   The MCP surface is an HTTP CLIENT of the read API: a reader token, no store
+#   access, no account outside its scope.  Handing it the DuckDB engine or the
+#   store's query layer would be a privilege escalation and would defeat the
+#   split.  The Containerfile could simply not COPY them -- but then the next
+#   edit could, by accident, and nothing would say so.
+#
+#   With this file, `server/srv/store.py`, `duck.py`, `query.py`, `api.py` and
+#   `serve.py` ARE NOT IN THE BUILD CONTEXT AT ALL.  A `COPY server/srv/`
+#   added here fails the build by name rather than quietly producing a fatter
+#   image with a database handle in it.  That is the same reason the door's
+#   read API is gated by `readers.json` rather than by being unreachable: a
+#   property enforced by the shape of the thing beats one enforced by everyone
+#   remembering.
+#
+# The context is the REPOSITORY ROOT, because the image needs `LICENCE`,
+# `server/srv/mcp.py` and `server/oci/`, and no one of them is a parent of the
+# others.
+#
+# Last match wins, so the `__pycache__` line at the bottom is what keeps a
+# developer's stale byte-code out of a published image -- and it matters more
+# here than it does for Linux, because this image has no RUN and therefore
+# never re-compiles what it copies.
+*
+!/LICENCE
+!/server/srv/mcp.py
+!/server/oci/entrypoint-mcp.sh
+!/server/oci/stage-freebsd-mcp/**
+**/__pycache__

@@ -4013,6 +4013,27 @@ assert_eq "a held lock means this spawner stands down" "$(recv_starts_seen)" "0"
 # ...but a lock nobody released must not stop every future spawn for ever. It
 # is broken rather than obeyed, and that attempt still stands down, so breaking
 # it and claiming it are never one racy step.
+#
+# The lock is re-established immediately before it is aged, and that is not
+# belt and braces. The RECEIVER releases the spawn lock as it starts -- claudio
+# deliberately does not, because a receiver alive for hours would be removing a
+# lock some later spawner now holds -- so a stub receiver detached by an earlier
+# scenario can still be on its way here. On a slow machine it lands between the
+# `mkdir` above and the `touch` below, and then this `run` finds NO lock,
+# claims it and spawns: `recv.lock` exists at the assertion and the spawn count
+# is already 1, so both assertions in this block fail. That is a raced test over
+# a correct claudio, and it is what failed on the CI runner while passing on
+# macOS and in two Linux containers.
+#
+# Waiting for absence first is what makes it exact: the straggler's last act is
+# releasing the lock, so an empty path means it has finished and the lock
+# created next is ours.
+recv_lock_i=0
+while [ -e "$RDIR/recv.lock" ] && [ "$recv_lock_i" -lt 20 ]; do
+  sleep 1
+  recv_lock_i=$((recv_lock_i + 1))
+done
+mkdir -p "$RDIR/recv.lock"
 touch -t 200001010000 "$RDIR/recv.lock"
 out=$(run run)
 assert_file_not_exists "a stale lock is broken" "$RDIR/recv.lock"

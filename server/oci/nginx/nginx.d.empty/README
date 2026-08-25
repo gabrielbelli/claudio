@@ -1,0 +1,16 @@
+An empty directory, mounted at /etc/claudio/nginx.d when the operator has no
+additions of their own.
+
+Compose cannot mount "nothing", and a bind mount whose source does not exist is
+created by the daemon as a root-owned directory -- which the proxy runs as
+65534 and cannot read.  So the empty case is a real, committed, empty
+directory, and CLAUDIO_NGINX_D replaces it with yours.
+
+Two globs are read from here and they are disjoint by name:
+
+  http-*.conf     included at http level.  A whole `server { }` goes here --
+                  a redirect, a second vhost, your own TLS terminator.
+  server-*.conf   included INSIDE the plain 8080 server block, next to the
+                  routes.  A `location` goes here.
+
+One glob for both would try to include a whole `server { }` inside another one.

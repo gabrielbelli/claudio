@@ -53,6 +53,7 @@ Claude Code adds later, so the keys that arrive are counted and named.
 """
 
 import os
+import tempfile
 import threading
 
 from . import duck
@@ -61,9 +62,20 @@ from .query import Unanswerable, refused
 
 # Named once.  Every path that could produce a plausible empty result instead
 # of a missing dependency goes through `require()`.
+# One string, naming every platform this server is published for, because the
+# remedy is the whole point of the refusal and a remedy that does not work on
+# the machine reading it is a refusal with no way out.
+#
+# The FreeBSD line is not decoration: there is a published FreeBSD image, and
+# on FreeBSD `pip install duckdb` finds no wheel -- PyPI publishes macOS,
+# manylinux and Windows and nothing else -- so it falls back to the sdist and
+# compiles the C++ engine, for hours, if it succeeds at all.  `pkg` is the only
+# viable route there.  `brew` does not exist on FreeBSD either.
 INSTALL_HINT = (
     "the server's query layer needs DuckDB, which is not installed.\n"
-    "    python3 -m pip install duckdb\n"
+    "    python3 -m pip install duckdb          (Linux, macOS, Windows)\n"
+    "    pkg install py312-duckdb               (FreeBSD; PyPI has no FreeBSD "
+    "wheel, so pip would compile the engine from source)\n"
     "  or:  brew install duckdb   (the CLI; the Python module is still pip)\n"
     "Nothing else in this project needs it: `claudio usage` and everything "
     "under usage/ read the same JSONL with the standard library, offline, "
@@ -76,6 +88,24 @@ LOWER_BOUND_NOTE = (
     "and the only sound cross-machine operator is max: a figure derived from "
     "them is a floor, never a reading."
 )
+
+
+# WHERE DUCKDB SPILLS, NAMED RATHER THAN INHERITED FROM THE CWD.  See
+# `DuckStore._settings` for the measurement; the short version is that
+# DuckDB's own default is `.tmp` relative to the process's working directory,
+# which in a container with no `WORKDIR` is `/`.
+TEMP_DIR_ENV = "CLAUDIO_DUCKDB_TEMP_DIR"
+MEMORY_LIMIT_ENV = "CLAUDIO_DUCKDB_MEMORY_LIMIT"
+TEMP_DIR_MAX_ENV = "CLAUDIO_DUCKDB_TEMP_MAX"
+
+
+def default_temp_dir():
+    """An absolute path under the system temp directory, or whatever the
+    operator named.  Absolute, always: a relative path is the bug."""
+    named = os.environ.get(TEMP_DIR_ENV)
+    if named:
+        return os.path.abspath(named)
+    return os.path.join(tempfile.gettempdir(), "claudio-duckdb")
 
 
 class DuckDBMissing(RuntimeError):
@@ -198,12 +228,24 @@ class DuckStore(object):
     would maintain.
     """
 
-    def __init__(self, root, connection=None, threads=None):
+    def __init__(self, root, connection=None, threads=None, temp_dir=None,
+                 memory_limit=None, temp_dir_max=None):
         self.paths = Paths(root)
         self.root = root
         self._con = connection
         self._threads = threads
+        self.temp_dir = default_temp_dir() if temp_dir is None else temp_dir
+        self.memory_limit = (os.environ.get(MEMORY_LIMIT_ENV) or None
+                             if memory_limit is None else memory_limit)
+        self.temp_dir_max = (os.environ.get(TEMP_DIR_MAX_ENV) or None
+                             if temp_dir_max is None else temp_dir_max)
         self._tl = threading.local()
+        # Guards the LAZY CONSTRUCTION only, never a query.  Two threads
+        # arriving at an unopened store would otherwise each build a
+        # connection and one of them would be dropped on the floor with its
+        # settings; the queries themselves run on per-thread cursors and take
+        # nothing.  See `con`.
+        self._con_lock = threading.Lock()
 
     # -- problems: per DERIVATION, never per process ------------------------
 
@@ -239,12 +281,119 @@ class DuckStore(object):
     # -- connection --------------------------------------------------------
 
     def con(self):
-        if self._con is None:
-            duckdb = require()
-            self._con = duckdb.connect()
-            if self._threads:
-                self._con.execute("SET threads=%d" % int(self._threads))
-        return self._con
+        """A handle for THIS THREAD.  One database, one cursor per caller.
+
+        A `DuckDBPyConnection` holds the pending result of the last `execute`
+        ON THE CONNECTION, so handing one handle to every request thread makes
+        two concurrent readers consume each other's rows.  MEASURED against a
+        completely static store -- nothing appending, no writer running, so
+        this is not the read-while-append path and the store lock is innocent
+        -- through a real door, 8 threads and 480 requests to
+        `/api/v1/search`:
+
+            71 answered HTTP 500 `reader-failed`
+            30 answered HTTP 200 `ok` CARRYING ANOTHER QUESTION'S FIGURES
+
+        The 500s are the harmless half.  The 200s are this project's cardinal
+        sin with a status code on it: `matched: 303` served beside an EMPTY
+        `rows` list -- the refusal-as-empty-list the whole envelope exists to
+        prevent, delivered through the engine instead of through the
+        vocabulary -- and one account's request answered with another
+        account's `matched`.  A figure crossed accounts, which is the one rule
+        this package refuses to bend.  The mechanism is not inferred: the
+        server's own stderr caught a `request_id` hash arriving where the
+        `scanned` count belongs, `int('f75165a92c6b44a9')`.
+
+        `cursor()` returns a connection over the SAME in-memory database with
+        a result slot of its own, so nothing is re-opened and no file is read
+        twice.  Isolated: one connection, 6 threads, 1800 queries gives 6
+        `None`s and a wrong value; `cursor()` gives 1800/1800.  With the fix
+        the identical 480-request load gives 0 failures and 0 wrong answers.
+
+        This is `problems` one level down -- the property directly above says
+        "the door is a `ThreadingHTTPServer`, so two concurrent requests share
+        this object", and that reasoning was applied to the list and not to the
+        connection it describes.
+        """
+        with self._con_lock:
+            if self._con is None:
+                duckdb = require()
+                con = duckdb.connect()
+                if self._threads:
+                    con.execute("SET threads=%d" % int(self._threads))
+                for stmt, value in self._settings():
+                    con.execute(stmt, [value])
+                self._con = con
+            base = self._con
+        c = getattr(self._tl, "con", None)
+        if c is None:
+            c = base.cursor()
+            self._tl.con = c
+        return c
+
+    def _settings(self):
+        """`SET` statements every connection is opened with, as (sql, value).
+
+        WHY THIS IS NOT LEFT TO DUCKDB'S DEFAULTS.  `temp_directory` defaults
+        to `.tmp`, RELATIVE TO THE PROCESS'S CWD.  Measured inside the api
+        container: no `WORKDIR`, so cwd is `/`, the image runs as 65534, and
+        the store mount is `:ro` -- so the first query that spills answers
+
+            IO Error: Failed to create directory ".tmp": Permission denied
+
+        which reaches the caller as `reader-failed` with the detail reduced to
+        the exception TYPE (deliberately -- the text goes to stderr), so an
+        operator reads a fault with no cause, and the cause is a directory
+        name.  Every measurement this design rests on points at the query that
+        triggers it: 45.6 GiB, 62 M rows, `GROUP BY` over the whole corpus.
+
+        The value binds; only the setting name is literal, and these three are
+        literals in this file.  See `duck.py` on why an identifier is the one
+        thing that cannot bind.
+        """
+        out = []
+        if self.temp_dir:
+            out.append(("SET temp_directory=?", self.temp_dir))
+        if self.temp_dir_max:
+            out.append(("SET max_temp_directory_size=?", self.temp_dir_max))
+        if self.memory_limit:
+            out.append(("SET memory_limit=?", self.memory_limit))
+        return out
+
+    def temp_dir_problem(self):
+        """None, or why this process could not use its spill directory.
+
+        SAID AT BOOT RATHER THAN DISCOVERED AS A 500 ON THE FIRST BIG
+        QUESTION.  It writes and unlinks one byte, because `os.access` answers
+        about the permission bits and not about a read-only mount, a full
+        filesystem or a path that is really a file.
+
+        It never imports duckdb: a missing DuckDB is a named 503 per request
+        and must not become a process that refuses to start.
+
+        And `serve()` WARNS on it rather than exiting, which is the honest
+        wording for what this returns.  A door that cannot spill still answers
+        every small question correctly, still serves the reconciler half and
+        still takes shipments in the whole-door configuration, so refusing to
+        start would turn a degraded reader into no reader at all.  Do not
+        promote this to a refusal without changing that trade deliberately --
+        and if you do, change this paragraph with it.
+        """
+        if not self.temp_dir:
+            return None
+        probe = os.path.join(self.temp_dir, ".probe-%d" % os.getpid())
+        try:
+            os.makedirs(self.temp_dir, mode=0o700, exist_ok=True)
+            with open(probe, "wb") as fh:
+                fh.write(b"\0")
+            os.unlink(probe)
+        except OSError as exc:
+            return ("%s is not writable (%s). DuckDB spills large "
+                    "aggregations there, so a big question would fail as an "
+                    "unexplained `reader-failed`. Point %s at a writable "
+                    "path, or give this process one."
+                    % (self.temp_dir, exc, TEMP_DIR_ENV))
+        return None
 
     def _rel(self, paths, stream="a"):
         """(params, relation) for ONE statement.  Never shared between two.

@@ -24,11 +24,13 @@ there.
 
 import contextlib
 import gzip
+import hashlib
 import io
 import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import threading
@@ -45,7 +47,7 @@ sys.path.insert(0, HERE)
 import fixtures as fx                                          # noqa: E402
 
 from srv import attribute, coverage, ingest, query, reconcile, window, wire  # noqa: E402,E501
-from srv import api, duck, serve                               # noqa: E402
+from srv import api, duck, mcp, serve                               # noqa: E402
 from srv import store as duckstore                             # noqa: E402
 
 PASS = FAIL = 0
@@ -67,6 +69,20 @@ def check(name, got, want, tol=None):
 
 def check_true(name, cond):
     check(name, bool(cond), True)
+
+
+def fail(name, detail=None):
+    """Record a failure that has no got/want pair to compare.
+
+    Some refusals are asserted by their ABSENCE of an outcome -- "serve() must
+    not bind a port" -- and there is no value to hold up beside an expected
+    one.  Routing those through `check(name, False, True)` prints `got: False
+    want: True`, which says nothing about what happened; this prints the
+    sentence instead.
+    """
+    global FAIL
+    FAIL += 1
+    FAILURES.append(name if detail is None else "%s\n     %s" % (name, detail))
 
 
 def canon(obj):
@@ -219,7 +235,13 @@ FORBIDDEN_IMPORTS = ("os", "io", "socket", "sqlite3", "urllib", "http",
 # `store.py` is the second and last: it opens a DuckDB connection and reads
 # the store's files.  Admitted here, in the suite, before it can exist -- which
 # is the whole point of asserting the set rather than subtracting from it.
-IMPURE = ("serve.py", "store.py")
+IMPURE = ("mcp.py", "serve.py", "store.py")
+# mcp.py is the third, and it is admitted here rather than hidden: it is an
+# HTTP CLIENT of the read API, which is the whole of its authority -- it
+# cannot reach the store's files and cannot see an account its reader token
+# excludes. Handing it the DuckDB handle would have been fewer moving parts
+# and a privilege escalation, since an agent with a database handle is not
+# bounded by anything the operator configured.
 
 
 def test_the_core_is_pure():
@@ -4231,6 +4253,8 @@ def test_api_coverage_known_is_true_exactly_when_a_fraction_exists():
                          "account=%s&interval=3600" % u)[1]]
     for doc in docs:
         for cov in _coverages(doc):
+            if _check_coverage_shape(cov, "a coverage slot"):
+                continue
             if cov["known"]:
                 seen_known += 1
                 check_true("api/coverage: known implies a fraction",
@@ -4283,6 +4307,8 @@ def test_api_the_basis_says_whether_the_number_was_measured():
                     % fx.uuid_of("alpha"))[1]]
     for doc in docs:
         for cov in _coverages(doc):
+            if _check_coverage_shape(cov, "a coverage slot"):
+                continue
             seen += 1
             check_true("api/coverage: every basis on the wire is declared "
                        "by the SERVED catalogue, prefix family included",
@@ -4734,11 +4760,21 @@ def test_api_the_residual_and_its_pin_survive_the_endpoint():
           canon_json(cov_got), canon_json(want["coverage"]))
     check("api: ...and gains exactly the tri-state boolean and its "
           "classification", added, {"known": False, "basis_is": "unknown"})
-    for key in ("by", "by_tag"):
-        check("api: %s carries exactly the core's buckets, in wire shape" % key,
-              canon_json(got["result"]["window"].get(key)),
-              canon_json({dim: api.bucketise(vals)
-                          for dim, vals in (want.get(key) or {}).items()}))
+    # TWO SHAPES, AND THIS ASSERTION USED TO PIN THE BUG.  `by` is nested
+    # (`{dimension: {value: stats}}`) and `by_tag` is FLAT (`{"k=v" or None:
+    # stats}`), and the expectation below applied `by`'s conversion to both --
+    # the same mistake the endpoint made, spelled out here as the expected
+    # value, so a test written for this bug agreed with it.  The endpoint's
+    # output was `{None: [...], "test=4": [...]}`: a dict still keyed by `str`
+    # and `None`, which `json.dumps(sort_keys=True)` cannot order at all.
+    check("api: by carries exactly the core's buckets, in wire shape",
+          canon_json(got["result"]["window"].get("by")),
+          canon_json({dim: api.bucketise(vals)
+                      for dim, vals in (want.get("by") or {}).items()}))
+    check("api: by_tag is the FLAT map put into wire shape whole, not "
+          "iterated as if its tag values were dimension names",
+          canon_json(got["result"]["window"].get("by_tag")),
+          canon_json(api.bucketise(dict(want.get("by_tag") or {}))))
     check("api: the residual is zero here",
           got["result"]["window"]["residual_pp"], 0.0)
     if have_duck():
@@ -5329,6 +5365,40 @@ def test_api_a_missing_duckdb_refuses_by_name_and_never_answers_zero():
         check("api/duckdb: nor a count that would read as zero (%s)" % how,
               "n" in req, False)
 
+        # AND THE COVERAGE BESIDE IT, which used to publish a full placement
+        # CENSUS OF ZEROS about the very rows three keys above it says it
+        # could not read.  `query.coverage_for` counts per row, so an empty
+        # list gave `rows_total: 0`, `windows.touched: 0` -- about the window
+        # sitting in `result.window` on the same payload -- and
+        # `basis: "no-window-touched"`, which is the POSITIVE claim that none
+        # of these rows fell in any window.  Measured byte-identical to the
+        # answer for a window that genuinely holds no requests, so two states
+        # produced one object and it asserted the false one.
+        #
+        # Asserted ABSENT, never zero: asserting zero would pin the bug.
+        # `.get`, not `[...]`: a mutation that restores the census makes
+        # `unavailable` absent, and a KeyError is counted as a failure exactly
+        # as an assertion is -- so the row would read `caught` with nobody
+        # able to see WHICH property was violated.  A named failure is the
+        # difference between a matrix that reports and one that is believed.
+        cov = win["result"]["coverage"]
+        check("api/duckdb: the coverage over those rows is refused by name "
+              "(%s)" % how,
+              (cov.get("unavailable") or {}).get("reason"), "duckdb-missing")
+        for k in ("placement", "windows", "fraction", "known", "basis"):
+            check("api/duckdb: ...and carries no %s to read as a measurement "
+                  "(%s)" % (k, how), k in cov, False)
+
+        # The contrast that made it a contradiction rather than merely a wrong
+        # number: `/windows` builds its coverage from the RECONCILER's rows,
+        # which need no engine, so at the same moment over the same account it
+        # reported the true placement.  Two routes over one store, both `ok`.
+        _st, plural = ui_call(a, V1 + "windows", "account=" + u)
+        pl = plural["result"]["coverage"]["placement"]
+        check_true("api/duckdb: while /windows still reports real placement "
+                   "for the same account (%s)" % how,
+                   isinstance(pl["rows_total"], int) and pl["rows_total"] > 0)
+
 
 def test_api_capabilities_states_the_engine_and_the_constraints():
     """omini hardcodes nothing: everything it would copy is served."""
@@ -5377,10 +5447,27 @@ def test_api_every_payload_survives_the_handler_s_own_serialiser():
     """
     _root, _store, a = ui_store()
     u = fx.uuid_of("alpha")
+    # `agent`, NOT `alpha`, AND THAT IS THE WHOLE OF THE TEST.
+    #
+    # This assertion was written for exactly this bug, named it in its
+    # docstring, called the right route -- and passed over broken code for as
+    # long as it existed, because all three of `alpha`'s captured rows carry
+    # `tags: {}`.  That makes `by_tag` `{None: ...}`: one key, homogeneous,
+    # sorts perfectly.  The one row in the whole corpus that carries a tag
+    # belongs to `agent`, so a `str` key and a `None` key never met in one
+    # window anywhere in the suite and the fixture was the bug's alibi.
+    # Nothing is fabricated to fix that -- the mixed case is real captured
+    # data and was simply never asked for.  `mixed_probe` below proves the
+    # input can still exhibit the defect, so this cannot go quietly vacuous
+    # again.
+    mixed = fx.uuid_of("agent")
     shapes = [(V1 + "capabilities", ""), (V1 + "accounts", ""),
               (V1 + "diagnostics", ""), (V1 + "health", ""),
               (V1 + "windows", "account=" + u),
               (V1 + "window", "account=%s&kind=5h&resets_at=1786598400" % u),
+              (V1 + "window",
+               "account=%s&kind=5h&resets_at=1786598400" % mixed),
+              (V1 + "windows", "account=" + mixed),
               (V1 + "search", "account=%s&stream=b" % u),
               (V1 + "windows", "account=nobody")]
     if have_duck():
@@ -5401,6 +5488,55 @@ def test_api_every_payload_survives_the_handler_s_own_serialiser():
             ok = "raised %s" % exc
         check("api/wire: %s?%s serialises exactly as the handler serialises it"
               % (path, qs), ok, True)
+
+    # THE PROBE, so the list above cannot go vacuous the way it did.  The
+    # `agent` window must really carry a `None` bucket AND a `str` bucket, or
+    # the shape this whole test exists for is not among the payloads it
+    # checked.  Asserted on the WIRE shape, since that is what is served.
+    _st, mix = ui_call(a, V1 + "window",
+                       "account=%s&kind=5h&resets_at=1786598400" % mixed)
+    buckets = mix["result"]["window"]["by_tag"]
+    check_true("api/wire: the probe window really carries a null tag bucket "
+               "and a named one, or this test proves nothing",
+               isinstance(buckets, list)
+               and any(b["value_is_null"] for b in buckets)
+               and any(not b["value_is_null"] for b in buckets))
+    # Shape-guarded, so a regression FAILS BY NAME rather than raising.  The
+    # mutation that restores the bug makes `by_tag` a dict again, and
+    # iterating a dict yields its keys -- one of which is `None` -- so the
+    # unguarded version died with "'NoneType' object is not subscriptable".
+    # An exception counts as a failure exactly as an assertion does, which is
+    # how a matrix row reads `caught` without anyone learning what broke.
+    flags = (sorted((b["value"] is None, b["value_is_null"]) for b in buckets)
+             if isinstance(buckets, list)
+                and all(isinstance(b, dict) for b in buckets)
+             else "by_tag was not a list of buckets: %r" % (buckets,))
+    check("api/wire: the null bucket is flagged rather than stringified into "
+          "a label indistinguishable from a tag called \"None\"",
+          flags, sorted([(False, False), (True, True)]))
+
+    # AND THE PROPERTY, rather than a sample of it: no dict anywhere in any
+    # payload may be keyed by `None`, at any depth.  `by_tag` was reached
+    # through a loop that treated it as `by`'s NESTED shape when it is flat,
+    # so the values were mangled AND the outer dict kept its mixed keys; a
+    # test that only asserted the buckets would have passed on a payload that
+    # still could not be serialised.
+    def none_keyed(obj, path="$"):
+        out = []
+        if isinstance(obj, dict):
+            if any(k is None for k in obj):
+                out.append(path)
+            for k, v in obj.items():
+                out.extend(none_keyed(v, "%s.%s" % (path, k)))
+        elif isinstance(obj, list):
+            for i, v in enumerate(obj):
+                out.extend(none_keyed(v, "%s[%d]" % (path, i)))
+        return out
+
+    for path, qs in shapes:
+        _st, doc = ui_call(a, path, qs)
+        check("api/wire: %s?%s carries no None-keyed dict at any depth"
+              % (path, qs), none_keyed(doc), [])
 
 
 def test_api_a_null_bucket_keeps_its_own_flag_rather_than_a_label():
@@ -5532,6 +5668,20 @@ def test_api_the_readme_names_exactly_the_routes_that_exist():
                "/api/v1/; see" in text or "are **gone**" in text)
     check_true("api/docs: and /healthz is documented as unenveloped",
                "unenveloped" in text)
+    # THE CLAIM THAT WAS FALSE.  Both the route table and `_v1_health`'s own
+    # note said `/api/v1/health` asks "the same question as /healthz" -- and
+    # the two differed on precisely the property that decides whether half the
+    # API works, because only one of them named the engine.  They are the same
+    # question in MORE DETAIL now, and `/healthz` is the surface that can be
+    # asked without a token.  Flattened first, for the reason the `usage/`
+    # refuted-claim scan gives: a line break inside the sentence makes a
+    # literal `in` blind to it.
+    flat = " ".join(text.split())
+    check("api/docs: the README no longer calls /api/v1/health the same "
+          "question as /healthz", "same question as `/healthz`" in flat, False)
+    check_true("api/docs: it says a 200 from /healthz is not a statement that "
+               "stream A can be queried",
+               "not a statement that" in flat and "engine.available" in flat)
 
 
 # ---- over a real socket -----------------------------------------------------
@@ -5598,6 +5748,28 @@ def test_api_the_store_is_served_over_http_beside_the_door():
               "unenveloped", (status, health["door"]), (200, serve.DOOR_VERSION))
         check("api/http: ...and carries no API envelope for a script to trip "
               "over", "outcome" in health, False)
+        # THE ENGINE, ON THE ONE SURFACE SERVED BEFORE READER AUTH.
+        #
+        # `/api/v1/capabilities` and `/api/v1/health` both name it and both
+        # need a token -- and `readers.json` is not an exotic configuration,
+        # it is the only one `serve()` permits on a non-loopback bind, i.e.
+        # every container.  Measured before this existed: the key sets of an
+        # engine-present and an engine-absent door were IDENTICAL, so the
+        # health check this repository's own README recommends
+        # (`urlopen('/healthz').status == 200`) reported healthy for a door
+        # whose entire stream-A half refuses every question.  That matters
+        # most for the FreeBSD image, whose engine has never been executed
+        # outside one amd64 smoke job that is deliberately not allowed to
+        # block a publish.
+        # `.get`, so its absence is a NAMED failure rather than a KeyError:
+        # an exception is counted exactly as an assertion is, and a row
+        # reading `caught` with no reason attached is a matrix that is
+        # believed rather than read.
+        eng = health.get("engine") or {}
+        check("api/http: /healthz names the engine, because nothing else "
+              "answers without a token",
+              (eng.get("name"), eng.get("available")),
+              ("duckdb", duckstore.available()))
     finally:
         serve.ShipHandler.api = None
         httpd.shutdown()
@@ -6045,7 +6217,12 @@ def test_api_a_fault_in_the_reader_names_its_type_and_leaks_no_sql():
     tenants = serve.Tenants(mapping={"tok-alpha": fx.uuid_of("alpha")})
 
     class Exploding(object):
-        def handle(self, path, params, multi, now=None):
+        # `scope` is part of `Api.handle`'s signature: the door hands every
+        # request the caller's account list, or None for "everything". A stub
+        # that omits it fails with a TypeError the handler would report as
+        # `reader-failed` -- a test double drifting from the interface it
+        # stands in for, which reads as the very fault this test is about.
+        def handle(self, path, params, multi, now=None, scope=None):
             raise RuntimeError("BinderException: SELECT count(\"nope\") "
                                "FROM read_json('/private/tmp/x')")
 
@@ -6182,6 +6359,48 @@ def _coverages(doc, out=None):
         for v in doc:
             _coverages(v, out)
     return out
+
+
+def _coverage_is_refusal(cov):
+    """A `coverage` slot holding a REFUSAL rather than a statement.
+
+    `/api/v1/window` computes its coverage over the request rows inside the
+    window, and with no engine those rows were never read -- so that slot is a
+    refusal object with no `placement`, no `windows` and no `fraction`, in
+    exactly the shape `requests` beside it already uses.
+
+    Told apart HERE and not skipped in the walker.  `_coverages` selects on
+    the key alone, deliberately: it used to require `"known" in v` as well,
+    which turned "every coverage object carries the boolean" into "every
+    coverage object that carries the boolean carries it" and gave the bug its
+    own alibi.  Adding `and "unavailable" not in v` to the walker would be the
+    identical mistake in a new costume, so the walker still returns
+    everything and the callers assert that each object is one of exactly two
+    well-formed shapes.
+    """
+    return isinstance(cov, dict) and "unavailable" in cov
+
+
+def _check_coverage_shape(cov, where):
+    """Every coverage slot is a statement OR a named refusal -- never between.
+
+    The half that matters: a refusal must carry NONE of the numbers, because a
+    placement census of zeros over rows nobody read is indistinguishable from
+    a real window that holds no requests, and `basis: "no-window-touched"` is
+    a positive claim that none of those rows fell in any window.
+    """
+    if not _coverage_is_refusal(cov):
+        check_true("api/coverage: %s is a statement carrying the tri-state"
+                   % where, "known" in cov and "basis" in cov)
+        return False
+    check_true("api/coverage: %s is refused BY NAME" % where,
+               isinstance(cov["unavailable"], dict)
+               and bool(cov["unavailable"].get("reason")))
+    check("api/coverage: %s carries no number to read as a measurement"
+          % where,
+          sorted(k for k in ("placement", "windows", "fraction", "known",
+                             "basis") if k in cov), [])
+    return True
 
 
 def _bases_in(path, only_coverage_funcs=False):
@@ -6691,16 +6910,35 @@ def test_api_reader_auth_scopes_by_refusal_not_by_filter():
               (status, doc.get("refusal", {}).get("reason")),
               (401, "unauthorised"))
 
-        # The front end's case, first because it is the ordinary one.
+        # THE PERMITTED CASES ASK A RECONCILER ROUTE, NOT `search`, AND THAT IS
+        # A CORRECTION RATHER THAN A CONVENIENCE.
+        #
+        # The gate is `ShipHandler._reader_auth`, which runs in `do_GET`
+        # before any route is dispatched and never looks at the engine.  These
+        # three assertions used to ask `/search`, which is a stream-A route, so
+        # on an interpreter with no DuckDB they got the perfectly correct
+        # `503 duckdb-missing` and reported it as an auth failure -- four red
+        # assertions in a configuration this repository PUBLISHES and documents
+        # (`1164 passed, 0 failed, 44 skipped`), for a reason with nothing to do
+        # with reader auth.  A test that cannot distinguish "this token was
+        # refused" from "this build has no query engine" is not testing the
+        # thing it is named after.
+        #
+        # `windows` is account-scoped, goes through the identical gate, and
+        # needs no engine.  The stream-A half is not lost: the 403 below still
+        # asks `/search`, because a refusal that happens before dispatch is
+        # exactly what has to be proved about a route the engine cannot serve
+        # -- and the engine-present case is asserted at the bottom, under a
+        # loud skip.
         for acct in (alpha, beta):
-            status, doc = get(V1 + "search?account=" + acct, token="r-all")
+            status, doc = get(V1 + "windows?account=" + acct, token="r-all")
             check("reader-auth: a universal token reads every account (%s)"
                   % acct[:8], (status, doc.get("outcome")), (200, "ok"))
         status, doc = get(V1 + "accounts", token="r-all")
         check("reader-auth: and may ask a store-wide question",
               (status, doc.get("outcome")), (200, "ok"))
 
-        status, doc = get(V1 + "search?account=" + alpha, token="r-alpha")
+        status, doc = get(V1 + "windows?account=" + alpha, token="r-alpha")
         check("reader-auth: a scoped token reads the account it covers",
               (status, doc.get("outcome")), (200, "ok"))
 
@@ -6710,10 +6948,24 @@ def test_api_reader_auth_scopes_by_refusal_not_by_filter():
               (403, "account-not-permitted"))
         check("reader-auth: a refusal carries no result key to render as empty",
               "result" in doc, False)
+        check("reader-auth: ...and the refusal beats the engine, so a store "
+              "with no DuckDB still says WHY", status, 403)
 
-        status, doc = get(V1 + "search?account=" + beta, token="r-all")
+        status, doc = get(V1 + "windows?account=" + beta, token="r-all")
         check("reader-auth: a '*' token reads any account",
               (status, doc.get("outcome")), (200, "ok"))
+
+        # The half that does need an engine, asserted when there is one and
+        # named when there is not.  Without this the move above would quietly
+        # stop proving that a permitted token can reach a stream-A route at
+        # all.
+        if duckstore.available():
+            status, doc = get(V1 + "search?account=" + alpha, token="r-all")
+            check("reader-auth: a permitted token reaches a stream-A route too",
+                  (status, doc.get("outcome")), (200, "ok"))
+        else:
+            _skip("reader-auth: stream-A route under a permitted token "
+                  "(duckdb not installed)")
 
         # Operators and health checks are deliberately outside the gate.
         req = urllib.request.Request("http://127.0.0.1:%d/healthz" % port)
@@ -6724,6 +6976,545 @@ def test_api_reader_auth_scopes_by_refusal_not_by_filter():
         httpd.shutdown()
         serve.ShipHandler.door = None
         serve.ShipHandler.api = None
+
+
+def _swell_ledger(root, uuid, n):
+    """Append `n` more rows to an account's ledger, derived from its own first
+    row so the shape is the captured one and only the identity moves.
+
+    A three-row account cannot show a race: the window in which two threads are
+    both inside DuckDB is the time the scan takes, and three rows is not
+    enough of it.  The measured shapes were 303 rows against 60, so that
+    asymmetry is what is built here -- it is also what makes a crossed answer
+    VISIBLE, since one account's `matched` is not the other's.
+    """
+    path = os.path.join(root, "accounts", uuid, "ledger.jsonl")
+    with open(path, "r", encoding="utf-8") as fh:
+        base = json.loads(fh.readline())
+    with open(path, "a", encoding="utf-8") as fh:
+        for i in range(n):
+            row = dict(base)
+            row["request_id"] = "%016x" % (abs(hash((uuid, i))) & ((1 << 64) - 1))
+            row["ts"] = base["ts"] + i + 1
+            row["ts_ns"] = int(row["ts"] * 1e9)
+            fh.write(json.dumps(row, sort_keys=True) + "\n")
+
+
+def test_api_two_requests_at_once_do_not_read_each_others_results():
+    """Concurrent reads must not share a DuckDB result slot.
+
+    THE DEFECT.  `DuckStore.con()` opened one `duckdb.connect()` and handed
+    that same handle to every caller.  The door is a `ThreadingHTTPServer` with
+    `daemon_threads`, so every request runs in its own thread, and a
+    `DuckDBPyConnection` holds the pending result of the last `execute` ON THE
+    CONNECTION -- so two request threads consumed each other's rows.
+
+    Measured against a COMPLETELY STATIC store, with no writer running and
+    nothing appending, so this is not the read-while-append path and the store
+    lock is innocent.  8 threads, 480 requests: 71 answered HTTP 500
+    `reader-failed` and 30 answered HTTP 200 `ok` carrying another question's
+    figures -- `matched: 303` beside an EMPTY rows list, and one account's
+    request answered with the other account's `matched`.
+
+    WHY BOTH HALVES ARE ASSERTED SEPARATELY.  They are two defects wearing one
+    cause, and only the second one matters.  Pinning the 500s alone would leave
+    the silent wrong answer unguarded, and a future `except Exception: return
+    no-data` would turn such a test green while making the product strictly
+    worse -- an empty result where a figure crossed accounts is the exact
+    shape this envelope was designed to make impossible.
+
+    WHY THIS TEST HAD TO BE WRITTEN AT ALL.  Every `threading.Thread` in this
+    file ran `serve_forever` or `shutdown`; not one issued two API requests at
+    the same moment, so a defect that exists only when two threads are inside
+    `DuckStore` together was structurally invisible here -- and the mutation
+    matrix inherited the blindness.  That is the `by_tag` 500's blind spot one
+    axis over: there it was "never serialised what came back", here it is
+    "never asked two questions at once".
+    """
+    if not have_duck():
+        _skip("api/concurrency: two readers at once (duckdb not installed)")
+        return
+    root, store_, a = ui_store()
+    alpha, beta = fx.uuid_of("alpha"), fx.uuid_of("beta")
+    _swell_ledger(root, alpha, 300)
+    _swell_ledger(root, beta, 57)
+
+    tenants = serve.Tenants(mapping={"tok-alpha": alpha})
+    serve.ShipHandler.door = serve.Door(store_, tenants,
+                                        counters=serve.Counters())
+    serve.ShipHandler.door.readers = None
+    serve.ShipHandler.api = a
+    serve.ShipHandler.quiet = True
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), serve.ShipHandler)
+    httpd.daemon_threads = True
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    port = httpd.server_address[1]
+
+    def get(uuid):
+        url = ("http://127.0.0.1:%d%ssearch?account=%s&limit=400"
+               % (port, V1, uuid))
+        try:
+            with urllib.request.urlopen(url, timeout=30) as fh:
+                return fh.status, json.loads(fh.read())
+        except urllib.error.HTTPError as exc:
+            return exc.code, json.loads(exc.read())
+
+    try:
+        # The serial truth, one question at a time, before any thread exists.
+        truth = {}
+        for uuid in (alpha, beta):
+            st, doc = get(uuid)
+            check("api/concurrency: the serial answer for %s is ok" % uuid[:8],
+                  (st, doc.get("outcome")), (200, "ok"))
+            page = doc["result"]["page"]
+            truth[uuid] = (page["matched"], len(doc["result"]["rows"]))
+        check_true("api/concurrency: the two accounts have different figures, "
+                   "so a crossed answer is visible",
+                   truth[alpha] != truth[beta])
+
+        faults, wrong, foreign = [], [], []
+        lock = threading.Lock()
+
+        def hammer(seed):
+            for i in range(40):
+                uuid = alpha if (seed + i) % 2 else beta
+                st, doc = get(uuid)
+                if st != 200 or doc.get("outcome") != "ok":
+                    with lock:
+                        faults.append((st, (doc.get("refusal") or {})
+                                       .get("reason")))
+                    continue
+                rows = doc["result"]["rows"]
+                got = (doc["result"]["page"]["matched"], len(rows))
+                if got != truth[uuid]:
+                    with lock:
+                        wrong.append((uuid[:8], truth[uuid], got))
+                bad = sorted({r.get("account_uuid") for r in rows} - {uuid})
+                if bad:
+                    with lock:
+                        foreign.append((uuid[:8], bad))
+
+        threads = [threading.Thread(target=hammer, args=(s,))
+                   for s in range(6)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        # 240 requests. Unpatched this produced 37 faults and 14 wrong answers,
+        # so it fires almost at once rather than only under sustained load.
+        check("api/concurrency: no request faulted (%d seen)" % len(faults),
+              faults[:4], [])
+        check("api/concurrency: and every 200 carries ITS OWN figures "
+              "(%d disagreed)" % len(wrong), wrong[:4], [])
+        check("api/concurrency: no row crossed an account boundary",
+              foreign[:4], [])
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        serve.ShipHandler.door = None
+        serve.ShipHandler.api = None
+
+
+def _uuids_in(obj, out=None):
+    """Every account-shaped UUID anywhere in a payload, at any depth."""
+    if out is None:
+        out = set()
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            _uuids_in(k, out)
+            _uuids_in(v, out)
+    elif isinstance(obj, (list, tuple)):
+        for v in obj:
+            _uuids_in(v, out)
+    elif isinstance(obj, str):
+        for m in re.finditer(
+                r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+                obj):
+            out.add(m.group(0))
+    return out
+
+
+def test_api_a_scoped_token_that_names_no_account_is_refused_not_answered():
+    """Scope is decided by the TOKEN, not by the `account` query parameter.
+
+    THE HOLE.  The gate read `params.get("account")` and `Readers.permits`
+    returned True for `account is None`, on a docstring that delegated the
+    omitted case to "the ROUTE ... and `store` already refuses to total across
+    accounts".  `store` refuses to TOTAL across accounts; it returns ROWS
+    across them happily.  Measured through the running stack with a token
+    scoped to one account:
+
+        /search?text=<other account's address>  200 ok, their rows
+        /lookup?field=session_id&value=<theirs> 200 ok, their rows
+        /accounts                               200 ok, both identities
+        /diagnostics                            200 ok, both
+
+    and identically through the MCP surface, which forwards the caller's
+    token: `tools/call search` returned `isError: false` and another account's
+    rows to an agent.  Every existing assertion asked with `?account=`, so the
+    scope held only against a caller who cooperated by naming the account it
+    was not allowed to read.
+
+    A REFUSAL, NOT A NARROWED ANSWER, for this file's standing reason: a
+    silently narrowed result is indistinguishable from an account that has
+    shipped nothing, and telling those apart is why `no-data`,
+    `filtered-to-nothing` and `unanswerable` are three different words.
+
+    Asked of EVERY route rather than of the four that were measured, because
+    the next route added is the next hole and a list of four would not have
+    caught it.
+    """
+    root, store_, a = ui_store()
+    alpha, beta, agent = (fx.uuid_of("alpha"), fx.uuid_of("beta"),
+                          fx.uuid_of("agent"))
+    counters = serve.Counters()
+    door = serve.Door(store_, serve.Tenants(mapping={"tok-alpha": alpha}),
+                      counters=counters)
+    door.readers = serve.Readers(mapping={"r-alpha": [alpha],
+                                          "r-all": serve.ALL_ACCOUNTS})
+    serve.ShipHandler.door = door
+    serve.ShipHandler.api = a
+    serve.ShipHandler.quiet = True
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), serve.ShipHandler)
+    httpd.daemon_threads = True
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    port = httpd.server_address[1]
+
+    def get(path, token, qs=""):
+        url = "http://127.0.0.1:%d%s%s" % (port, path, ("?" + qs) if qs else "")
+        req = urllib.request.Request(url)
+        req.add_header("Authorization", "Bearer " + token)
+        try:
+            with urllib.request.urlopen(req, timeout=20) as fh:
+                return fh.status, json.loads(fh.read())
+        except urllib.error.HTTPError as exc:
+            return exc.code, json.loads(exc.read())
+
+    outside = {beta, agent}
+    try:
+        answered, leaked = [], []
+        for route in a.routes():
+            slug = route[len(V1):]
+            st, doc = get(route, "r-alpha")
+            free = slug in api.SCOPE_FREE_ROUTES
+            reason = (doc.get("refusal") or {}).get("reason")
+            if not free:
+                if not (st == 403
+                        and reason == "account-required-for-this-token"):
+                    answered.append((slug, st, reason))
+            found = _uuids_in(doc) & outside
+            if found:
+                leaked.append((slug, sorted(found)))
+        check("reader-scope: every record route refuses a scoped token that "
+              "names no account", answered, [])
+        # The assertion that survives any later change to WHICH routes refuse:
+        # whatever the answer is, it must never name an account outside the
+        # scope.
+        check("reader-scope: and no payload names an account outside the "
+              "token's scope", leaked, [])
+
+        # The three exceptions still answer, because refusing them would make
+        # a scoped token unable to read its own answers: `capabilities` is
+        # where a client learns what a null means here.
+        for slug in api.SCOPE_FREE_ROUTES:
+            st, doc = get(V1 + slug, "r-alpha")
+            check("reader-scope: %s is still answered (it reads no record)"
+                  % slug, (st, doc.get("outcome")), (200, "ok"))
+
+        # The remedy is an ACTION, and the action has to work.
+        st, doc = get(V1 + "windows", "r-alpha")
+        check("reader-scope: the refusal names the accounts the token covers",
+              alpha in doc["refusal"]["remedy"], True)
+        check("reader-scope: ...and carries no result key to render as empty",
+              "result" in doc, False)
+        st, doc = get(V1 + "windows", "r-alpha", "account=" + alpha)
+        check("reader-scope: following the remedy answers",
+              (st, doc.get("outcome")), (200, "ok"))
+
+        # TWO ROUTES CANNOT BE SCOPED AT ALL, and the generic remedy would
+        # send their callers into a SECOND refusal.
+        # `aggregate/per-account` refuses `?account=` by design;
+        # `accounts` reads no `account` parameter, so passing one is
+        # `unknown-query-key`.  Each gets its own sentence, and each names a
+        # route that really exists and really answers.
+        for slug, must_name in (("aggregate/per-account",
+                                 V1 + "aggregate?account="),
+                                ("accounts", V1 + "windows?account=")):
+            st, doc = get(V1 + slug, "r-alpha",
+                          "by=model" if slug != "accounts" else "")
+            check("reader-scope: %s is refused by the same name" % slug,
+                  (st, doc["refusal"]["reason"]),
+                  (403, "account-required-for-this-token"))
+            check_true("reader-scope: ...with a remedy that names a route that "
+                       "answers, not one that refuses again (%s)" % slug,
+                       must_name in doc["refusal"]["remedy"])
+            check_true("reader-scope: ...and the covered UUIDs, which is how a "
+                       "scoped caller learns its own scope (%s)" % slug,
+                       alpha in doc["refusal"]["remedy"])
+        # And the remedy is followed, so it is an action rather than a claim.
+        st, doc = get(V1 + "windows", "r-alpha", "account=" + alpha)
+        check("reader-scope: the accounts remedy really answers",
+              (st, doc.get("outcome")), (200, "ok"))
+        st, doc = get(V1 + "aggregate", "r-alpha",
+                      "account=%s&by=model" % alpha)
+        check_true("reader-scope: ...and so does the per-account one",
+                   st == 200 or doc["refusal"]["reason"] == "duckdb-missing")
+
+        # And nothing changed for the ordinary token a front end holds.
+        st, doc = get(V1 + "accounts", "r-all")
+        check("reader-scope: a '*' token still asks a store-wide question",
+              (st, doc.get("outcome")), (200, "ok"))
+        check_true("reader-scope: ...and still sees every account",
+                   outside <= _uuids_in(doc))
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        serve.ShipHandler.door = None
+        serve.ShipHandler.api = None
+
+
+def test_api_meta_accounts_is_scoped_to_the_token_and_says_so():
+    """`meta` enumerated the whole store on every payload, whatever the scope.
+
+    `_meta` attached `accounts` -- identity, email address,
+    `organization_uuid`, `account_uuid` -- for every account in the snapshot,
+    built from the store and never from the caller.  Measured:
+    `/api/v1/search?limit=100` with a token scoped to alpha returned alpha's
+    rows and a `meta.accounts` naming beta, `beta@example.com` and both of its
+    UUIDs, with `meta.root` -- the store's absolute path -- beside it.
+
+    IT IS NOT FIXED BY FIXING THE ROUTE GATE.  It is attached AFTER a route has
+    correctly answered about the account it was allowed to answer about, so it
+    is the one leak that survives every per-route repair.
+
+    Narrowed WITH A NOTE rather than silently: an unqualified short list is a
+    second wrong answer, because "this store holds one account" is a claim and
+    a scoped reader cannot tell it from the truth.
+    """
+    root, store_, a = ui_store()
+    alpha, beta, agent = (fx.uuid_of("alpha"), fx.uuid_of("beta"),
+                          fx.uuid_of("agent"))
+
+    # In-process, because `handle`'s `scope` argument IS the contract the door
+    # fills in -- and asserting it here means any future transport inherits it.
+    st, doc = a.handle(V1 + "windows", {"account": alpha},
+                       {"account": [alpha]}, now=fx.NOW_JOINT, scope=[alpha])
+    check("reader-scope/meta: a permitted question still answers",
+          (st, doc.get("outcome")), (200, "ok"))
+    named = {m["account_uuid"] for m in doc["meta"]["accounts"]}
+    check("reader-scope/meta: meta names only the covered account",
+          sorted(named), [alpha])
+    check("reader-scope/meta: and no identity outside the scope survives "
+          "anywhere in the payload",
+          sorted(_uuids_in(doc) & {beta, agent}), [])
+    check("reader-scope/meta: nor an address",
+          "beta@example.com" in json.dumps(doc, default=str), False)
+    check("reader-scope/meta: the store's path is not published to a scoped "
+          "reader", doc["meta"]["root"], None)
+    check_true("reader-scope/meta: the short list SAYS it is short",
+               "not every account in the store"
+               in doc["meta"]["accounts_are"])
+    check("reader-scope/meta: and names the scope it was narrowed to",
+          doc["meta"]["scope"], [alpha])
+
+    # THE CASE THE DOOR CANNOT SEE, and the reason `_scope_refusal` carries
+    # its own `account-not-permitted` branch rather than leaving it to
+    # `ShipHandler._reader_auth`.  Asked in process, with no handler in front
+    # of it: the rule has to hold for a caller that reaches `handle` directly,
+    # which is how this suite asks it and is the shape a second transport
+    # would take.
+    st, doc = a.handle(V1 + "windows", {"account": beta}, {"account": [beta]},
+                       now=fx.NOW_JOINT, scope=[alpha])
+    check("reader-scope/meta: an out-of-scope account is refused with no "
+          "door in front of it",
+          (st, doc["refusal"]["reason"]), (403, "account-not-permitted"))
+    check("reader-scope/meta: ...and carries no result key",
+          "result" in doc, False)
+    check("reader-scope/meta: ...and does not name the account's identity, "
+          "only the uuid the caller itself sent",
+          "beta@example.com" in json.dumps(doc, default=str), False)
+
+    # The ordinary `"*"` token -- `scope=None` -- is byte-for-byte unchanged.
+    st, wide = a.handle(V1 + "windows", {"account": alpha},
+                        {"account": [alpha]}, now=fx.NOW_JOINT)
+    check("reader-scope/meta: an unscoped read still names every account",
+          sorted(m["account_uuid"] for m in wide["meta"]["accounts"]),
+          sorted([alpha, beta, agent]))
+    check("reader-scope/meta: ...and still carries the store root",
+          wide["meta"]["root"], a.view.root)
+    check("reader-scope/meta: ...and gains no note about a scope",
+          [k for k in ("accounts_are", "scope") if k in wide["meta"]], [])
+
+
+def test_store_names_its_spill_directory_rather_than_inheriting_the_cwd():
+    """DuckDB's `temp_directory` default is `.tmp`, relative to the CWD.
+
+    Measured inside the api container: `Containerfile.linux.api` set no
+    `WORKDIR`, so cwd is `/`, the image runs as 65534 against a root-owned
+    `/`, and the store mount is `:ro`.  Forcing a spill there gives
+
+        IO Error: Failed to create directory ".tmp": Permission denied
+
+    which reaches the caller as `reader-failed` with `detail` reduced to the
+    exception TYPE -- deliberately, since the text goes to stderr -- so the
+    operator sees a fault with no cause, and the cause is a directory name.
+    Every measurement this design rests on points at the query that triggers
+    it: 45.6 GiB, 62 M rows, `GROUP BY` over the whole corpus.
+
+    A relative path is the bug, so the property asserted is absoluteness, not
+    a particular directory.
+    """
+    root = door_root()
+    st = duckstore.DuckStore(root)
+    check_true("store/spill: the temp directory is an absolute path (%s)"
+               % st.temp_dir, os.path.isabs(st.temp_dir))
+    check("store/spill: and is never DuckDB's cwd-relative default",
+          st.temp_dir.endswith(os.sep + ".tmp"), False)
+
+    named = os.path.join(door_root(), "spill-here")
+    st2 = duckstore.DuckStore(root, temp_dir=named)
+    check("store/spill: an operator's path is used as given",
+          st2.temp_dir, named)
+    check("store/spill: ...and the environment names the same knob",
+          duckstore.TEMP_DIR_ENV, "CLAUDIO_DUCKDB_TEMP_DIR")
+
+    # A REFUSAL AT BOOT, not a 500 on the first large question. It writes and
+    # unlinks one byte, because `os.access` answers about the permission bits
+    # and not about a read-only mount, a full filesystem, or a path that is
+    # really a file.
+    check("store/spill: a writable directory is not a problem",
+          st2.temp_dir_problem(), None)
+    check_true("store/spill: ...and the probe left nothing behind",
+               os.listdir(named) == [])
+
+    blocked = os.path.join(door_root(), "blocked")
+    with open(blocked, "w", encoding="utf-8") as fh:
+        fh.write("not a directory\n")
+    why = duckstore.DuckStore(root, temp_dir=blocked).temp_dir_problem()
+    check_true("store/spill: an unusable directory is NAMED, never silent",
+               why is not None and blocked in why)
+    check_true("store/spill: ...and the message names the variable that "
+               "fixes it", duckstore.TEMP_DIR_ENV in (why or ""))
+
+    if not have_duck():
+        _skip("store/spill: the setting reaches the connection "
+              "(duckdb not installed)")
+        return
+    # And it is really applied, on the base connection AND on the per-thread
+    # cursor every query actually runs on.
+    st3 = duckstore.DuckStore(root, temp_dir=named, memory_limit="512MB")
+    got = st3.con().execute("SELECT current_setting('temp_directory')"
+                            ).fetchone()[0]
+    check("store/spill: the cursor a query runs on sees the setting",
+          got, named)
+    box = {}
+
+    def ask():
+        box["v"] = st3.con().execute(
+            "SELECT current_setting('temp_directory')").fetchone()[0]
+
+    t = threading.Thread(target=ask)
+    t.start()
+    t.join()
+    check("store/spill: ...and so does a second thread's own cursor",
+          box.get("v"), named)
+
+
+# The write primitives, named once.  A grep for these over `srv/store.py` was
+# run by hand while the split was built and reported "no `open(`, no `write(`,
+# no `os.remove/rename/mkdir/makedirs/unlink/replace`, no `shutil`, no `flock`"
+# -- a true statement about that revision, and a claim with nothing keeping it
+# true, which is exactly the shape this repository keeps writing tests against.
+STORE_WRITE_PRIMITIVES = (
+    "open(", "os.remove", "os.rename", "os.replace", "os.unlink", "os.mkdir",
+    "os.makedirs", "os.rmdir", "os.truncate", "shutil.", "fcntl.",
+    "os.O_CREAT", "os.O_WRONLY", "os.O_APPEND",
+)
+
+
+def test_the_reader_writes_nothing_into_the_store():
+    """`srv/store.py` is the READ half of the split, and the mount is `:ro`.
+
+    Proven from inside the running api container -- `EROFS` on an append, on a
+    `door.lock` flock and on a plain file -- but that proves the MOUNT, and a
+    mount is an operator's configuration.  This asserts the property of the
+    SOURCE, so that an api handed a writable store by mistake still writes
+    nothing to it.
+
+    THE ONE EXCEPTION IS NAMED RATHER THAN EXCLUDED FROM THE SCAN.
+    `temp_dir_problem` writes and unlinks one byte, and it does it in the
+    DuckDB SPILL directory, which is not the store and is never under it.  A
+    guard that simply allowed `open(` anywhere in this file would be satisfied
+    by a write into `accounts/`; one that forbade it outright would have to be
+    deleted the first time a probe was needed, and a deleted guard asserts
+    nothing.  So the primitives are confined BY LOCATION and the path the
+    exception may touch is asserted separately.
+    """
+    import ast as _ast
+    path = os.path.join(fx.SRV_DIR, "srv", "store.py")
+    src = open(path, encoding="utf-8").read()
+    lines = src.splitlines(keepends=True)
+    span = None
+    for node in _ast.walk(_ast.parse(src)):
+        if isinstance(node, _ast.FunctionDef) and node.name == "temp_dir_problem":
+            span = (node.lineno, node.end_lineno)
+    check_true("store/readonly: the spill probe is findable, so the "
+               "exception is a real span and not a guess", span is not None)
+    for i in range(span[0] - 1, span[1]):
+        lines[i] = "\n"
+    tmp = os.path.join(door_root(), "store-without-the-probe.py")
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write("".join(lines))
+    # Comments and docstrings name these primitives on purpose -- this test's
+    # own prose does -- so the scan is of CODE.  Greping the raw file is how
+    # the counters test one directory over came to assert a comment.
+    code = code_without_prose(tmp)
+    found = sorted({p for p in STORE_WRITE_PRIMITIVES if p in code})
+    check("store/readonly: no write primitive outside the spill probe",
+          found, [])
+    probe = "".join(src.splitlines(keepends=True)[span[0] - 1:span[1]])
+    check_true("store/readonly: ...and the probe touches only self.temp_dir",
+               "self.temp_dir" in probe and "self.root" not in probe
+               and "self.paths" not in probe)
+    check("store/readonly: the engine opens no database file either",
+          "duckdb.connect()" in code, True)
+
+    # BEHAVIOURAL, because a scan is a statement about spelling.  Ask every
+    # shape of question and assert the store's bytes and timestamps are
+    # untouched -- directory mtimes included, so a file created and removed
+    # inside the store would still be caught.
+    if not have_duck():
+        _skip("store/readonly: the behavioural half (duckdb not installed)")
+        return
+    root, _store, a = ui_store()
+    alpha = fx.uuid_of("alpha")
+
+    def snapshot():
+        out = {}
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames.sort()
+            st = os.stat(dirpath)
+            out[dirpath] = (st.st_mtime_ns, sorted(dirnames), sorted(filenames))
+            for fn in sorted(filenames):
+                p = os.path.join(dirpath, fn)
+                fs = os.stat(p)
+                out[p] = (fs.st_size, fs.st_mtime_ns)
+        return out
+
+    before = snapshot()
+    for route, qs in (("search", "account=" + alpha),
+                      ("aggregate", "account=%s&by=model" % alpha),
+                      ("histogram", "account=%s&interval=3600" % alpha),
+                      ("values", "account=%s&fields=model" % alpha),
+                      ("fields", "account=" + alpha),
+                      ("lookup", "account=%s&field=session_id&value=x" % alpha),
+                      ("diagnostics", "account=" + alpha),
+                      ("windows", "account=" + alpha),
+                      ("accounts", "")):
+        ui_call(a, V1 + route, qs)
+    check("store/readonly: no query changed a byte or a timestamp in the store",
+          snapshot(), before)
 
 
 def test_api_reader_auth_is_inert_until_configured_and_never_echoes_a_token():
@@ -6806,6 +7597,4092 @@ def test_api_an_exposed_door_refuses_to_serve_an_unauthenticated_read_api():
           "email addresses" in text, True)
     check("reader-auth: and names both remedies",
           ("readers.json" in text and "--no-api" in text), True)
+
+
+# ---------------------------------------------------------------------------
+# the split: the writer's lock, the reader's absence of one, and the flag pair
+# ---------------------------------------------------------------------------
+
+
+def _split_root(with_accounts=True):
+    """A store root, optionally with the `accounts/` a writer would create."""
+    root = tempfile.mkdtemp(prefix="omini-split-")
+    if with_accounts:
+        os.makedirs(os.path.join(root, "accounts"), mode=0o700)
+        os.makedirs(os.path.join(root, "offsets"), mode=0o700)
+    with open(os.path.join(root, "tokens.json"), "w", encoding="utf-8") as fh:
+        json.dump({"t": fx.uuid_of("alpha")}, fh)
+    with open(os.path.join(root, "readers.json"), "w", encoding="utf-8") as fh:
+        json.dump({"r": serve.ALL_ACCOUNTS}, fh)
+    return root
+
+
+@contextlib.contextmanager
+def _running_door(root, **kw):
+    """`serve()` in a thread, on a real port, shut down cleanly afterwards.
+
+    The `ready` callback is handed the bound PORT and not the server, so there
+    is nothing in it to call `shutdown()` on.  The server object is captured by
+    wrapping the class `serve()` constructs -- restored in the `finally`,
+    because a suite that left a subclass installed would be testing its own
+    wrapper from then on.
+    """
+    box, out = {}, {}
+    started = threading.Event()
+    real = serve.ThreadingHTTPServer
+
+    class Captured(real):
+        def __init__(self, *a, **k):
+            real.__init__(self, *a, **k)
+            box["httpd"] = self
+
+    serve.ThreadingHTTPServer = Captured
+
+    def _ready(port):
+        box["port"] = port
+        started.set()
+
+    def _run():
+        try:
+            out["rc"] = serve.serve(
+                "127.0.0.1", 0, root,
+                os.path.join(root, "tokens.json"), quiet=True, ready=_ready,
+                readers_path=os.path.join(root, "readers.json"), **kw)
+        finally:
+            started.set()
+
+    thread = threading.Thread(target=_run, daemon=True)
+    thread.start()
+    started.wait(20)
+    try:
+        yield box, out
+    finally:
+        if "httpd" in box:
+            box["httpd"].shutdown()
+        thread.join(20)
+        serve.ThreadingHTTPServer = real
+
+
+def _serve_expecting_refusal(label, root, **kw):
+    """`serve()` that is expected to REFUSE, run so that a bind FAILS BY NAME.
+
+    The obvious shape -- call `serve()` on the main thread and assert the exit
+    code -- is a test that cannot check its own control.  If the refusal it
+    pins is ever removed, `serve()` does not return a different number: it
+    binds a port and calls `serve_forever`, and the suite HANGS.  A hang is not
+    a failing test; nobody can tell it from a slow machine, CI kills the job
+    with no finding attached, and the one line it was guarding is the one line
+    in the split that can lose data.  Proven: reinstating the defect this was
+    written for (`if False:` where `if ship_enabled:` belongs, which is exactly
+    how the lock arrived in this tree) hung the run instead of failing it.
+
+    So the call goes on a daemon thread, the server class is wrapped to capture
+    the instance the way `_running_door` does, and a bind is shut down and
+    reported as the named failure it is.  Returns `(rc, stderr text)`.
+    """
+    box, out = {}, {}
+    done = threading.Event()
+    real = serve.ThreadingHTTPServer
+
+    class Captured(real):
+        def __init__(self, *a, **k):
+            real.__init__(self, *a, **k)
+            box["httpd"] = self
+
+    err = io.StringIO()
+
+    def _run():
+        try:
+            out["rc"] = serve.serve(
+                "127.0.0.1", 0, root, os.path.join(root, "tokens.json"),
+                quiet=True, ready=lambda p: box.setdefault("port", p),
+                readers_path=os.path.join(root, "readers.json"), **kw)
+        except Exception as exc:                     # pragma: no cover
+            out["exc"] = exc
+        finally:
+            done.set()
+
+    old = sys.stderr
+    sys.stderr = err
+    serve.ThreadingHTTPServer = Captured
+    try:
+        thread = threading.Thread(target=_run, daemon=True)
+        thread.start()
+        done.wait(20)
+        if not done.is_set():
+            # It bound. Take it down before saying so, or every later test on
+            # this root meets a live server holding the lock.
+            if "httpd" in box:
+                box["httpd"].shutdown()
+            done.wait(20)
+            thread.join(20)
+            fail("%s: serve() BOUND A PORT where a refusal was required "
+                 "(port %s) -- the refusal is gone, not merely renumbered"
+                 % (label, box.get("port")))
+            return None, err.getvalue()
+        thread.join(20)
+    finally:
+        sys.stderr = old
+        serve.ThreadingHTTPServer = real
+    if "exc" in out:
+        fail("%s: serve() raised %r instead of refusing"
+             % (label, out["exc"]))
+        return None, err.getvalue()
+    check_true("%s: and it never bound a port" % label, "httpd" not in box)
+    return out.get("rc"), err.getvalue()
+
+
+def test_the_store_lock_is_the_writers_and_a_reader_takes_none():
+    """THE ONE EDIT IN THE SPLIT THAT COULD LOSE DATA, ASSERTED FROM BOTH ENDS.
+
+    `lock_root` ran unconditionally in `serve()` and refused a second process
+    of ANY kind on one root.  Its docstring says why, and the reason is
+    narrower than the lock was: two processes on one root would not corrupt the
+    record files -- every append is `O_APPEND` -- but they would interleave
+    read-modify-write on the OFFSETS, and an offset is what the ack promises.
+    Offsets are written in exactly one place, `Store.accept`, on the ship path.
+    So it is the WRITER's lock, and the reader-only api service takes none.
+
+    TWO WRITERS MUST STILL BE REFUSED, and that is the first half here --
+    exit 3, the same code and the same message as before, over three shapes:
+    two ship-enabled processes, and a whole door beside an ingest-only one.
+
+    THE SECOND HALF IS THE ONE A GREP CANNOT DO.  "The reader takes no lock" is
+    not "the reader started while a lock was held" -- it could have taken a
+    second lock on a different path, or taken and released one, and both would
+    pass a naive test.  `lock_root` is replaced by a recorder for the duration,
+    so what is asserted is the CALL: the writer makes exactly one and the
+    reader makes none at all.
+    """
+    root = _split_root()
+
+    # -- 1. two writers, refused --------------------------------------------
+    fd = serve.lock_root(root)
+    check_true("split-lock: the first writer takes the lock", fd is not None)
+    check("split-lock: a second lock_root on the same root is refused",
+          serve.lock_root(root), None)
+
+    # Ship-enabled with the lock already held, both shapes. `_serve_expecting_
+    # refusal` is what makes these assertions checkable: a serve() that binds
+    # instead of refusing is reported by name rather than hanging the suite.
+    rc_api_off, err_api_off = _serve_expecting_refusal(
+        "split-lock/ingest-only", root, api_enabled=False)
+    rc_whole, err_whole = _serve_expecting_refusal(
+        "split-lock/whole-door", root)
+    check("split-lock: an ingest-only door on a locked root exits 3",
+          rc_api_off, 3)
+    check("split-lock: a whole door on a locked root exits 3 too", rc_whole, 3)
+    check_true("split-lock: and the refusal still names door.lock",
+               "door.lock" in err_api_off and "door.lock" in err_whole)
+
+    # -- 2. the reader, while that lock is still held ------------------------
+    calls = []
+    real_lock = serve.lock_root
+
+    def _recorded(r):
+        calls.append(r)
+        return real_lock(r)
+
+    serve.lock_root = _recorded
+    try:
+        with _running_door(root, ship_enabled=True, api_enabled=False) as (b, o):
+            pass
+    finally:
+        serve.lock_root = real_lock
+    # The writer above could not start (the lock is still held by `fd`), which
+    # is fine: what is being counted is the ATTEMPT.
+    check("split-lock: a ship-enabled door asks for the lock exactly once",
+          len(calls), 1)
+
+    calls = []
+    serve.lock_root = _recorded
+    try:
+        with _running_door(root, ship_enabled=False) as (box, out):
+            check_true("split-lock: the reader BOUND a port while the writer's "
+                       "lock is held", isinstance(box.get("port"), int))
+            # Guarded, because the failure this test exists to catch is a
+            # reader that DOES take the lock -- and such a reader never binds,
+            # so an unguarded `box["port"]` turns the finding into a KeyError
+            # traceback. A raise is not a worse failure than the assertion; it
+            # is a worse REPORT of the same one, and it buries the named line
+            # directly above it. Proven by the `split-lock-taken-by-reader`
+            # row of the mutation matrix, which printed exactly that KeyError.
+            if isinstance(box.get("port"), int):
+                req = urllib.request.Request(
+                    "http://127.0.0.1:%d/healthz" % box["port"])
+                with urllib.request.urlopen(req, timeout=10) as fh:
+                    health = json.loads(fh.read())
+                check("split-lock: ...and it says which half it is",
+                      health.get("role"), "reader")
+    finally:
+        serve.lock_root = real_lock
+    check("split-lock: a reader NEVER calls lock_root", calls, [])
+    check("split-lock: and the reader exited 0, not 3", out.get("rc"), 0)
+
+    os.close(fd)
+    shutil.rmtree(root, ignore_errors=True)
+
+
+def test_a_reader_creates_nothing_and_refuses_a_store_it_cannot_see():
+    """`Store(create=False)` and exit 9, which are two halves of one fact.
+
+    A reader is handed the store volume READ ONLY.  `Store.__init__` calls
+    `os.makedirs(..., exist_ok=True)` twice and `lock_root` calls it a third
+    time; on a read-only mount whose directories are absent that is EROFS out
+    of the top of `serve.py`, aborting a process that was never going to write
+    a byte, with a permission error an operator reads as a broken mount rather
+    than as the correct configuration it is.
+
+    The other half is the damage the split CREATES.  `accounts_in` swallows
+    `OSError` and returns `[]`, and `Paths.accounts` does the same -- both
+    deliberately, on the write path, where an account directory that does not
+    exist yet is not an error.  On the READ path with a mistyped `--root`, or a
+    bind mount that did not land, those two zeros compose into a server that
+    answers `no-data` about every account in a store it is not looking at.
+    That is byte-indistinguishable from a store nobody has shipped to, which is
+    this project's cardinal sin.  So it is refused by name, with the three
+    things it can mean.
+    """
+    # -- create=False writes nothing ----------------------------------------
+    bare = tempfile.mkdtemp(prefix="omini-nocreate-")
+    st = serve.Store(bare, create=False)
+    check("split-create: Store(create=False) creates no directories",
+          sorted(os.listdir(bare)), [])
+    check("split-create: ...and still answers the questions health asks",
+          (st.root, st.reserve == serve.DISK_RESERVE,
+           isinstance(st.free_bytes(), int)),
+          (os.path.abspath(bare), True, True))
+    st2 = serve.Store(bare)
+    check("split-create: the default still creates them, for the writer",
+          sorted(os.listdir(bare)), ["accounts", "offsets"])
+    check_true("split-create: ...and it is the same class either way",
+               type(st) is type(st2))
+    shutil.rmtree(bare, ignore_errors=True)
+
+    # -- exit 9 --------------------------------------------------------------
+    empty = _split_root(with_accounts=False)
+    # Bounded, so that REMOVING this refusal fails by name instead of hanging
+    # the suite on a `serve_forever` -- see `_serve_expecting_refusal`.
+    rc, text = _serve_expecting_refusal("split-root", empty, ship_enabled=False)
+    check("split-root: a reader over a store with no accounts/ exits 9", rc, 9)
+    check_true("split-root: ...naming the root it was given",
+               os.path.abspath(empty) in text)
+    for meaning in ("--root", "bind mount", "never run"):
+        check_true("split-root: ...and what it can mean (%s)" % meaning,
+                   meaning in text)
+    check_true("split-root: ...and why silence would be worse",
+               "no-data" in text)
+    # A WRITER over the same root does NOT refuse: it creates them, which is
+    # exactly the asymmetry the refusal rests on.  Without this the test would
+    # pass over a `serve()` that refused every empty root.
+    fd = serve.lock_root(empty)
+    check_true("split-root: a writer creates accounts/ rather than refusing",
+               fd is not None)
+    serve.Store(empty)
+    check_true("split-root: ...and now the reader's precondition holds",
+               os.path.isdir(os.path.join(empty, "accounts")))
+    if fd is not None:
+        os.close(fd)
+    shutil.rmtree(empty, ignore_errors=True)
+
+
+def test_the_two_flags_name_two_services_and_both_together_are_refused():
+    """`--no-api` and `--no-ship`, and the empty intersection between them.
+
+    One process, two halves.  Each flag switches one off and names the service
+    the other half is; both on is the whole door and is still the default, so
+    nothing that ran before the split runs differently.
+
+    BOTH OFF IS REFUSED BY NAME (exit 8) RATHER THAN STARTED.  A process with
+    both halves off comes up, binds a port and answers `/healthz` -- so
+    everything that pings it reports a healthy service, while it serves neither
+    shipments nor reads.  That is a plausible zero with a port number on it.
+    """
+    root = _split_root()
+    rc, text = _serve_expecting_refusal("split-flags", root,
+                                        api_enabled=False, ship_enabled=False)
+    check("split-flags: both flags together is exit 8", rc, 8)
+    for named in ("--no-api", "--no-ship", "/healthz"):
+        check_true("split-flags: ...and the refusal names %s" % named,
+                   named in text)
+    check("split-flags: ...and no lock was left behind",
+          os.path.exists(os.path.join(root, "door.lock")), False)
+
+    # THE FLAGS ARE WIRED THROUGH `main`, which is what an image actually
+    # invokes.  A `serve()` that took the keyword while argparse never passed
+    # it would leave every assertion above true and every container wrong.
+    parsed = {}
+    real = serve.serve
+
+    def _spy(*a, **kw):
+        parsed.clear()
+        parsed.update(kw)
+        return 0
+
+    serve.serve = _spy
+    try:
+        serve.main(["--root", root])
+        check("split-flags: no flag is the whole door",
+              (parsed.get("api_enabled"), parsed.get("ship_enabled")),
+              (True, True))
+        serve.main(["--root", root, "--no-api"])
+        check("split-flags: --no-api is the ingest service",
+              (parsed.get("api_enabled"), parsed.get("ship_enabled")),
+              (False, True))
+        serve.main(["--root", root, "--no-ship"])
+        check("split-flags: --no-ship is the api service",
+              (parsed.get("api_enabled"), parsed.get("ship_enabled")),
+              (True, False))
+        serve.main(["--root", root, "--no-ui"])
+        check("split-flags: --no-ui is still the old spelling of --no-api",
+              (parsed.get("api_enabled"), parsed.get("ship_enabled")),
+              (False, True))
+    finally:
+        serve.serve = real
+    shutil.rmtree(root, ignore_errors=True)
+
+
+def test_a_reader_refuses_a_shipment_by_name_and_never_acknowledges_one():
+    """503 `no-ship`, and it is neither a 404 nor an ack.
+
+    A 404 would tell a shipper this URL does not exist, and a shipper that
+    concludes that stops trying -- it exists, and this process is not the one
+    that serves it.  An ack would be worse: the client advances its offset on a
+    200 and those bytes are then gone from its point of view, while nothing
+    was written.  The offset is untouched either way, so the client still holds
+    every byte and resends the identical range to the process that does.
+
+    AND THE READER'S `/healthz` SAYS ITS COUNTERS ARE STRUCTURALLY ZERO.
+    `records_written: 0` is true of a reader and says nothing at all about the
+    store, so a monitor reading the same key set off both halves of a split
+    door would conclude a healthy stack had ingested nothing.  Every existing
+    key keeps its meaning; two are added.
+    """
+    root = _split_root()
+    with _running_door(root, ship_enabled=False) as (box, _out):
+        port = box["port"]
+
+        def post(path, body=b"{}\n", token="t"):
+            req = urllib.request.Request("http://127.0.0.1:%d%s" % (port, path),
+                                         data=body, method="POST")
+            req.add_header("Authorization", "Bearer " + token)
+            req.add_header("Content-Type", serve.CONTENT_TYPE)
+            try:
+                with urllib.request.urlopen(req, timeout=10) as fh:
+                    return fh.status, json.loads(fh.read())
+            except urllib.error.HTTPError as exc:
+                return exc.code, json.loads(exc.read())
+
+        status, doc = post(serve.PATH_SHIP)
+        check("split-noship: a shipment to a reader is 503 no-ship",
+              (status, doc.get("reason")), (503, "no-ship"))
+        check("split-noship: ...and it is NOT an acknowledgement",
+              doc.get("ok"), False)
+        check("split-noship: ...and carries no offset to advance to",
+              "offset" in doc, False)
+        check_true("split-noship: ...and says where to ship instead",
+                   "read-write" in (doc.get("detail") or ""))
+
+        # A DIFFERENT PATH IS STILL A 404, so the refusal above is about the
+        # ROUTE existing here rather than about POST being refused wholesale.
+        status, doc = post("/v1/nonsense")
+        check("split-noship: an unknown POST path is still 404 not-found",
+              (status, doc.get("reason")), (404, "not-found"))
+
+        with urllib.request.urlopen(
+                "http://127.0.0.1:%d/healthz" % port, timeout=10) as fh:
+            health = json.loads(fh.read())
+        check("split-health: the reader names its role", health.get("role"),
+              "reader")
+        check_true("split-health: ...and says its write counters mean nothing",
+                   "structurally zero" in (health.get("counters_are") or ""))
+        check("split-health: ...and every existing key is still there",
+              [k for k in ("root", "disk_free_bytes", "disk_reserve_bytes",
+                           "tenants_configured", "tokens_refused", "engine")
+               if k not in health], [])
+
+    with _running_door(root, api_enabled=False) as (box, _out):
+        with urllib.request.urlopen(
+                "http://127.0.0.1:%d/healthz" % box["port"], timeout=10) as fh:
+            health = json.loads(fh.read())
+        check("split-health: the writer names its role", health.get("role"),
+              "writer")
+        # AND CARRIES NO SUCH CAVEAT, which is the half that makes the caveat
+        # readable: a sentence on every payload is a sentence nobody reads.
+        check("split-health: ...and has no counters_are, because its counters "
+              "mean what they say", "counters_are" in health, False)
+    shutil.rmtree(root, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# the OCI images: what is in them, and what they must never quietly do
+# ---------------------------------------------------------------------------
+
+# These are static guards over `server/oci/`, and they are resolved from `HERE`
+# -- this file's own directory -- rather than from `fx.SRV_DIR`.  That is not a
+# stylistic choice.  `mutate.py` copies `srv/` and the README into a temporary
+# tree and points `SRV_DIR` at it; a test that resolved these files through
+# `SRV_DIR` would raise `FileNotFoundError` in EVERY mutated run, an exception
+# is counted as a failure exactly as an assertion is, and every row of the
+# matrix would read `caught` whether or not anything asserted the behaviour.
+# That is precisely the defect this harness was found to have once already, and
+# it hid three real survivors.  Resolved from `HERE` these read the real files
+# in a mutated run, pass, and contribute nothing false to any row.
+#
+# Each one fails BY NAME when its input is absent, for the same reason.
+
+OCI = os.path.join(os.path.dirname(HERE), "oci")
+REPO = os.path.dirname(os.path.dirname(HERE))
+
+
+def _oci_containerfiles():
+    """Every `Containerfile.*` in `server/oci/`, as (name, source)."""
+    if not os.path.isdir(OCI):
+        return []
+    out = []
+    for fn in sorted(os.listdir(OCI)):
+        # `Containerfile.linux.dockerignore` starts with "Containerfile" and is
+        # not one.  Excluded by suffix rather than by counting dots, because
+        # `.containerignore` is the same file under buildah's name for it and a
+        # dot-counting rule would let that one through.
+        if fn.endswith((".dockerignore", ".containerignore")):
+            continue
+        if fn.startswith("Containerfile"):
+            out.append((fn, open(os.path.join(OCI, fn),
+                                 encoding="utf-8").read()))
+    return out
+
+
+def _sh_code(text):
+    """A shell file with its full-line comments removed.
+
+    The same trap `code_without_prose` exists for one language over: a static
+    "the entrypoint never says `--no-api`" check that greps the raw file
+    matches the paragraph explaining why it must never say it.  Only full-line
+    comments are stripped and that is stated rather than glossed -- a trailing
+    `#` inside a line would survive -- because stripping a `#` that sits inside
+    a quoted string is exactly the wrong kind of clever for a guard.
+    """
+    return "\n".join(l for l in text.splitlines()
+                      if not l.lstrip().startswith("#"))
+
+
+def _sysexit(fn, args):
+    """`None` if `fn(args)` returned, otherwise the `SystemExit`'s message.
+
+    These commands refuse with `sys.exit("...")`, so "did it refuse, and did
+    it say why" is one question about one object.
+    """
+    try:
+        fn(args)
+        return None
+    except SystemExit as exc:
+        return exc.code if exc.code is not None else "exit()"
+
+
+# A synthetic RSA-1024 key, generated here rather than committed.
+#
+# What is under test is the VERIFIER, and a key this test owns the private
+# half of exercises two branches the real FreeBSD key cannot reach at all: a
+# signature over the single hash rather than pkg's double one, and a forged
+# PKCS#1 block with short padding.  Deterministically seeded, so a failure is
+# reproducible; 1024 bits because the block only has to be wide enough for a
+# SHA-256 DigestInfo plus eight octets of padding, and a bigger modulus buys
+# the test nothing but seconds.
+_RSA_CACHE = {}
+
+
+def _rsa_key_1024():
+    if _RSA_CACHE:
+        return _RSA_CACHE
+    import random
+    rnd = random.Random(20260821)
+
+    def probably_prime(n):
+        if n < 2:
+            return False
+        for p in (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37):
+            if n % p == 0:
+                return n == p
+        d, r = n - 1, 0
+        while d % 2 == 0:
+            d //= 2
+            r += 1
+        for a in (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37):
+            x = pow(a, d, n)
+            if x in (1, n - 1):
+                continue
+            for _ in range(r - 1):
+                x = x * x % n
+                if x == n - 1:
+                    break
+            else:
+                return False
+        return True
+
+    def prime():
+        while True:
+            c = rnd.getrandbits(512) | (1 << 511) | 1
+            if probably_prime(c):
+                return c
+
+    e = 65537
+    while True:
+        p, q = prime(), prime()
+        if p == q:
+            continue
+        phi = (p - 1) * (q - 1)
+        # `e` must be coprime to phi, i.e. phi % e MUST NOT be zero.  Written
+        # the other way round first, which loops for ever rather than failing.
+        if phi % e == 0:
+            continue
+        _RSA_CACHE.update({"n": p * q, "e": e, "d": pow(e, -1, phi)})
+        return _RSA_CACHE
+
+
+def _spki_pem(n, e):
+    """(n, e) as a PEM SubjectPublicKeyInfo, DER built by hand.
+
+    Written out rather than taken from a library, because the whole point of
+    `pkgindex.py`'s parser is that it needs no library.
+    """
+    import base64
+
+    def tlv(tag, val):
+        if len(val) < 0x80:
+            return bytes([tag, len(val)]) + val
+        ln = len(val).to_bytes((len(val).bit_length() + 7) // 8, "big")
+        return bytes([tag, 0x80 | len(ln)]) + ln + val
+
+    def integer(x):
+        b = x.to_bytes((x.bit_length() + 8) // 8, "big")
+        return tlv(0x02, b)
+
+    rsa = tlv(0x30, integer(n) + integer(e))
+    # rsaEncryption OID 1.2.840.113549.1.1.1, NULL parameters.
+    algid = tlv(0x30, bytes.fromhex("06092a864886f70d010101") + tlv(0x05, b""))
+    spki = tlv(0x30, algid + tlv(0x03, b"\x00" + rsa))
+    b64 = base64.encodebytes(spki).decode("ascii").strip()
+    return ("-----BEGIN PUBLIC KEY-----\n" + b64
+            + "\n-----END PUBLIC KEY-----\n").encode("ascii")
+
+
+def _rsa_sign_pkcs1_sha256(key, digest):
+    """A correct EMSA-PKCS1-v1_5 SHA-256 signature over `digest`."""
+    k = (key["n"].bit_length() + 7) // 8
+    di = bytes.fromhex("3031300d060960864801650304020105000420") + digest
+    em = b"\x00\x01" + b"\xff" * (k - 3 - len(di)) + b"\x00" + di
+    return pow(int.from_bytes(em, "big"), key["d"], key["n"]).to_bytes(k, "big")
+
+
+def test_oci_the_files_this_section_asserts_about_exist():
+    """The named-failure half.  Without it every check below is vacuous."""
+    check_true("oci: server/oci/ exists", os.path.isdir(OCI))
+    for fn in ("entrypoint.sh", "preflight.py", "entrypoint-mcp.sh",
+               "entrypoint-proxy.sh", "compose.yml"):
+        check("oci: the shared %s was found" % fn,
+              os.path.isfile(os.path.join(OCI, fn)) and fn,
+              fn)
+    # The proxy's configuration.  Two of the three are shared with the Linux
+    # proxy image byte for byte -- the routes are one decision -- and the third
+    # is the base-specific main configuration.
+    for fn in ("claudio.conf", "claudio-locations.conf", "claudio-tls.conf",
+               "nginx.freebsd.conf", "nginx.linux.conf"):
+        path = os.path.join(OCI, "nginx", fn)
+        check("oci: nginx/%s was found" % fn,
+              os.path.isfile(path) and fn, fn)
+    names = [n for n, _ in _oci_containerfiles()]
+    check_true("oci: at least one Containerfile was found", bool(names))
+    # ONE IMAGE PER COMPONENT PER BASE, and all eight are named here so that
+    # every loop below has something to loop over.  A component whose
+    # Containerfile went missing would otherwise make its guards vacuous rather
+    # than red.
+    for base in ("linux", "freebsd"):
+        for comp in COMPONENTS:
+            fn = "Containerfile.%s.%s" % (base, comp)
+            check("oci: %s was found" % fn, fn in names and fn, fn)
+    # AND NO BARE `Containerfile.<os>`.  That name meant "the door" -- one
+    # process holding the write lock, the store read-write and the query engine
+    # -- and the whole point of the split is that no such image exists.  Left
+    # behind it would build and run and look right.
+    for base in ("linux", "freebsd"):
+        check("oci: there is no whole-door Containerfile.%s any more" % base,
+              "Containerfile.%s" % base in names, False)
+
+
+# The component a Containerfile builds, derived from its name rather than
+# written down: `Containerfile.<os>.<x>` is component `<x>`.  Derived, because
+# a hand-kept mapping is a second place to forget and the copy is always the
+# one that goes stale -- and because it pairs `Containerfile.linux.mcp` with
+# `Containerfile.freebsd.mcp` with no edit here.
+#
+# A BARE `Containerfile.<os>` USED TO MEAN "door", AND IT DELIBERATELY MEANS
+# NOTHING NOW.  The door was one process holding the write lock, the store
+# read-write and the query engine at once; it is two images.  Returning `None`
+# rather than a default is what makes `_oci_components` refuse a file nobody
+# has classified, instead of quietly filing it under the component whose
+# guards are weakest.
+def _component_of(name):
+    parts = name.split(".")
+    if len(parts) < 3:
+        return None
+    return parts[2]
+
+
+# The two components that touch the store, and the two that must never.
+# Written here once, so a third store-holding component has one place to be
+# admitted rather than four loops to be added to.
+STORE_COMPONENTS = ("ingest", "api")
+COMPONENTS = ("ingest", "api", "mcp", "proxy")
+
+
+def _os_of(name):
+    parts = name.split(".")
+    return parts[1] if len(parts) > 1 else None
+
+
+def test_oci_no_containerfile_declares_a_healthcheck():
+    """`HEALTHCHECK` is silently DROPPED under `--format oci`.
+
+    The OCI image spec has no field for one, so buildah drops it and the
+    published config would simply not contain it -- while a Docker-format build
+    of the identical file keeps it.  That is how the omission goes unnoticed:
+    it appears to work locally and vanishes on publish.  This project ships two
+    images and one of them is built with buildah; a health check present in one
+    and absent in the other is a health check nothing may rely on.
+    """
+    files = _oci_containerfiles()
+    check_true("oci/health: there were Containerfiles to check", bool(files))
+    for name, text in files:
+        code = "\n".join(l for l in text.splitlines()
+                          if not l.lstrip().startswith("#"))
+        check("oci/health: %s declares no HEALTHCHECK" % name,
+              "HEALTHCHECK" in code.upper(), False)
+        # THE RUN-TIME EQUIVALENT, AND IT IS NOT ALWAYS `/healthz`.  The two
+        # store halves serve that route and their comments quote it; the mcp
+        # component has no unauthenticated route at all -- that is the point of
+        # it -- and the proxy's healthy answer to `/` is a 404 from the
+        # catch-all.  So what is asserted is that the file says HOW to check
+        # this image at run time, not that every image has one route in common.
+        check_true("oci/health: %s documents the run-time equivalent instead"
+                   % name,
+                   "--health-cmd" in text or "healthcheck:" in text)
+
+
+def test_oci_the_proxy_notices_an_upstream_that_moved():
+    """`claudio.conf` argues -- correctly -- that the upstream addresses must
+    NOT be deferred into a variable with a `resolver`, because that turns
+    nginx's loud startup refusal into a steady silent 502.  That argument is
+    about STARTUP, and the other direction is the one that bites later.
+
+    nginx resolves each upstream name once, at configuration load, so an
+    address that moves afterwards is never noticed.  Reproduced on the running
+    stack: `docker compose restart ingest api` swapped 172.28.0.2 and
+    172.28.0.3, nginx kept the old pair, and both routes crossed -- and with
+    `restart: unless-stopped` on every service, a crashed or recreated backend
+    reaches that state with nobody watching.
+
+    The watcher is in the ENTRYPOINT and not in the nginx configuration, which
+    is the whole reason it is compatible with that argument: the addresses are
+    still resolved once per configuration load, and this only decides WHEN a
+    load happens.
+
+    Controlled measurement, both directions, on the live stack:
+
+        CLAUDIO_PROXY_WATCH=0   crossed at t+0, still crossed indefinitely
+        watcher on              crossed at t+0, correct at t+18s (one tick)
+
+    with the before and after address triples in the proxy's own log.
+    """
+    src = open(os.path.join(OCI, "entrypoint-proxy.sh"), encoding="utf-8").read()
+    check_true("oci/proxy-watch: the entrypoint reloads nginx rather than "
+               "restarting it", "-s reload" in src)
+    check_true("oci/proxy-watch: ...on a timer of its own",
+               "CLAUDIO_PROXY_WATCH_SECONDS" in src)
+    check_true("oci/proxy-watch: ...and it can be turned off by name",
+               "CLAUDIO_PROXY_WATCH" in src)
+
+    # A RESOLUTION FAILURE IS NOT A MOVE, and this is the assertion that keeps
+    # the watcher from making things worse: a backend that is briefly down
+    # resolves to nothing, and reloading on that walks nginx into the startup
+    # refusal the whole design relies on not happening unattended.
+    check_true("oci/proxy-watch: a name that resolves to NOTHING stands the "
+               "watcher down instead of reloading", '"=;"' in src)
+    # A FAILED RELOAD IS NOT A SUCCESSFUL ONE. Recording the new addresses as
+    # seen after a reload that failed leaves the proxy permanently crossed with
+    # a log line saying it was fixed.
+    lines = [ln.strip() for ln in src.splitlines()]
+    marks = [i for i, ln in enumerate(lines) if ln == '_WATCH_SEEN="$_now"']
+    check("oci/proxy-watch: the new addresses are recorded in exactly one "
+          "place", len(marks), 1)
+    check_true("oci/proxy-watch: ...and it is the SUCCESS arm of the reload, "
+               "so a failed reload retries instead of claiming it fixed "
+               "something",
+               bool(marks) and lines[marks[0] - 1].startswith('if "$NGINX" -s reload'))
+    # AND IT NEVER KILLS THE PROXY. A watcher that dies leaves the proxy
+    # working exactly as it did before this existed, so its own failure must
+    # not be fatal.
+    check("oci/proxy-watch: the watcher never exits the container",
+          [ln.strip() for ln in src.splitlines()
+           if ln.strip().startswith("exit ") and "_WATCH" in ln], [])
+
+    # THE COMPOSE FILE MUST BE ABLE TO REACH THE SWITCH. A documented kill
+    # switch that is unset in the supported way of starting the stack is a
+    # documented switch nobody can use.
+    comp = open(os.path.join(OCI, "compose.yml"), encoding="utf-8").read()
+    check_true("oci/proxy-watch: compose passes the switch through",
+               "CLAUDIO_PROXY_WATCH:" in comp)
+
+
+def test_oci_the_proxy_health_check_requires_an_answer():
+    """A health check whose failure mode is a plausible pass is worse than none.
+
+    The first draft was `... | grep -qE ' (502|504) ' && exit 1` -- unhealthy
+    only on a bad gateway.  Proven inside the running proxy against a port
+    nothing listens on: it reported HEALTHY.  And measured on the real stack
+    with the mcp stopped, `GET /mcp` came back with an EMPTY status line rather
+    than a 502, because nginx dropped the connection -- so the case that
+    catches "nothing answered" is not a hypothetical arm, it is the arm the
+    real failure takes.
+
+    What it asserts is that a BACKEND answered, not that it answered 200:
+    `/sender` is a 404 from the ingest door, `/api/v1/health` a 401 from the
+    api and `/mcp` a 404 from the mcp, and all three are correct.
+    """
+    # SLICED AS TEXT, not parsed. PyYAML is not in the standard library and
+    # nothing else in this suite needs it; making a guard depend on a
+    # third-party module is how a guard becomes a skip on the machine that
+    # most needs it.
+    comp = open(os.path.join(OCI, "compose.yml"), encoding="utf-8").read()
+    svc = comp.split("\n  proxy:\n", 1)
+    check_true("oci/proxy-health: compose.yml declares a proxy service",
+               len(svc) == 2)
+    block = re.split(r"\n  [a-z]", svc[1])[0] if len(svc) == 2 else ""
+    hc = block.split("    healthcheck:", 1)
+    check_true("oci/proxy-health: ...with a health check on it", len(hc) == 2)
+    cmd = re.split(r"\n    [a-z]", hc[1])[0] if len(hc) == 2 else ""
+    # COMMENTS STRIPPED, AND THIS LINE IS THE FINDING. Written without it,
+    # every assertion below was satisfied by the PARAGRAPH EXPLAINING the
+    # setting rather than by the setting: deleting the `*)` arm and deleting
+    # the `sleep 1` both left the suite green, because the comment above the
+    # command names them both. That is the counters test one directory over,
+    # which matched `host:\s*0\.0\.0\.0` in the comment saying why that
+    # setting was load-bearing -- and it is the reason `code_without_prose`
+    # exists for the Python half.
+    cmd = "\n".join(ln for ln in cmd.splitlines()
+                    if not ln.strip().startswith("#"))
+    check_true("oci/proxy-health: it is a shell command",
+               "CMD-SHELL" in cmd)
+    # ONE ROUTE PER UPSTREAM, derived from the proxy's own location file rather
+    # than listed here a second time: a route added there and not here would
+    # make this check silently narrower than the proxy it guards.
+    loc = open(os.path.join(OCI, "nginx", "claudio-locations.conf"),
+               encoding="utf-8").read()
+    proxied = sorted(set(re.findall(r"location\s+=?\s*(/\S*?)\s*\{[^}]*?"
+                                    r"proxy_pass", loc, re.S)))
+    check_true("oci/proxy-health: the locations file really names proxied "
+               "routes (%r)" % (proxied,), len(proxied) >= 3)
+    missing = [r for r in proxied
+               if r.rstrip("/") and r.rstrip("/") not in cmd]
+    check("oci/proxy-health: every proxied route is probed", missing, [])
+    check_true("oci/proxy-health: a bad gateway is unhealthy",
+               "50[24]" in cmd)
+    # THE ARM THAT MATTERS. Without it an empty answer -- which is what a dead
+    # upstream really produces -- reads as healthy.
+    # THE WHOLE LINE, not a substring. `"*) exit 1" in cmd` is satisfied by
+    # `HTTP/*50[24]*) exit 1 ;;` -- the 502 arm ends in exactly those
+    # characters -- so deleting the catch-all left the assertion green while
+    # restoring the defect. Measured by mutation, which is what a mutation
+    # matrix is for.
+    check_true("oci/proxy-health: and so is an answer that is not HTTP at all",
+               any(ln.strip() == "*) exit 1 ;;" for ln in cmd.splitlines()))
+    # busybox `nc` exits the moment its stdin reaches EOF, so a bare
+    # `printf | nc` sends the request, closes, and reads nothing: measured as
+    # three empty status lines against a perfectly healthy stack.
+    check_true("oci/proxy-health: stdin is held open past the write, or "
+               "busybox nc reads nothing", "sleep 1" in cmd)
+
+
+def test_oci_the_entrypoint_never_papers_over_the_bind_refusal():
+    """The door refuses an unauthenticated read API off loopback, exit 4.
+
+    Inside a container the bind IS non-loopback -- the port mapping is what
+    decides reachability, and binding loopback inside would make the port
+    answer nothing -- so that refusal is the ordinary first experience of these
+    images with no `readers.json` mounted.  An entrypoint that added
+    `--no-api`, or fell back to `--host 127.0.0.1`, would turn a refusal that
+    names its own remedy into either a mystery or a running door serving every
+    record in the store to anyone who can reach it.
+
+    THE ENTRYPOINT NOW SAYS `--no-api`, AND THE PROPERTY IS UNCHANGED.  It says
+    it in exactly one place -- the `CLAUDIO_SERVER_ROLE` case -- for an image
+    that DECLARED itself the ingest service.  "Quietly" was always the whole of
+    the prohibition: a role an operator can read in `docker inspect`, change
+    with `-e`, and see printed on every start is not a paper-over.  What would
+    be is a fallback, so the `door` branch is asserted to add nothing and an
+    unknown role is asserted to be refused rather than defaulted.
+
+    RUN, NOT READ.  The role is turned into argv by a shell `case`, and the way
+    to be wrong about it is a branch that falls through -- which a grep for the
+    flag cannot see and a stub `preflight.py` can.
+    """
+    path = os.path.join(OCI, "entrypoint.sh")
+    if not os.path.isfile(path):
+        check("oci/refusal: the entrypoint was found", path, "a file that exists")
+        return
+    text = open(path, encoding="utf-8").read()
+    code = _sh_code(text)
+    check("oci/refusal: the entrypoint's CODE never says '127.0.0.1'",
+          "127.0.0.1" in code, False)
+    check("oci/refusal: ...and never says '--no-ui'", "--no-ui" in code, False)
+    # The two role flags appear in the `case` and NOWHERE ELSE, which is what
+    # stops one being appended unconditionally further down.
+    for flag in ("--no-api", "--no-ship"):
+        check("oci/refusal: %r appears exactly once in the code" % flag,
+              code.count(flag), 1)
+    check_true("oci/refusal: it does pass --readers through",
+               "--readers" in code)
+    check_true("oci/refusal: and it execs rather than forking a wrapper",
+               "exec " in code)
+
+    # -- what each role actually becomes ------------------------------------
+    #
+    # A stub `preflight.py` beside a copy of the entrypoint: the entrypoint
+    # resolves an interpreter, execs `${HERE}/preflight.py`, and the stub
+    # prints the argv it was handed.  So this asserts the argv the door would
+    # really have received, not a string in a file.
+    work = tempfile.mkdtemp(prefix="omini-role-")
+    shutil.copy(path, os.path.join(work, "entrypoint.sh"))
+    with open(os.path.join(work, "preflight.py"), "w", encoding="utf-8") as fh:
+        fh.write("import sys\nprint('ARGV', ' '.join(sys.argv[1:]))\n")
+
+    def run(role, extra=()):
+        env = dict(os.environ)
+        env["CLAUDIO_SERVER_STORE"] = os.path.join(work, "store")
+        if role is not None:
+            env["CLAUDIO_SERVER_ROLE"] = role
+        else:
+            env.pop("CLAUDIO_SERVER_ROLE", None)
+        proc = subprocess.run(
+            ["/bin/sh", os.path.join(work, "entrypoint.sh")] + list(extra),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+        argv = ""
+        for line in proc.stdout.decode("utf-8", "replace").splitlines():
+            if line.startswith("ARGV "):
+                argv = line[5:]
+        return proc.returncode, argv, proc.stderr.decode("utf-8", "replace")
+
+    rc, argv, _err = run(None)
+    check("oci/role: no role is the WHOLE door -- neither flag", rc, 0)
+    check("oci/role: ...and its argv carries neither flag",
+          [f for f in ("--no-api", "--no-ship") if f in argv.split()], [])
+
+    rc, argv, _err = run("ingest")
+    check("oci/role: ingest exits 0", rc, 0)
+    check("oci/role: ...and adds --no-api and only --no-api",
+          [f for f in ("--no-api", "--no-ship") if f in argv.split()],
+          ["--no-api"])
+
+    rc, argv, _err = run("api")
+    check("oci/role: api exits 0", rc, 0)
+    check("oci/role: ...and adds --no-ship and only --no-ship",
+          [f for f in ("--no-api", "--no-ship") if f in argv.split()],
+          ["--no-ship"])
+
+    # THE OPERATOR'S OWN FLAGS COME LAST, which is the whole reason this is an
+    # environment variable rather than a `CMD`: argparse takes the last
+    # occurrence of a repeated option, so overriding one flag must not drop the
+    # one that makes the image what it is.
+    rc, argv, _err = run("api", ["--port", "9000"])
+    words = argv.split()
+    check("oci/role: an argv override keeps the role flag",
+          "--no-ship" in words, True)
+    check("oci/role: ...and the operator's flags are last",
+          words[-2:], ["--port", "9000"])
+
+    # AND AN UNKNOWN ROLE IS REFUSED, NOT DEFAULTED.  Falling back to the whole
+    # door would start both halves, the store lock and the query engine for
+    # somebody who typed one word wrong, with a banner as the only evidence.
+    rc, argv, err = run("reader")
+    check("oci/role: an unknown role is refused by name", rc, 11)
+    check("oci/role: ...and nothing was launched", argv, "")
+    check_true("oci/role: ...and the refusal names the value it was given",
+               "reader" in err)
+    for named in ("ingest", "api", "door"):
+        check_true("oci/role: ...and lists %s" % named, named in err)
+    shutil.rmtree(work, ignore_errors=True)
+
+
+def test_oci_the_preflight_refuses_but_never_reconfigures():
+    """One decision, one implementation.
+
+    The preflight checks the store and nothing else.  Reader auth and the bind
+    address are `serve.py`'s, already refused by name with the path of the file
+    to write; a second copy here would be the one that drifts, because it is
+    the one nobody runs the suite against.
+    """
+    path = os.path.join(OCI, "preflight.py")
+    if not os.path.isfile(path):
+        check("oci/preflight: the preflight was found", path,
+              "a file that exists")
+        return
+    code = code_without_prose(path)
+    for forbidden in ("--no-api", "--no-ui", "127.0.0.1", "duckdb"):
+        check("oci/preflight: its CODE never says %r" % forbidden,
+              forbidden in code, False)
+    check_true("oci/preflight: it does exec the door",
+               "execv" in code and "serve.py" in code)
+    # An ephemeral store is a WARNING and never a refusal: a throwaway door
+    # over a throwaway store is a legitimate experiment, and refusing it would
+    # make the honest case unreachable.  An unwritable one IS a refusal,
+    # because the alternative is `lock_root`'s makedirs raising out of the top
+    # of serve.py -- a traceback about `door.lock` for a fault about `chown`.
+    check_true("oci/preflight: an unmounted store is said out loud",
+               "NOTHING IS MOUNTED THERE" in open(path, encoding="utf-8").read())
+
+
+def test_oci_the_default_store_path_is_one_string_everywhere():
+    """Derived from the preflight's own constant, not hardcoded a fifth time.
+
+    Four files name this path and a fifth would be a fifth place to forget, so
+    the constant is read out of `preflight.py` and the others are checked
+    against it.
+    """
+    path = os.path.join(OCI, "preflight.py")
+    if not os.path.isfile(path):
+        check("oci/store-path: the preflight was found", path,
+              "a file that exists")
+        return
+    src_ = open(path, encoding="utf-8").read()
+    m = re.search(r'^DEFAULT_STORE = "([^"]+)"', src_, re.M)
+    if not m:
+        check("oci/store-path: preflight.py declares DEFAULT_STORE",
+              None, "a quoted path")
+        return
+    store = m.group(1)
+    check_true("oci/store-path: it is an absolute path", store.startswith("/"))
+    ep = os.path.join(OCI, "entrypoint.sh")
+    if os.path.isfile(ep):
+        check_true("oci/store-path: entrypoint.sh defaults to %s" % store,
+                   store in open(ep, encoding="utf-8").read())
+    files = _oci_containerfiles()
+    check_true("oci/store-path: there were Containerfiles to check", bool(files))
+    # THE TWO STORE HALVES NAME IT AND THE OTHER TWO MUST NOT, WHICH IS THE
+    # STRONGER HALF.
+    #
+    # This used to require every Containerfile to name the store path, which
+    # was right while there was one image and is exactly backwards now.  The
+    # mcp component is an HTTP CLIENT of the read API -- a reader token and
+    # nothing else -- and the proxy parses no record at all; a store path in
+    # either is either a mount that should not be there or a comment implying
+    # one, and both are how a boundary erodes.  Asserted on the whole file and
+    # not just its COPY lines on purpose: a mount point mentioned in prose is
+    # how the next person learns to add the mount.
+    holders = [(n, t) for n, t in files
+               if _component_of(n) in STORE_COMPONENTS]
+    check_true("oci/store-path: at least one store-holding image was found",
+               bool(holders))
+    check("oci/store-path: and it is both halves of the split, not one",
+          sorted({_component_of(n) for n, _ in holders}),
+          sorted(STORE_COMPONENTS))
+    for name, text in holders:
+        check_true("oci/store-path: %s names %s" % (name, store),
+                   store in text)
+    for name, text in files:
+        if _component_of(name) in STORE_COMPONENTS:
+            continue
+        check("oci/store-path: %s never names %s, because that component has "
+              "no store" % (name, store), store in text, False)
+    readme = os.path.join(os.path.dirname(HERE), "README.md")
+    if not os.path.isfile(readme):
+        check("oci/store-path: the README was found", readme,
+              "a file that exists")
+        return
+    check_true("oci/store-path: server/README.md names %s" % store,
+               store in open(readme, encoding="utf-8").read())
+
+
+def test_oci_the_pinned_engine_is_the_version_the_measurements_cite():
+    """A floating DuckDB does not merely risk a test; it invalidates prose.
+
+    `srv/duck.py` refuses five things DuckDB does silently, and each refusal is
+    written against a behaviour MEASURED on one version.  The pin is read out
+    of the Containerfile and the version out of duck.py's own "measured on"
+    sentences, so neither can move without the other.
+    """
+    duck_src = open(os.path.join(fx.SRV_DIR, "srv", "duck.py"),
+                    encoding="utf-8").read()
+    cited = sorted(set(re.findall(r"easured on (\d+\.\d+\.\d+)", duck_src)))
+    check("oci/pin: duck.py cites exactly one measured engine version",
+          len(cited), 1)
+    if not cited:
+        return
+    files = _oci_containerfiles()
+    check_true("oci/pin: there were Containerfiles to check", bool(files))
+    pinned = 0
+    for name, text in files:
+        for got in re.findall(r"^ARG DUCKDB_VERSION=(\S+)", text, re.M):
+            pinned += 1
+            check("oci/pin: %s pins the version duck.py measured" % name,
+                  got, cited[0])
+    check_true("oci/pin: at least one image pins a DuckDB version at all",
+               pinned > 0)
+
+
+def test_oci_the_images_carry_the_server_and_nothing_else():
+    """`claudio`, the receiver and the shipper are a WORKSTATION install.
+
+    They have no third-party dependency at all and are installed with `make
+    install`; shipping them in an image would suggest a container is a
+    supported way to run them, which it is not.  Only the SOURCE operands of a
+    COPY are inspected -- the destinations are all under `/opt/claudio-server`,
+    so grepping the whole line would match the word `claudio` every time.
+    """
+    files = _oci_containerfiles()
+    check_true("oci/contents: there were Containerfiles to check", bool(files))
+    for name, text in files:
+        sources = []
+        for line in text.splitlines():
+            s = line.strip()
+            if not s.upper().startswith("COPY "):
+                continue
+            parts = [w for w in s.split()[1:] if not w.startswith("--")]
+            sources.extend(parts[:-1])          # the last operand is the dest
+        # WHAT EACH COMPONENT COPIES, WHICH IS NOW THREE DIFFERENT ANSWERS.
+        #
+        #   ingest the package, so `server/srv/` wholesale;
+        #   api    the same, because it IS the same source with one package
+        #          added -- which is the honest reason two images exist;
+        #   mcp    `server/srv/mcp.py` and NOTHING else out of the package --
+        #          it is an HTTP client of the read API and a second module
+        #          would be the beginning of a second reader;
+        #   proxy  no Python at all.
+        #
+        # The negative for mcp is the load-bearing half: `server/srv/` on its
+        # own line would put `store.py`, `duck.py` and `api.py` in an image
+        # whose whole authority is one bearer token.
+        comp = _component_of(name)
+        srv_sources = [x for x in sources if "server/srv" in x]
+        if comp in STORE_COMPONENTS:
+            check_true("oci/contents: %s copies srv/" % name, bool(srv_sources))
+        elif comp == "mcp":
+            check("oci/contents: %s copies mcp.py and no other module of the "
+                  "package" % name, sorted(srv_sources), ["server/srv/mcp.py"])
+        else:
+            check("oci/contents: %s copies nothing out of server/srv/" % name,
+                  srv_sources, [])
+        # Every image carries the licence of the software in it.
+        check_true("oci/contents: %s copies the LICENCE" % name,
+                   any(x.rstrip("/") == "LICENCE" for x in sources))
+        for banned in ("usage/", "test.sh", "server/tests", "Makefile",
+                       "Formula"):
+            check("oci/contents: %s never copies %s" % (name, banned),
+                  any(banned in s for s in sources), False)
+        # `claudio` the script, at the repository root: matched as a whole
+        # operand so that `server/oci/entrypoint.sh` does not trip it.
+        check("oci/contents: %s never copies the claudio script" % name,
+              any(s.rstrip("/") == "claudio" for s in sources), False)
+
+
+def test_oci_the_exit_codes_do_not_collide_with_the_door_s():
+    """`serve.py` already owns 1, 3 and 4; a wrapper reusing one is a lie.
+
+    Exit 4 in particular is the refusal an operator is told to look for, so a
+    preflight that also exited 4 for an unwritable store would send them to
+    write a `readers.json` that was never the problem.
+    """
+    pre = os.path.join(OCI, "preflight.py")
+    ep = os.path.join(OCI, "entrypoint.sh")
+    for path, want in ((pre, 5), (ep, 6)):
+        if not os.path.isfile(path):
+            check("oci/exit: %s was found" % os.path.basename(path), path,
+                  "a file that exists")
+            continue
+        text = open(path, encoding="utf-8").read()
+        check_true("oci/exit: %s uses %d for its own refusal"
+                   % (os.path.basename(path), want), str(want) in text)
+    door = open(os.path.join(fx.SRV_DIR, "srv", "serve.py"),
+                encoding="utf-8").read()
+    for code in ("return 3", "return 4"):
+        check_true("oci/exit: the door still owns `%s`" % code, code in door)
+
+
+def test_oci_the_readme_documents_the_image_it_publishes():
+    """An untested assertion in a README is an untested assertion.
+
+    What has to be there is what an operator cannot discover by running it: the
+    two mounts, the refusal they will meet first, and the fact that the
+    workstation half is deliberately absent.
+    """
+    readme = os.path.join(os.path.dirname(HERE), "README.md")
+    if not os.path.isfile(readme):
+        check("oci/docs: server/README.md was found", readme,
+              "a file that exists")
+        return
+    text = open(readme, encoding="utf-8").read()
+    flat = " ".join(text.split())
+    for needed in ("readers.json", "/etc/claudio", "/healthz",
+                   "ghcr.io", "make install"):
+        check_true("oci/docs: the README names %s" % needed, needed in flat)
+    check_true("oci/docs: it says the door exits 4 rather than serving an "
+               "unauthenticated API off loopback",
+               "exit 4" in flat or "exits 4" in flat)
+    check_true("oci/docs: it says the workstation half is not in the image",
+               "not in the image" in flat or "is NOT containerised" in flat
+               or "not containerised" in flat)
+
+
+# ---------------------------------------------------------------------------
+# the FreeBSD image
+# ---------------------------------------------------------------------------
+#
+# It exists because the deployment this door is for is a jail or a container on
+# a FreeBSD host, and an operator who runs FreeBSD should not have to run Linux
+# to accept shipments from their own workstations.  The two images are meant to
+# be INTERCHANGEABLE -- same entrypoint, same environment, same mounts, same
+# uid, same exit codes -- so most of what is asserted below is asserted about
+# BOTH of them at once.
+#
+# Nothing here has ever been built.  buildah and podman are not installed on
+# the machine this was written on and cannot be, so every claim about the built
+# IMAGE is CI's to make; what a test can hold is the source, the scripts and
+# the workflow, and that is what these do.
+
+REPO = os.path.dirname(os.path.dirname(HERE))
+WORKFLOW = os.path.join(REPO, ".github", "workflows", "images.yml")
+
+
+def _pkgindex():
+    """`server/oci/pkgindex.py` imported as a module, or None."""
+    path = os.path.join(OCI, "pkgindex.py")
+    if not os.path.isfile(path):
+        return None
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("_pkgindex_under_test", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_oci_the_freebsd_image_stages_and_never_runs():
+    """`RUN` is the one instruction this image may not have.
+
+    `RUN` executes a binary inside the image and a Linux kernel cannot execute
+    FreeBSD binaries -- qemu-user crosses architectures, not operating systems.
+    `FROM` and `COPY` execute nothing, which is the whole reason six FreeBSD
+    images build on ordinary Linux runners in seconds.  Adding one `RUN` does
+    not slow the build down; it makes the build impossible, and the obvious
+    "fix" is a self-hosted FreeBSD runner nobody has.
+
+    Asserted on the CODE and not the raw text, because the paragraph above this
+    one in the Containerfile says the word repeatedly.
+    """
+    files = [(n, t) for n, t in _oci_containerfiles() if _os_of(n) == "freebsd"]
+    check_true("oci/freebsd: there were FreeBSD Containerfiles to check",
+               bool(files))
+    # ALL THREE, not just the door.  The impossibility is the same one for each
+    # of them -- there is no FreeBSD kernel on the runner -- and the component
+    # most likely to acquire a `RUN` is the proxy, where every tutorial in
+    # existence says `RUN mkdir` and `RUN chown`.  Those two are done by
+    # `stage-freebsd.sh` on the build host instead, and a reader who did not
+    # know that would reach for the instruction first.
+    for name, text in files:
+        code = [l for l in text.splitlines() if not l.lstrip().startswith("#")]
+        runs = [l for l in code if l.strip().upper().startswith("RUN ")]
+        check("oci/freebsd: %s has no RUN instruction" % name, runs, [])
+        # FLATTENED, and that is the same trap the doc scan under `usage/` was
+        # rewritten for: the sentence is wrapped across two comment lines in
+        # two of these three files, so a literal `in text` finds it in the file
+        # that happens to fit it on one line and misses it in the others --
+        # reporting the paragraph as absent where it is spelled out exactly.
+        flat = " ".join(l.lstrip("# ") for l in text.splitlines()
+                        if l.lstrip().startswith("#")).replace("  ", " ")
+        flat = " ".join(flat.split())
+        check_true("oci/freebsd: %s says why, so nobody adds one back" % name,
+                   "qemu-user crosses architectures, not operating systems"
+                   in flat)
+        # The positive half: without it this test passes over an empty file.
+        #
+        # `FROM ${BASE_REF}` now, because CI resolves the moving base tag to a
+        # digest and builds from THAT -- so the assertion is about the pre-FROM
+        # ARG's readable default, which is the base a hand build takes and the
+        # one `base.name` records.
+        check_true("oci/freebsd: %s builds FROM freebsd-runtime" % name,
+                   re.search(r"^ARG BASE_REF=\S*freebsd/freebsd-runtime[:@]",
+                             text, re.M) is not None)
+        check_true("oci/freebsd: %s does it through a build arg, so CI can pin "
+                   "the digest" % name, "FROM ${BASE_REF}" in text)
+        # THE STAGED TREES ARE THREE DIRECTORIES, NEVER ONE.  Staging is
+        # destructive -- `stage-freebsd.sh` starts with `rm -rf` on its stage
+        # directory -- so two components sharing a default would mean the
+        # second build silently consuming the first's tree, or worse, building
+        # the mcp image out of the door's staged DuckDB.
+        stages = re.findall(r"^ARG STAGE=(\S+)", text, re.M)
+        check("oci/freebsd: %s declares exactly one STAGE default" % name,
+              len(stages), 1)
+    stage_defaults = [re.search(r"^ARG STAGE=(\S+)", t, re.M).group(1)
+                      for _n, t in files
+                      if re.search(r"^ARG STAGE=(\S+)", t, re.M)]
+    check("oci/freebsd: and no two components stage into the same directory",
+          len(set(stage_defaults)), len(stage_defaults))
+    for fn in ("fetch-pkgs.sh", "stage-freebsd.sh", "pkgindex.py"):
+        check_true("oci/freebsd: %s is beside it" % fn,
+                   os.path.isfile(os.path.join(OCI, fn)))
+
+
+def test_oci_the_freebsd_image_puts_usr_local_lib_on_the_linker_path():
+    """MEASURED, and the single easiest thing to delete as obviously redundant.
+
+    FreeBSD's runtime linker searches DT_RPATH/DT_RUNPATH, `LD_LIBRARY_PATH`,
+    the hints file `/var/run/ld-elf.so.hints`, then `/lib:/usr/lib`.
+    `/usr/local/lib` is reached ONLY through the hints file, which `ldconfig`
+    writes at boot -- and this image never boots and has no `RUN` to invoke
+    `ldconfig` with.
+
+    From the real published artefacts, read on 2026-08-21:
+      * `freebsd/freebsd-runtime:15.1` and `:14.4` ship NO
+        `/var/run/ld-elf.so.hints`;
+      * `usr/local/bin/python3.12` from the FreeBSD package has an EMPTY
+        DT_RUNPATH and needs `libpython3.12.so.1.0` and `libintl.so.8`, both in
+        `/usr/local/lib`.
+
+    So without the ENV the image fails at the first exec with `ld-elf.so.1:
+    Shared object "libpython3.12.so.1.0" not found` -- after building, pushing
+    and pulling cleanly.  There is no `RUN` for `ldconfig` and there cannot be.
+    """
+    files = [(n, t) for n, t in _oci_containerfiles() if _os_of(n) == "freebsd"]
+    check_true("oci/ldpath: there were FreeBSD Containerfiles to check",
+               bool(files))
+    # EVERY FreeBSD image needs it, and the proxy needs it for a different
+    # library than the two Python ones: `nginx` links `libpcre2-8.so.0`, which
+    # lives in `/usr/local/lib` and in no directory the runtime linker searches
+    # without the hints file.  One image getting this and another not is the
+    # shape of failure that survives a build, a push and a pull.
+    for name, text in files:
+        code = "\n".join(l for l in text.splitlines()
+                          if not l.lstrip().startswith("#"))
+        env = [l for l in code.splitlines()
+               if l.strip().upper().startswith("ENV ")
+               and "LD_LIBRARY_PATH" in l]
+        check("oci/ldpath: %s sets LD_LIBRARY_PATH exactly once" % name,
+              len(env), 1)
+        if env:
+            check_true("oci/ldpath: ...and %s names /usr/local/lib" % name,
+                       "/usr/local/lib" in env[0])
+
+
+def test_oci_the_two_images_offer_the_same_contract():
+    """Interchangeable, or the operator learns two things instead of one.
+
+    Whatever else differs between the bases, an operator types the same
+    `docker run`/`podman run`: same entrypoint, same uid, same port, same two
+    paths.  Derived by comparing the two files against each other rather than
+    against a written-down expectation, so the test cannot drift away from
+    whichever one is right.
+    """
+    files = dict(_oci_containerfiles())
+    for base in ("linux", "freebsd"):
+        want = "Containerfile.%s.ingest" % base
+        if want not in files:
+            check("oci/contract: %s was found" % want, want,
+                  "a Containerfile that exists")
+            return
+
+    # PAIRED BY COMPONENT, DERIVED FROM THE FILE NAMES.
+    #
+    # There are four components now, and the contract is per component: the
+    # ingest pair are interchangeable across the two bases, and so are the api,
+    # mcp and proxy pairs -- but an ingest image and an mcp image are NOT meant
+    # to agree about USER, EXPOSE or ENTRYPOINT, and comparing them would
+    # either fail honestly or force a false agreement.
+    #
+    # Derived rather than listed, so the mcp and proxy pairs come under this
+    # guard the moment the Linux halves land, with no edit here.  A FreeBSD
+    # component with no Linux counterpart is not a failure today -- it is the
+    # ordinary state while the split lands -- but it is COUNTED, so "every pair
+    # agreed" cannot be a statement about an empty set.
+    pairs = {}
+    for name in files:
+        comp, osname = _component_of(name), _os_of(name)
+        if comp and osname:
+            pairs.setdefault(comp, {})[osname] = name
+    both = {c: v for c, v in pairs.items() if len(v) == 2}
+    check_true("oci/contract: at least one component is built for both bases",
+               bool(both))
+
+    def directive(text, name):
+        out = []
+        for line in text.splitlines():
+            s = line.strip()
+            if s.upper().startswith(name + " "):
+                out.append(" ".join(s.split()[1:]))
+        return out
+
+    for comp, byos in sorted(both.items()):
+        for name in ("ENTRYPOINT", "USER", "EXPOSE"):
+            a = directive(files[byos["linux"]], name)
+            b = directive(files[byos["freebsd"]], name)
+            check("oci/contract: the %s images agree on %s" % (comp, name),
+                  b, a)
+    # And no CMD in either: everything after the image name is appended to the
+    # door's argv, and argparse takes the last occurrence of a repeated option,
+    # so one flag can be overridden without retyping the rest.  A CMD carrying
+    # the full flag list is replaced wholesale and the flag people forget to
+    # retype is `--readers`.
+    for name, text in files.items():
+        check("oci/contract: %s declares no CMD" % name,
+              directive(text, "CMD"), [])
+    # EVERY IMAGE RUNS AN ENTRYPOINT AT AN ABSOLUTE PATH IT ALSO COPIES.
+    #
+    # It used to be "both name /opt/claudio-server/entrypoint.sh", which is a
+    # door fact: the mcp image runs its own entrypoint and the proxy runs nginx
+    # directly, with no wrapper to go wrong.  What is true of all three -- and
+    # is what that assertion was reaching for -- is that the ENTRYPOINT is an
+    # absolute path and is not a shell string that resolves through PATH, since
+    # PATH inside a container is whatever the base happened to set.
+    for name, text in sorted(files.items()):
+        eps = directive(text, "ENTRYPOINT")
+        check("oci/contract: %s declares exactly one ENTRYPOINT" % name,
+              len(eps), 1)
+        if eps:
+            check_true("oci/contract: %s's ENTRYPOINT is exec form" % name,
+                       eps[0].startswith("["))
+            first = re.findall(r'"([^"]+)"', eps[0])
+            check_true("oci/contract: %s's ENTRYPOINT is an absolute path"
+                       % name, bool(first) and first[0].startswith("/"))
+
+    # THE LABELS, WHICH THE FILTER ABOVE COULD NOT SEE.
+    #
+    # This test's docstring is "Interchangeable, or the operator learns two
+    # things instead of one", and it compared ENTRYPOINT, USER and EXPOSE --
+    # so every divergence in the one thing a user reads WITHOUT running the
+    # image went unasserted.  Four were live at once: a `licenses` of MIT over
+    # a BSD-2-Clause `LICENCE` the image itself carries; an `image.version`
+    # reporting DuckDB's version as the product's; `com.claudio.engine` and
+    # `com.claudio.stream-a` on the image that has never been executed and on
+    # neither the one that proves its engine every build; and `image.revision`
+    # as a config LABEL on one and a manifest ANNOTATION on the other.
+    #
+    # Key SETS, so a key present in one and absent in the other is a named
+    # failure.  Values are deliberately NOT compared: the description and the
+    # engine's provenance differ honestly between the two bases.
+    def labels(text):
+        out, buf, collecting = {}, "", False
+        for line in text.splitlines():
+            st = line.strip()
+            if st.upper().startswith("LABEL "):
+                collecting, buf = True, st[6:]
+            elif collecting:
+                buf += " " + st
+            if collecting and not st.endswith("\\"):
+                collecting = False
+                for tok in re.findall(r'([A-Za-z0-9._-]+)="', buf.replace("\\", " ")):
+                    out[tok] = True
+        return set(out)
+
+    for comp, byos in sorted(both.items()):
+        la = labels(files[byos["linux"]])
+        lb = labels(files[byos["freebsd"]])
+        check_true("oci/contract: the Linux %s image declares labels at all"
+                   % comp, bool(la))
+        check("oci/contract: the %s images declare the same label KEYS "
+              "(only-in-linux, only-in-freebsd)" % comp,
+              (sorted(la - lb), sorted(lb - la)), ([], []))
+    all_labels = {n: labels(t) for n, t in files.items()}
+    check("oci/contract: and no image claims a capability it cannot derive",
+          sorted({k for ks in all_labels.values() for k in ks
+                  if k.startswith("com.claudio.stream")}), [])
+    for name, ks in sorted(all_labels.items()):
+        for want in ("org.opencontainers.image.revision",
+                     "org.opencontainers.image.version",
+                     "org.opencontainers.image.source",
+                     "org.opencontainers.image.base.digest",
+                     "com.claudio.component"):
+            check_true("oci/contract: %s carries %s as a LABEL" % (name, want),
+                       want in ks)
+        # `com.claudio.engine` IS REQUIRED OF EVERY IMAGE, AND THE RULE MOVED
+        # FROM ITS PRESENCE TO ITS VALUE.
+        #
+        # It used to be required of exactly the images that pin a DuckDB
+        # version, on the grounds that a label the proxy has to invent is
+        # ceremony.  The split makes that backwards: "this image has no query
+        # engine in it" is the CLAIM THE SPLIT RESTS ON for the ingest and mcp
+        # components, and an absent label states it to nobody -- a registry
+        # listing shows the same nothing for "no engine" and for "we forgot".
+        # So every image declares it, and the value NAMES duckdb iff the file
+        # pins a version.  A pin with no duckdb in the label, or a duckdb in
+        # the label with no pin, is the disagreement worth catching.
+        pins = "ARG DUCKDB_VERSION=" in files[name]
+        check_true("oci/contract: %s declares com.claudio.engine" % name,
+                   "com.claudio.engine" in ks)
+        m = re.search(r'com\.claudio\.engine="([^"]*)"', files[name])
+        check("oci/contract: %s's engine label names duckdb iff it pins a "
+              "duckdb version" % name,
+              bool(m) and "duckdb" in m.group(1).lower(), pins)
+    # The component label says what the file name says, so a copied
+    # Containerfile whose label was not updated is caught here rather than in a
+    # registry listing.
+    for name, text in sorted(files.items()):
+        m = re.search(r'com\.claudio\.component="([^"]+)"', text)
+        check("oci/contract: %s's component label matches its file name" % name,
+              m.group(1) if m else None, _component_of(name))
+
+    # THE BASE, SPELLED TWICE IN EACH FILE, SO THE TWO SPELLINGS ARE COMPARED.
+    #
+    # `ARG BASE_REF` is what `FROM` takes and `ARG BASE_NAME` is what
+    # `org.opencontainers.image.base.name` records.  CI overrides the first
+    # with a digest and the second with the readable tag, so they cannot
+    # disagree there -- but a hand build takes both defaults, and a default
+    # that drifted would publish an image whose label names a base it was not
+    # built from.  Compared by the repository/tag part, since one carries a
+    # registry prefix and the other need not.
+    def base_args(text):
+        # Every `ARG NAME=value` default, so `${FREEBSD_VERSION}` inside
+        # `BASE_NAME` resolves the way a build with no --build-arg resolves
+        # it.  Without the substitution the two spellings could never be
+        # compared at all and this guard would have to be deleted -- which is
+        # how a guard becomes a comment.
+        defaults = dict(re.findall(r"^ARG ([A-Z_]+)=(\S+)", text, re.M))
+
+        def resolve(v):
+            for k, dv in defaults.items():
+                if "${%s}" % k not in v:
+                    continue
+                v = v.replace("${%s}" % k, dv)
+            for pre in ("docker.io/", "library/"):
+                if v.startswith(pre):
+                    v = v[len(pre):]
+            return v
+
+        return {k: resolve(defaults[k]) for k in ("BASE_REF", "BASE_NAME")
+                if k in defaults}
+
+    for name, text in sorted(files.items()):
+        got = base_args(text)
+        check("oci/contract: %s declares both base spellings" % name,
+              sorted(got), ["BASE_NAME", "BASE_REF"])
+        if len(got) == 2:
+            check("oci/contract: %s names one base, not two" % name,
+                  got["BASE_NAME"], got["BASE_REF"])
+
+    # THE LICENCE, DERIVED FROM THE REPOSITORY'S OWN `LICENCE` FILE.
+    #
+    # It said MIT in three places -- both Containerfiles and the workflow's
+    # annotation list -- which is the reference repository's licence copied
+    # without re-checking it against this project's facts.  The field is an
+    # SPDX expression that registry UIs, SBOM generators and compliance
+    # scanners read as authoritative, and the image `COPY`s the contradicting
+    # text a few lines above the label.  Derived rather than hardcoded, for
+    # the `LOGGING_LEGACY` and `CLAUDIO_*` guards' reason: a written-down copy
+    # is a fourth place to forget.
+    spdx = {"BSD 2-Clause License": "BSD-2-Clause",
+            "BSD 3-Clause License": "BSD-3-Clause",
+            "MIT License": "MIT",
+            "Apache License": "Apache-2.0"}
+    lic_path = os.path.join(REPO, "LICENCE")
+    if not os.path.isfile(lic_path):
+        check("oci/licence: the repository's LICENCE was found", lic_path,
+              "a file that exists")
+    else:
+        head = open(lic_path, encoding="utf-8").readline().strip()
+        want = spdx.get(head)
+        if want is None:
+            check("oci/licence: the LICENCE's first line maps to an SPDX id",
+                  head, "one of " + ", ".join(sorted(spdx)))
+        else:
+            got = {}
+            for name, text in files.items():
+                m = re.search(
+                    r'org\.opencontainers\.image\.licenses="([^"]*)"', text)
+                got[name] = m.group(1) if m else None
+            wf = os.path.join(REPO, ".github", "workflows", "images.yml")
+            if os.path.isfile(wf):
+                for m in re.finditer(
+                        r'org\.opencontainers\.image\.licenses=([^\s"\\]+)',
+                        open(wf, encoding="utf-8").read()):
+                    got["images.yml annotation"] = m.group(1)
+            check_true("oci/licence: every place that states a licence was "
+                       "found", len(got) >= 3)
+            for where, value in sorted(got.items()):
+                check("oci/licence: %s states the SPDX id of the LICENCE this "
+                      "repository actually ships" % where, value, want)
+
+
+def test_oci_the_package_index_is_the_root_of_trust_and_is_verified():
+    """The index used to be fetched and trusted, and everything derives from it.
+
+    `packagesite.yaml` says which URL each package is fetched from
+    (`repopath`) AND what its blake2b digest should be (`sum`).  So while the
+    index itself was unauthenticated, "verifies every blake2b checksum" --
+    which `server/README.md`, `Containerfile.freebsd` and the workflow all
+    claimed -- meant only that the bytes matched what the same unverified
+    document said they would.  Substituting the index substitutes both halves
+    at once and every check passes.
+
+    It needed no dependency: `packagesite.pkg` already CONTAINS
+    `packagesite.yaml.sig` and `packagesite.yaml.pub`, and the previous script
+    extracted one member and discarded those two.
+
+    Exercised, not described.  The signing key is generated here rather than
+    committed, so the suite stays hermetic and needs no network: what is under
+    test is the VERIFIER, and a synthetic RSA key exercises every branch of it
+    including the two nobody can reach with the real key -- a forged padding
+    block, and a signature over the single hash rather than pkg's double one.
+    """
+    path = os.path.join(OCI, "pkgindex.py")
+    if not os.path.isfile(path):
+        check("oci/index: pkgindex.py was found", path, "a file that exists")
+        return
+    pk = _pkgindex()
+    if pk is None:
+        check("oci/index: pkgindex.py imported", path, "an importable module")
+        return
+
+    # -- the pin ------------------------------------------------------------
+    fp = getattr(pk, "PKG_FREEBSD_FINGERPRINT", None)
+    check_true("oci/index: the FreeBSD repository key is pinned as a 64-hex "
+               "sha256",
+               isinstance(fp, str) and len(fp) == 64
+               and all(c in "0123456789abcdef" for c in fp))
+    src = open(path, encoding="utf-8").read()
+    check_true("oci/index: and the pin says where it comes from, so a "
+               "mismatch reads as a rotated key rather than a broken check",
+               "/usr/share/keys/pkg/trusted/" in src)
+
+    # -- the verifier, over a key this test owns ----------------------------
+    key = _rsa_key_1024()
+    pem = _spki_pem(key["n"], key["e"])
+    check("oci/index: the SPKI parser recovers the modulus and exponent",
+          pk.rsa_pubkey(pem), (key["n"], key["e"]))
+
+    body = b'{"name":"python312","sum":"2$abc","repopath":"All/python312.pkg"}\n'
+    inner = hashlib.sha256(body).hexdigest()
+    double = hashlib.sha256(inner.encode("ascii")).digest()
+    single = hashlib.sha256(body).digest()
+
+    good = _rsa_sign_pkcs1_sha256(key, double)
+    check("oci/index: a real signature over pkg's DOUBLE hash verifies",
+          pk.rsa_pkcs1v15_sha256_ok(pem, good, double), True)
+    # pkg signs the ASCII HEX STRING of the file's sha256, not the sha256.
+    # Measured both ways against the live FreeBSD:15:amd64/latest index on
+    # 2026-08-21: the double hash matches and the plain one does not.  A
+    # reader who "simplifies" that to one hash gets a check that can never
+    # match, which is a check that looks like a check.
+    check("oci/index: a signature over the SINGLE hash does NOT verify, which "
+          "is the simplification most likely to be made",
+          pk.rsa_pkcs1v15_sha256_ok(pem, _rsa_sign_pkcs1_sha256(key, single),
+                                    double), False)
+    check("oci/index: a flipped byte in the index does not verify",
+          pk.rsa_pkcs1v15_sha256_ok(pem, good, single), False)
+    check("oci/index: a truncated signature does not verify",
+          pk.rsa_pkcs1v15_sha256_ok(pem, good[:-1], double), False)
+
+    # THE FORGERY THE `find`-BASED CHECK WOULD HAVE ACCEPTED.  A block that
+    # carries a valid SHA-256 DigestInfo for the right digest but whose PKCS#1
+    # padding is short and stuffed with attacker-chosen bytes -- the classic
+    # Bleichenbacher'06 shape.  Only reachable because this test holds the
+    # private key; it is why the verifier reconstructs the whole block and
+    # compares it byte for byte instead of searching for the DigestInfo.
+    k = (key["n"].bit_length() + 7) // 8
+    di = pk._SHA256_DIGESTINFO + double
+    forged_em = (b"\x00\x01" + b"\xff" * 4 + b"\x00" + di)
+    forged_em = forged_em + b"\x41" * (k - len(forged_em))
+    forged = pow(int.from_bytes(forged_em, "big"), key["d"], key["n"])
+    check("oci/index: a short-padding block carrying the right DigestInfo is "
+          "REFUSED; a DigestInfo search would have taken it",
+          pk.rsa_pkcs1v15_sha256_ok(
+              pem, forged.to_bytes(k, "big"), double), False)
+
+    # -- the command, and each of its three refusals ------------------------
+    td = tempfile.mkdtemp()
+    try:
+        y = os.path.join(td, "packagesite.yaml")
+        sg = os.path.join(td, "packagesite.yaml.sig")
+        pb = os.path.join(td, "packagesite.yaml.pub")
+        open(y, "wb").write(body)
+        open(sg, "wb").write(good)
+        open(pb, "wb").write(pem)
+        real = pk.PKG_FREEBSD_FINGERPRINT
+        try:
+            pk.PKG_FREEBSD_FINGERPRINT = hashlib.sha256(pem).hexdigest()
+            with contextlib.redirect_stderr(io.StringIO()):
+                accepted = _sysexit(pk.cmd_verifyindex, [y, sg, pb])
+            check("oci/index: verifyindex accepts a correctly signed index",
+                  accepted, None)
+            open(y, "wb").write(body + b"tampered\n")
+            check_true("oci/index: and REFUSES a tampered one by name",
+                       "signature does not verify"
+                       in str(_sysexit(pk.cmd_verifyindex, [y, sg, pb])))
+            open(y, "wb").write(body)
+            check_true("oci/index: refuses a missing .sig rather than falling "
+                       "back to an unverified index",
+                       "Refusing rather than falling back"
+                       in str(_sysexit(pk.cmd_verifyindex,
+                                       [y, sg + ".nope", pb])))
+            pk.PKG_FREEBSD_FINGERPRINT = real
+            check_true("oci/index: and refuses a key that is not the pinned "
+                       "one, saying it means the key rotated",
+                       "ROTATED"
+                       in str(_sysexit(pk.cmd_verifyindex, [y, sg, pb])))
+        finally:
+            pk.PKG_FREEBSD_FINGERPRINT = real
+    finally:
+        shutil.rmtree(td, ignore_errors=True)
+
+    # -- and the caller actually calls it, before it reads the index --------
+    fetch = os.path.join(OCI, "fetch-pkgs.sh")
+    if not os.path.isfile(fetch):
+        check("oci/index: fetch-pkgs.sh was found", fetch,
+              "a file that exists")
+        return
+    code = _sh_code(open(fetch, encoding="utf-8").read())
+    check_true("oci/index: fetch-pkgs.sh extracts the .sig and the .pub, "
+               "which it used to throw away",
+               "packagesite.yaml.sig" in code and "packagesite.yaml.pub" in code)
+    # The INVOCATION, not the word.  A first draft asserted that the string
+    # "verifyindex" appeared somewhere before "resolve", and a mutation that
+    # commented the call out but left the token in a disabled line survived it
+    # green.  So this looks for a line that actually runs `pkgindex.py
+    # verifyindex`, and takes the position of that line.
+    def call_line(verb):
+        for i, line in enumerate(code.splitlines()):
+            st = line.strip()
+            if st.startswith((":", "#")):
+                continue
+            if "pkgindex.py" in st and verb in st.split():
+                return i
+            # The invocation is wrapped, so the verb can be on the same line
+            # as `pkgindex.py` or the line is continued -- both are covered by
+            # matching the verb as a whole word on a line naming the script.
+            if "pkgindex.py" in st and st.rstrip("\\").strip().endswith(verb):
+                return i
+        return -1
+
+    vi, rs = call_line("verifyindex"), call_line("resolve")
+    check_true("oci/index: fetch-pkgs.sh really RUNS pkgindex.py verifyindex",
+               vi != -1)
+    check_true("oci/index: and it runs resolve too, or the ordering check "
+               "below has nothing to order", rs != -1)
+    check_true("oci/index: the verification happens BEFORE anything derives a "
+               "URL or a checksum from the index",
+               vi != -1 and rs != -1 and vi < rs)
+
+    # -- https, and it stays https ------------------------------------------
+    #
+    # `curl -fsSL` follows an https -> http redirect without a word (curl's
+    # own manual: "By default curl only allows HTTP, HTTPS, FTP and FTPS on
+    # redirects"), so one 302 in front of the index downgrades the rest of the
+    # transfer to cleartext -- and the attacker then authors both the
+    # `repopath` and the `sum` that `verify` compares against.
+    check_true("oci/index: the fetcher refuses a non-https URL",
+               "--proto '=https'" in code or '--proto =https' in code)
+    check_true("oci/index: and refuses an https -> http redirect",
+               "--proto-redir '=https'" in code
+               or "--proto-redir =https" in code)
+    check("oci/index: with no bare `curl -fsSL` left to bypass it",
+          [l.strip() for l in code.splitlines()
+           if "curl -fsSL" in l and "--proto" not in l], [])
+
+
+def test_oci_the_linux_engine_is_pinned_to_a_file_and_not_only_a_version():
+    """A version pin does not pin the bytes.
+
+    `pip install duckdb==1.5.5` survives a different file published under the
+    same version, an index or mirror substitution, and an inherited
+    `PIP_INDEX_URL`.  The asymmetry is what made it worth closing: the FreeBSD
+    half blake2b-checks every package it stages, and the Linux half -- the one
+    whose image is built and pulled today -- checked nothing about the bytes
+    of its one third-party dependency.
+    """
+    req = os.path.join(OCI, "requirements-linux.txt")
+    cf = os.path.join(OCI, "Containerfile.linux.api")
+    for p in (req, cf):
+        if not os.path.isfile(p):
+            check("oci/pip: %s was found" % os.path.basename(p), p,
+                  "a file that exists")
+            return
+    rtext = open(req, encoding="utf-8").read()
+    ctext = open(cf, encoding="utf-8").read()
+
+    hashes = re.findall(r"--hash=sha256:([0-9a-f]{64})", rtext)
+    check_true("oci/pip: a hash is pinned for each architecture's wheel",
+               len(hashes) >= 2 and len(set(hashes)) == len(hashes))
+    pinned = re.findall(r"^duckdb==([0-9][0-9.]*)", rtext, re.M)
+    arg = re.findall(r"^ARG DUCKDB_VERSION=([0-9][0-9.]*)", ctext, re.M)
+    check_true("oci/pip: the requirements file names one version", len(pinned) == 1)
+    check_true("oci/pip: and the Containerfile names one", len(arg) == 1)
+    # Two places, so they are compared.  The build ALSO catches this at run
+    # time by re-importing, but a static failure names the two files.
+    check("oci/pip: requirements-linux.txt and ARG DUCKDB_VERSION agree",
+          pinned, arg)
+
+    for flag, why in (("--require-hashes", "or the hashes are decoration"),
+                      ("--no-deps", "or a future mandatory dependency arrives "
+                                    "unhashed"),
+                      ("--only-binary=:all:", "or an sdist compiles the "
+                                              "engine from source"),
+                      ("--index-url", "or an inherited PIP_INDEX_URL "
+                                      "redirects the fetch")):
+        check_true("oci/pip: the install passes %s, %s" % (flag, why),
+                   flag in ctext)
+    # No `pip install` ANYWHERE in the file that is not the hashed one.  The
+    # filter strips full-line comments first, for `_sh_code`'s reason: the
+    # thirty lines of prose above the install line say `pip install duckdb==X`
+    # while explaining why the version alone is not enough, and a guard that
+    # matched the explanation would fail on a correct file and pass on a
+    # wrong one the moment somebody reworded the comment.
+    installs = [l.strip() for l in _sh_code(ctext).splitlines()
+                if "pip install" in l]
+    check_true("oci/pip: there is exactly one pip install line", len(installs) == 1)
+    check("oci/pip: and it is the hashed one",
+          [l for l in installs if "--require-hashes" not in l], [])
+
+
+def test_oci_pkgindex_refuses_by_name_and_never_skips():
+    """Four refusals, exercised rather than described.
+
+    Each one is a place where the quiet alternative produces a published image
+    that is wrong: a skipped checksum, a dependency edge that was not followed,
+    an exclusion that silently stopped applying, and a checksum format nobody
+    checked.  The reference repository's rule, carried over: a check that
+    cannot fire is worse than no check, because it looks like one.
+    """
+    pk = _pkgindex()
+    if pk is None:
+        check("oci/pkgindex: pkgindex.py was found", None, "a file that exists")
+        return
+
+    # A tiny index, written here rather than fetched: this is about the graph
+    # walk and the refusals, and a test that needed the network would be a test
+    # that gets deleted.
+    def index(entries):
+        fd, path = tempfile.mkstemp(suffix=".yaml")
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            for e in entries:
+                fh.write(json.dumps(e) + "\n")
+        return path
+
+    def pkg(name, deps=(), version="1.0"):
+        return {"name": name, "version": version,
+                "repopath": "All/%s-%s.pkg" % (name, version),
+                "sum": "2$abc", "pkgsize": 1, "flatsize": 10,
+                "deps": {d: {"version": "1.0"} for d in deps}}
+
+    path = index([pkg("app", ["libx", "shared"]),
+                  pkg("libx", ["shared", "only-libx"]),
+                  pkg("shared"), pkg("only-libx")])
+    try:
+        got = pk.closure(pk.load(path), ["app"])
+        check("oci/pkgindex: the closure is transitive",
+              got, ["app", "libx", "only-libx", "shared"])
+
+        # Dropping a NODE, not subtracting a list: `only-libx` goes because
+        # nothing else reaches it, `shared` stays because `app` still does.
+        # A list subtraction would keep the first and a naive subtree delete
+        # would take the second, and both produce an image that is missing a
+        # library or 900 MB larger than its README says.
+        got = pk.closure(pk.load(path), ["app"], without=["libx"])
+        check("oci/pkgindex: an exclusion takes what only it reached",
+              got, ["app", "shared"])
+
+        # A dependency the index does not carry is a REFUSAL. Skipping the edge
+        # is a missing library in a published image, and nothing would say so.
+        broken = index([pkg("app", ["absent"])])
+        try:
+            rc = "did not exit"
+            try:
+                pk.closure(pk.load(broken), ["app"])
+            except SystemExit as exc:
+                rc = str(exc)
+            check_true("oci/pkgindex: a dependency absent from the index is "
+                       "refused by name", "absent" in rc and "not in the index" in rc)
+        finally:
+            os.unlink(broken)
+
+        # An empty file is not an empty closure.
+        empty = index([])
+        try:
+            rc = "did not exit"
+            try:
+                pk.load(empty)
+            except SystemExit as exc:
+                rc = str(exc)
+            check_true("oci/pkgindex: an index that parsed to nothing is "
+                       "refused, not read as empty",
+                       "not a pkg index" in rc)
+        finally:
+            os.unlink(empty)
+    finally:
+        os.unlink(path)
+
+    # The checksum half.  `verify` is the one piece carried over from
+    # `gabrielbelli/freebsd-oauth2-proxy-oci` unchanged, and z-base-32 is the
+    # part that would fail silently if it were wrong -- so it is checked
+    # against a digest computed here rather than against a constant.
+    fd, blob = tempfile.mkstemp()
+    with os.fdopen(fd, "wb") as fh:
+        fh.write(b"the bytes of a package")
+    try:
+        good = "2$" + pk.zbase32(hashlib.blake2b(
+            open(blob, "rb").read()).digest())
+        ok = True
+        try:
+            pk.cmd_verify([blob, good])
+        except SystemExit as exc:
+            ok = str(exc)
+        check("oci/pkgindex: a correct checksum verifies", ok, True)
+
+        rc = "did not exit"
+        try:
+            pk.cmd_verify([blob, "2$wrongwrongwrong"])
+        except SystemExit as exc:
+            rc = str(exc)
+        check_true("oci/pkgindex: a wrong checksum is a mismatch, by name",
+                   "checksum mismatch" in rc)
+
+        rc = "did not exit"
+        try:
+            pk.cmd_verify([blob, "9$whatever"])
+        except SystemExit as exc:
+            rc = str(exc)
+        check_true("oci/pkgindex: an unsupported checksum version REFUSES "
+                   "rather than skipping the check",
+                   "refusing to skip the check" in rc)
+
+        rc = "did not exit"
+        try:
+            pk.cmd_verify([blob, ""])
+        except SystemExit as exc:
+            rc = str(exc)
+        check_true("oci/pkgindex: no checksum at all is refused too",
+                   "no checksum" in rc)
+    finally:
+        os.unlink(blob)
+
+
+def test_oci_the_prune_list_is_checked_against_what_the_server_imports():
+    """`stage-freebsd.sh` deletes 183 MiB out of somebody else's package.
+
+    `lib/python3.12/test` alone is 132 MiB of a 304 MiB tree and nothing under
+    `srv/` can reach it -- but that is a judgement, and the failure it can
+    cause is `ModuleNotFoundError` on a machine that is not this one, which no
+    amount of building catches.  So the import list is DERIVED from `srv/` with
+    `ast` and the staged tree is checked against it.
+
+    Asserted both ways.  A checker that only ever answers "fine" is the
+    decoration this project keeps writing tests against, so the negative half
+    builds a tree with a module missing and requires the refusal.
+    """
+    pk = _pkgindex()
+    if pk is None:
+        check("oci/prune: pkgindex.py was found", None, "a file that exists")
+        return
+    srv_dir = os.path.join(fx.SRV_DIR, "srv")
+    mods = pk._srv_imports(srv_dir)
+    check_true("oci/prune: the import list is derived from srv/ and is not "
+               "empty", len(mods) > 5)
+    for expected in ("json", "http", "duckdb"):
+        check_true("oci/prune: ...and names %s" % expected, expected in mods)
+
+    root = tempfile.mkdtemp()
+    try:
+        lib = os.path.join(root, "usr", "local", "lib", "python3.12")
+        os.makedirs(os.path.join(lib, "lib-dynload"))
+        os.makedirs(os.path.join(lib, "site-packages", "duckdb"))
+        for mod in mods:
+            if mod == "duckdb":
+                continue
+            open(os.path.join(lib, mod + ".py"), "w").close()
+        rc = pk.cmd_modules([root, srv_dir, "3.12"])
+        check("oci/prune: a complete tree passes", rc, 0)
+
+        # Now take one away.  `json` is chosen because it is a PACKAGE in the
+        # real tree, so a checker that only looked for `<name>.py` would still
+        # answer yes on the real one -- the failure this half exists to catch.
+        os.unlink(os.path.join(lib, "json.py"))
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            rc = pk.cmd_modules([root, srv_dir, "3.12"])
+        check("oci/prune: a tree with a module missing is REFUSED", rc, 1)
+        check_true("oci/prune: ...and the refusal names the module",
+                   "json" in err.getvalue())
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_oci_an_absent_import_is_a_refusal_unless_the_component_declared_it():
+    """THE INGEST IMAGE RESTS ON A DISTINCTION THAT DID NOT EXIST, AND THIS IS IT.
+
+    `stage-freebsd.sh`'s ingest branch said of `duckdb`: "it is imported inside
+    a function, and the check reads module-level imports, which is exactly the
+    distinction this component rests on".  `_srv_imports` walked the tree with
+    `ast.walk`, which descends into function bodies, so `duckdb` was in the
+    list and `stage-freebsd.sh ingest` -- the whole point of which is an image
+    with no engine in it -- failed its own check.  Found by RUNNING the stage
+    against the live FreeBSD:15:amd64 index, after it had downloaded, unpacked
+    and pruned 243 MiB; not by reading the comment, which read perfectly well.
+
+    So the distinction is real now, and it has two halves that must both hold.
+    A module imported AT IMPORT TIME may never be absent: that is a
+    `ModuleNotFoundError` before anything serves, and no flag excuses it.  A
+    module imported only inside a function body may be absent WHEN THE
+    COMPONENT SAYS SO -- which is `store.require()`'s whole design, raising
+    `DuckDBMissing` with the install command rather than a traceback.
+
+    And the declaration refuses itself when it goes stale, which is
+    `--without`'s rule one command over.  Both staleness shapes are asserted,
+    because a permission that quietly stopped applying is how 900 MB comes back
+    into an image whose README says it does not carry it.
+    """
+    pk = _pkgindex()
+    if pk is None:
+        check("oci/deferred: pkgindex.py was found", None, "a file that exists")
+        return
+    srv_dir = os.path.join(fx.SRV_DIR, "srv")
+    at_import, deferred = pk._srv_imports_by_kind(srv_dir)
+
+    check("oci/deferred: duckdb is imported by srv/ ONLY inside a function",
+          ("duckdb" in deferred, "duckdb" in at_import), (True, False))
+    for mod in ("json", "http", "os"):
+        check_true("oci/deferred: ...while %s is imported at import time" % mod,
+                   mod in at_import)
+    # The union is unchanged, so every caller that wants "everything srv/
+    # touches" still gets it.
+    check_true("oci/deferred: the union still names duckdb",
+               "duckdb" in pk._srv_imports(srv_dir))
+
+    # A CLASS BODY IS IMPORT TIME AND A FUNCTION BODY IS NOT.  Asserted on a
+    # written-out module rather than on `srv/`, because `srv/` has no class-body
+    # import today and the rule has to hold the day somebody adds one: a class
+    # body executes on import, so an import inside it is deferred by nothing.
+    tmp = tempfile.mkdtemp()
+    try:
+        probe = os.path.join(tmp, "probe.py")
+        with open(probe, "w") as fh:
+            fh.write("import eager_top\n"
+                     "class C:\n"
+                     "    import eager_in_class\n"
+                     "def f():\n"
+                     "    import lazy_in_func\n"
+                     "    from lazy_from import thing\n"
+                     "if True:\n"
+                     "    import eager_in_if\n")
+        a, d = pk._srv_imports_by_kind(probe)
+        check("oci/deferred: a module-level, class-body and if-body import are "
+              "all import time",
+              sorted(a), ["eager_in_class", "eager_in_if", "eager_top"])
+        check("oci/deferred: ...and only a function body defers",
+              sorted(d), ["lazy_from", "lazy_in_func"])
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    # ---- the check itself, over a tree with no duckdb in it ---------------
+    #
+    # `cmd_modules` REFUSES WITH `sys.exit(<message>)`, WHICH IS A `SystemExit`
+    # THROUGH THE MIDDLE OF THIS SUITE, and calling it bare is how a named
+    # failure becomes no run at all.  Found by the mutation matrix and not by
+    # reading: `duck-imports-the-driver` -- which makes `srv/duck.py` import
+    # duckdb at import time, exactly the condition the second refusal below
+    # exists for -- reported `BAD PATCH ... suite did not run` instead of
+    # `caught`, because the process exited on the `--deferred-ok duckdb` call a
+    # few lines down.  Two costs, and the second is the serious one: the matrix
+    # cannot tell a mutation that killed the suite from one nothing asserts,
+    # and a REAL regression here would black out every test after this point,
+    # which is `test.sh`'s `grep -c` blackout of ~325 assertions in another
+    # language.
+    #
+    # So every call goes through this, and a refusal becomes an rc and a
+    # message like any other.  The staleness cases below keep their explicit
+    # `try`, because there the SystemExit IS the assertion.
+    def modules(args):
+        err = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(err):
+                rc = pk.cmd_modules(args)
+        except SystemExit as exc:
+            # `sys.exit("text")` is rc 1 with the text on stderr; reproducing
+            # that here rather than re-raising is what keeps one refusal from
+            # ending the run.
+            return 1, err.getvalue() + str(exc)
+        return rc, err.getvalue()
+
+    root = tempfile.mkdtemp()
+    try:
+        lib = os.path.join(root, "usr", "local", "lib", "python3.12")
+        os.makedirs(os.path.join(lib, "lib-dynload"))
+        for mod in at_import | deferred:
+            if mod == "duckdb":
+                continue                        # the whole point: it is absent
+            open(os.path.join(lib, mod + ".py"), "w").close()
+
+        rc, text = modules([root, srv_dir, "3.12"])
+        check("oci/deferred: an undeclared absence is REFUSED", rc, 1)
+        check_true("oci/deferred: ...and the refusal names it",
+                   "duckdb" in text)
+
+        rc, text = modules([root, srv_dir, "3.12", "--deferred-ok", "duckdb"])
+        check("oci/deferred: a DECLARED absence passes -- this is the ingest "
+              "image", rc, 0)
+        # Named, never silent.  An image deliberately short a package must
+        # leave a line in the build log, or it reads as an oversight later.
+        check_true("oci/deferred: ...and the log says the module is absent on "
+                   "purpose", "duckdb" in text and "ABSENT" in text)
+
+        # THE FLAG DOES NOT EXCUSE ANYTHING ELSE.  Without this the permission
+        # would be a blanket one, which is the shape that publishes a broken
+        # image while looking like a decision.
+        os.unlink(os.path.join(lib, "json.py"))
+        rc, text = modules([root, srv_dir, "3.12", "--deferred-ok", "duckdb"])
+        check("oci/deferred: an import-time module is still REFUSED with the "
+              "flag set", rc, 1)
+        check_true("oci/deferred: ...and the refusal names json, not duckdb",
+                   "json" in text)
+        open(os.path.join(lib, "json.py"), "w").close()
+
+        # ---- the two staleness refusals -----------------------------------
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                pk.cmd_modules([root, srv_dir, "3.12",
+                                "--deferred-ok", "nothing_imports_this"])
+            check("oci/deferred: a permission for an import that does not "
+                  "exist is refused", "returned", "SystemExit")
+        except SystemExit as exc:
+            check_true("oci/deferred: a permission for an import that does not "
+                       "exist is refused, by name",
+                       "nothing_imports_this" in str(exc))
+
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                pk.cmd_modules([root, srv_dir, "3.12", "--deferred-ok", "json"])
+            check("oci/deferred: a permission for an IMPORT-TIME module is "
+                  "refused", "returned", "SystemExit")
+        except SystemExit as exc:
+            check_true("oci/deferred: a permission for an IMPORT-TIME module "
+                       "is refused, by name", "json" in str(exc))
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+    # ---- and the staging script is what actually passes it ----------------
+    stage = os.path.join(OCI, "stage-freebsd.sh")
+    if not os.path.isfile(stage):
+        check("oci/deferred: stage-freebsd.sh was found", stage,
+              "a file that exists")
+        return
+    text = open(stage, encoding="utf-8").read()
+    check_true("oci/deferred: the script really passes --deferred-ok to "
+               "pkgindex.py modules",
+               re.search(r"pkgindex\.py\" modules[^\n]*(\n[^\n]*)?--deferred-ok",
+                         text) is not None)
+
+    def branch(name):
+        m = re.search(r"^    %s\)\n(.*?)^        ;;" % re.escape(name),
+                      text, re.M | re.S)
+        return m.group(1) if m else None
+
+    # ONLY THE INGEST COMPONENT DECLARES ONE, and that is the assertion that
+    # keeps the flag from spreading.  The api stages the engine, so it has
+    # nothing to excuse; the mcp image is checked against `mcp.py`, which does
+    # not import duckdb at all -- and if either of them ever needed the flag,
+    # something has changed that a person should look at.
+    for comp in COMPONENTS:
+        b = branch(comp)
+        if b is None:
+            continue
+        declared = re.search(r'^\s*DEFERRED_OK="([^"]*)"', b, re.M)
+        got = declared.group(1) if declared else ""
+        check("oci/deferred: %s declares %r" % (comp, "duckdb" if comp == "ingest" else ""),
+              got, "duckdb" if comp == "ingest" else "")
+
+
+def test_oci_the_mcp_image_cannot_reach_the_store():
+    """The split is a BOUNDARY, and this is where it is enforced.
+
+    `srv/mcp.py` is an HTTP client of the read API: a reader token, and no
+    store access at all.  That is the whole of its authority -- it cannot see
+    an account the token's scope excludes, cannot reach the store's files, and
+    cannot answer a question the API refuses.  Giving its image the DuckDB
+    engine or the store's query layer would be a privilege escalation, and it
+    would also defeat the split.
+
+    Three assertions, and the second is the one that makes it structural.  The
+    Containerfile could simply not COPY those modules -- but a later edit
+    could, and nothing would say so.  The ignore file keeps them out of the
+    build CONTEXT, so a `COPY server/srv/` added there fails the build by name.
+    """
+    files = dict(_oci_containerfiles())
+    mcps = {n: t for n, t in files.items() if _component_of(n) == "mcp"}
+    check_true("oci/mcp: an mcp Containerfile was found", bool(mcps))
+
+    for name, text in sorted(mcps.items()):
+        code = "\n".join(l for l in text.splitlines()
+                          if not l.lstrip().startswith("#"))
+        # `duckdb` and the store's own modules, in the CODE and not the prose:
+        # this file explains at length why it does not carry them.
+        for banned in ("duckdb", "store.py", "duck.py", "query.py", "api.py",
+                       "serve.py", "preflight.py", "readers.json",
+                       "tokens.json"):
+            check("oci/mcp: %s's CODE never names %r" % (name, banned),
+                  banned in code, False)
+        # AND IT RUNS THE MODULE AS A SCRIPT.  `python -m srv.mcp` imports
+        # `srv/__init__.py` first, which imports six modules of the reconciler
+        # -- stdlib-only, so no DuckDB, but six modules in an image whose
+        # stated contents are "the MCP surface and nothing else", and
+        # `reconcile` re-exports from `ingest`, so the set only grows.
+        #
+        # ASSERTED ON THE ENTRYPOINT AS WELL AS THE CONTAINERFILE, and the
+        # entrypoint is the half that matters: the Containerfile only COPYs the
+        # file, and the `-m` would be written where the process is launched.
+        # Checked here first and found by mutation -- rewriting the entrypoint
+        # to `-m srv.mcp` left this test green when it looked only at the
+        # Containerfile, which is a guard asserting the wrong file.
+        check("oci/mcp: %s never runs it as `-m srv.mcp`" % name,
+              "srv.mcp" in code, False)
+    ep = os.path.join(OCI, "entrypoint-mcp.sh")
+    if not os.path.isfile(ep):
+        check("oci/mcp: entrypoint-mcp.sh was found", ep, "a file that exists")
+    else:
+        ep_code = _sh_code(open(ep, encoding="utf-8").read())
+        check("oci/mcp: the entrypoint never runs it as `-m srv.mcp`",
+              "srv.mcp" in ep_code, False)
+        check("oci/mcp: ...and never passes -m at all",
+              re.search(r"\bexec\b[^\n]*\s-m\s", ep_code) is not None, False)
+        check_true("oci/mcp: ...it execs the flat script instead",
+                   re.search(r"exec[^\n]*mcp\.py", ep_code) is not None)
+
+    # THE CONTEXT, which is the half a later edit cannot get around.
+    for name in sorted(mcps):
+        ign = os.path.join(OCI, name + ".containerignore")
+        if not os.path.isfile(ign):
+            ign = os.path.join(OCI, name + ".dockerignore")
+        if not os.path.isfile(ign):
+            check("oci/mcp: %s has an ignore file" % name, None,
+                  "an ignore file beside the Containerfile")
+            continue
+        body = [l.strip() for l in open(ign, encoding="utf-8").read().splitlines()
+                if l.strip() and not l.strip().startswith("#")]
+        check_true("oci/mcp: %s's context starts by excluding everything"
+                   % os.path.basename(ign), "*" in body)
+        allowed = [l[1:] for l in body if l.startswith("!")]
+        check_true("oci/mcp: ...and re-includes srv/mcp.py",
+                   any(a.endswith("/server/srv/mcp.py") or
+                       a.endswith("server/srv/mcp.py") for a in allowed))
+        # The negative, which is the point: no line re-includes the package as
+        # a whole, so `store.py` is not in the context at any path.
+        for a in allowed:
+            check("oci/mcp: ...and no line re-includes the whole package (%s)"
+                  % a, a.rstrip("*/").endswith("server/srv"), False)
+
+    # And the module itself still is what all of this assumes: no import of a
+    # sibling and no import of duckdb.  That is asserted elsewhere too, from
+    # the other direction; here it is what makes the flat COPY legitimate.
+    mcp_src = os.path.join(fx.SRV_DIR, "srv", "mcp.py")
+    if not os.path.isfile(mcp_src):
+        check("oci/mcp: srv/mcp.py was found", mcp_src, "a file that exists")
+        return
+    import ast as _ast
+    tree = _ast.parse(open(mcp_src, encoding="utf-8").read())
+    relative = [n for n in _ast.walk(tree)
+                if isinstance(n, _ast.ImportFrom) and n.level]
+    check("oci/mcp: srv/mcp.py imports no sibling module, so it runs flat",
+          [n.module for n in relative], [])
+    tops = sorted({a.name.split(".")[0]
+                   for n in _ast.walk(tree) if isinstance(n, _ast.Import)
+                   for a in n.names}
+                  | {n.module.split(".")[0] for n in _ast.walk(tree)
+                     if isinstance(n, _ast.ImportFrom) and not n.level
+                     and n.module})
+    check("oci/mcp: ...and imports the standard library only",
+          [m for m in tops if m in ("duckdb", "srv")], [])
+
+
+def test_oci_the_ingest_and_mcp_images_carry_no_duckdb():
+    """THE MEASURED HALF OF THE SPLIT, ASSERTED THE WAY `usage/` ASSERTS ITS OWN.
+
+    `usage/tests/test_all.py` has a test called "nothing under usage/ imports
+    duckdb", and its shape is the one to copy: the engine is this project's
+    first non-stdlib dependency and it is permitted in ONE place, so every
+    boundary around it is asserted rather than described.
+
+    Two of the four components need no engine, and that was MEASURED rather
+    than assumed.  `import duckdb` appears exactly once in the whole package --
+    inside `store.require()`, called from `DuckStore.con()` on the first query
+    -- so nothing imports it at module level, and `serve.py` starts, binds and
+    takes shipments on a stdlib-only interpreter.  `serve.py` already prints
+    `engine duckdb MISSING -- stream A routes will refuse by name` for exactly
+    that case.
+
+    WHY THIS IS ABOUT AUTHORITY AND NOT ABOUT MEGABYTES.  Built and measured on
+    the machine this was written on: ingest 215 MB, api 302 MB, mcp 213 MB,
+    proxy 94.2 MB -- so the engine is 87 MB of the api, and the ingest and mcp
+    images are ~76% and ~99% base image respectively.  The saving is real and
+    modest.  What the split buys is that the process holding the write lock and
+    the store read-write has no query engine in it, and the process an agent
+    talks to has neither.
+    """
+    files = dict(_oci_containerfiles())
+    engineless = {n: t for n, t in files.items()
+                  if _component_of(n) in ("ingest", "mcp")}
+    check_true("oci/no-engine: there were engineless Containerfiles to check",
+               bool(engineless))
+    check("oci/no-engine: ...and both components are represented",
+          sorted({_component_of(n) for n in engineless}), ["ingest", "mcp"])
+
+    for name, text in sorted(engineless.items()):
+        code = _sh_code(text)
+        # THE CODE, NOT THE PROSE.  Both of these files argue at length about
+        # DuckDB and why it is absent, so a guard that matched the explanation
+        # would fail on a correct file and pass on a wrong one the moment
+        # somebody reworded a comment.
+        for banned in ("pip install", "duckdb", "DUCKDB_VERSION"):
+            check("oci/no-engine: %s's CODE never says %r" % (name, banned),
+                  [l for l in code.splitlines() if banned in l], [])
+        # AND THE LABEL SAYS SO, so a registry listing distinguishes "no
+        # engine" from "nobody wrote a label".
+        m = re.search(r'com\.claudio\.engine="([^"]*)"', text)
+        check_true("oci/no-engine: %s declares an engine label" % name, bool(m))
+        if m:
+            check("oci/no-engine: ...and it does not name duckdb (%s)" % name,
+                  "duckdb" in m.group(1).lower(), False)
+
+    # THE STAGING SCRIPT IS THE OTHER HALF ON FreeBSD, where there is no `pip`
+    # to grep for: the packages are chosen by a `case` branch, and the wrong
+    # pick is not a build failure but an image quietly carrying the engine.
+    stage = os.path.join(OCI, "stage-freebsd.sh")
+    if not os.path.isfile(stage):
+        check("oci/no-engine: stage-freebsd.sh was found", stage,
+              "a file that exists")
+    else:
+        text = open(stage, encoding="utf-8").read()
+        for comp in ("ingest", "mcp"):
+            m = re.search(r"^    %s\)\n(.*?)^        ;;" % comp, text,
+                          re.M | re.S)
+            check_true("oci/no-engine: the %s staging branch was found" % comp,
+                       m is not None)
+            if m:
+                pkgs = re.search(r'^\s*PKGS="([^"]*)"', m.group(1), re.M)
+                check("oci/no-engine: ...and stages nothing matching duckdb",
+                      [x for x in (pkgs.group(1).split() if pkgs else [])
+                       if "duckdb" in x], [])
+
+    # AND THE api DOES CARRY IT, which is what stops all of the above being a
+    # statement about a project that dropped DuckDB entirely.
+    apis = {n: t for n, t in files.items() if _component_of(n) == "api"}
+    check_true("oci/no-engine: an api Containerfile was found", bool(apis))
+    for name, text in sorted(apis.items()):
+        check_true("oci/no-engine: %s pins a duckdb version" % name,
+                   "ARG DUCKDB_VERSION=" in text)
+
+
+def test_oci_the_proxy_sends_the_two_halves_to_two_upstreams():
+    """`/sender` and `/api/` are one route each to two DIFFERENT processes.
+
+    A single upstream serving both -- which is what this configuration had
+    while the door was one image -- puts the query engine and the write lock in
+    one process, which is exactly the thing the split exists to undo.  And it
+    is the failure that would go unnoticed: every request would keep working.
+
+    The other two ways to get it wrong are loud by comparison.  `/sender` at
+    the api meets a 503 `no-ship`; `/api/` at the ingest service meets a 503
+    `no-view`.  Both are named refusals somebody would find in an afternoon.
+    Pointing both at one whole door is the silent one, so the upstream NAMES
+    are asserted to be different from each other and each route to the right
+    one of them.
+    """
+    conf = _nginx_conf("claudio.conf")
+    loc = _nginx_conf("claudio-locations.conf")
+    if conf is None or loc is None:
+        check("oci/split-proxy: the two configurations were found", None,
+              "claudio.conf and claudio-locations.conf")
+        return
+
+    ups = dict(re.findall(r"upstream\s+(\S+)\s*\{\s*server\s+([^;]+);", conf))
+    check("oci/split-proxy: three upstreams, one per service that answers",
+          sorted(ups), ["claudio_api", "claudio_ingest", "claudio_mcp"])
+    # A DIFFERENT HOST EACH, read off the upstream bodies. Two upstream names
+    # pointing at one `server` line is the same defect with more typing.
+    check("oci/split-proxy: ...and no two of them name the same address",
+          len(set(ups.values())), 3)
+
+    code = "\n".join(l for l in loc.splitlines()
+                      if not l.lstrip().startswith("#"))
+
+    def target(header):
+        m = re.search(r"^\s*location\s+%s\s*\{(.*?)^    \}"
+                      % re.escape(header), code, re.M | re.S)
+        if not m:
+            return None
+        p_ = re.search(r"proxy_pass\s+http://([A-Za-z0-9_.:-]+)", m.group(1))
+        return p_.group(1) if p_ else None
+
+    check("oci/split-proxy: /sender reaches the WRITER", target("= /sender"),
+          "claudio_ingest")
+    check("oci/split-proxy: /api/ reaches the READER", target("/api/"),
+          "claudio_api")
+    check("oci/split-proxy: /mcp reaches the mcp service", target("= /mcp"),
+          "claudio_mcp")
+    check("oci/split-proxy: and no two routes share an upstream",
+          len({target("= /sender"), target("/api/"), target("= /mcp")}), 3)
+
+    # TLS IS SHIPPED NOW AND THE CERTIFICATE PATH IS IN ONE PLACE.  It used to
+    # be an example file the operator mounted, because nginx EXITS when
+    # `ssl_certificate` names a file that is not there.  `entrypoint-proxy.sh`
+    # answers that -- a mounted certificate if there is one, a self-signed pair
+    # it generates and announces if there is not -- so the secure configuration
+    # is the default rather than the one you reach after reading a paragraph.
+    tls = _nginx_conf("claudio-tls.conf")
+    if tls is None:
+        check("oci/split-proxy: nginx/claudio-tls.conf was found", None,
+              "a file that exists")
+        return
+    certs = re.findall(r"^\s*ssl_certificate(?:_key)?\s+(\S+);", tls, re.M)
+    check("oci/split-proxy: the TLS server names exactly two files",
+          len(certs), 2)
+    check_true("oci/split-proxy: ...both under the read-only secret mount",
+               all(c.startswith("/etc/claudio/") for c in certs))
+    check_true("oci/split-proxy: ...and it includes the shared route list, "
+               "rather than copying it",
+               re.search(r"include\s+claudio-locations\.conf;", tls) is not None)
+    # THE DOMAIN IS NOT IN THE NGINX CONFIGURATION AT ALL.  `server_name _`
+    # matches any host, which is right for a single-vhost proxy and is what
+    # makes this file identical on every deployment; the domain lives in one
+    # environment variable, read by the entrypoint for the generated
+    # certificate's CN.
+    check_true("oci/split-proxy: the TLS server matches any host",
+               re.search(r"server_name\s+_\s*;", tls) is not None)
+
+    ep = os.path.join(OCI, "entrypoint-proxy.sh")
+    if not os.path.isfile(ep):
+        check("oci/split-proxy: entrypoint-proxy.sh was found", ep,
+              "a file that exists")
+        return
+    ep_text = open(ep, encoding="utf-8").read()
+    ep_code = _sh_code(ep_text)
+    check_true("oci/split-proxy: the entrypoint reads the domain from one "
+               "variable", "CLAUDIO_DOMAIN" in ep_code)
+    check_true("oci/split-proxy: ...and the certificate directory from another",
+               "CLAUDIO_TLS_DIR" in ep_code)
+    # IT MUST NEVER OVERWRITE A CERTIFICATE THAT IS ALREADY THERE. That would
+    # replace a real certificate with a self-signed one on a restart -- every
+    # client's trust broken by a container coming back.
+    check_true("oci/split-proxy: it generates only when BOTH files are absent",
+               re.search(r"if\s+\[\s+-f\s+\"\$CERT\"\s+\]\s+&&\s+"
+                         r"\[\s+-f\s+\"\$KEY\"\s+\]", ep_code) is not None)
+    check_true("oci/split-proxy: ...and refuses half a pair rather than "
+               "completing it", "exit 10" in ep_code)
+    check_true("oci/split-proxy: ...and says the generated one is self-signed",
+               "SELF-SIGNED" in ep_text)
+    # The exit codes do not collide: serve.py owns 1, 3, 4, 8 and 9,
+    # preflight.py owns 5, the entrypoints own 6, the mcp ambient token is 7
+    # and an unknown server role is 11.
+    for collide in ("exit 1", "exit 3", "exit 4", "exit 5", "exit 7",
+                    "exit 8", "exit 9", "exit 11"):
+        check("oci/split-proxy: the proxy entrypoint never exits %r, which is "
+              "somebody else's code" % collide,
+              re.search(r"%s\b" % collide, ep_code) is not None, False)
+
+
+def test_oci_the_compose_stack_publishes_only_the_proxy():
+    """Four services, one `ports:`, and three different answers about the store.
+
+    This is the file an operator runs, so it is where the split either holds or
+    silently does not.  Four properties, and each of them is a way the stack
+    could come up looking perfectly healthy while the boundary was gone:
+
+      * only the PROXY publishes a port.  A `ports:` on the api is an
+        unauthenticated-by-default read API on the host's interfaces.
+      * the store is READ-WRITE on ingest and READ-ONLY on api.  `:ro` is not
+        what enforces it -- `--no-ship` and `Store(create=False)` are -- but a
+        mount that was meant to say `:ro` and does not is the day somebody
+        starts that image without the role and gets a second writer.
+      * the mcp service gets NO volume at all.  Not the store read-only, not
+        the token files.  A directory that is not mounted cannot be read.
+      * the mcp service gets NO ambient token.  Its authority is the caller's
+        forwarded bearer token and nothing else.
+    """
+    path = os.path.join(OCI, "compose.yml")
+    if not os.path.isfile(path):
+        check("oci/compose: server/oci/compose.yml was found", path,
+              "a file that exists")
+        return
+    text = open(path, encoding="utf-8").read()
+
+    # Parsed by INDENTATION rather than with a YAML library, because this
+    # project has no third-party dependency outside the server's engine and a
+    # test may not add one.  The shape asked of it is shallow: the service
+    # names, and the block of lines under each.
+    m = re.search(r"^services:\n(.*?)(?=^\S)", text, re.M | re.S)
+    check_true("oci/compose: the file declares services", m is not None)
+    if not m:
+        return
+    body = m.group(1)
+    blocks, current = {}, None
+    for line in body.splitlines():
+        head = re.match(r"^  ([A-Za-z0-9_-]+):\s*$", line)
+        if head:
+            current = head.group(1)
+            blocks[current] = []
+        elif current and line.strip():
+            blocks[current].append(line)
+    check("oci/compose: four services, one per component",
+          sorted(blocks), ["api", "ingest", "mcp", "proxy"])
+
+    for name, lines in sorted(blocks.items()):
+        block = "\n".join(lines)
+        has_ports = re.search(r"^\s+ports:", block, re.M) is not None
+        check("oci/compose: %s publishes a port iff it is the proxy" % name,
+              has_ports, name == "proxy")
+        if has_ports:
+            maps = re.findall(r'^\s+-\s+"([^"]+)"', block, re.M)
+            check_true("oci/compose: ...and every mapping it declares is "
+                       "pinned to loopback",
+                       bool(maps) and all(x.startswith("127.0.0.1:")
+                                          for x in maps))
+
+    def mounts(name):
+        return re.findall(r"^\s+-\s+(\S+:\S+)\s*$", "\n".join(blocks[name]),
+                          re.M)
+
+    store_mounts = {n: [x for x in mounts(n) if "claudio-usage" in x]
+                    for n in blocks}
+    check_true("oci/compose: ingest mounts the store read-WRITE",
+               len(store_mounts["ingest"]) == 1
+               and not store_mounts["ingest"][0].endswith(":ro"))
+    check_true("oci/compose: api mounts the store read-ONLY",
+               len(store_mounts["api"]) == 1
+               and store_mounts["api"][0].endswith(":ro"))
+    check("oci/compose: mcp mounts NOTHING, not even the store read-only",
+          mounts("mcp"), [])
+    check("oci/compose: ...and declares no volumes key at all",
+          re.search(r"^\s+volumes:", "\n".join(blocks["mcp"]), re.M) is not None,
+          False)
+
+    # THE TWO TOKEN FILES ARE SEPARATE AND EACH SERVICE GETS ONE.  A machine
+    # that ships is not thereby entitled to read, and a reader ships nothing.
+    check_true("oci/compose: ingest is given the shipping tokens and not the "
+               "readers file",
+               any("tokens.json" in x for x in mounts("ingest"))
+               and not any("readers.json" in x for x in mounts("ingest")))
+    check_true("oci/compose: api is given the readers file and not the "
+               "shipping tokens",
+               any("readers.json" in x for x in mounts("api"))
+               and not any("tokens.json" in x for x in mounts("api")))
+
+    check("oci/compose: the mcp service is given NO ambient token",
+          re.search(r"^\s+CLAUDIO_API_TOKEN:", "\n".join(blocks["mcp"]), re.M)
+          is not None, False)
+    check_true("oci/compose: ...and does point at the api, not the ingest "
+               "service",
+               re.search(r"CLAUDIO_API:\s*http://api:", "\n".join(blocks["mcp"]))
+               is not None)
+
+    # AND THE api WAITS FOR THE WRITER TO HAVE CREATED `accounts/`.  A reader
+    # over a store with no accounts directory exits 9 -- correctly -- so
+    # without this the api crash-loops on a fresh store until the ingest
+    # service happens to get there first. `service_started` is not enough.
+    # Comments stripped first: this block carries five lines of prose
+    # explaining why `service_started` is not enough, and a guard that matched
+    # the explanation would pass on a file that said the right thing and did
+    # the wrong one.
+    api_block = "\n".join(l for l in blocks["api"]
+                          if not l.lstrip().startswith("#"))
+    check_true("oci/compose: api depends on ingest being HEALTHY, not merely "
+               "started",
+               re.search(r"ingest:\s*\n\s+condition:\s*service_healthy",
+                         api_block) is not None)
+    check("oci/compose: ...and never on service_started",
+          "service_started" in api_block, False)
+
+
+def test_oci_the_mcp_route_left_the_store_images_and_the_imports_say_so():
+    """THE PAIRED GUARD IS SPENT, AND THIS IS WHAT REPLACES IT.
+
+    There used to be an IFF here: "the door image excludes `srv/mcp.py` exactly
+    when `serve.py` has stopped importing it".  Its own docstring said it would
+    turn red on the day the route moved.  That day came -- `POST /mcp` is the
+    mcp component's, served by `mcp.serve_http` in its own image -- so the
+    condition it balanced no longer has two coherent states to balance, and an
+    IFF with one live side is a test that can only ever assert the obvious.
+
+    Two flat assertions instead, and each one is a thing that could regress on
+    its own.
+
+    FIRST, `serve.py` IMPORTS NO `mcp`.  The route it briefly served looped
+    back to `http://127.0.0.1:<its own port>` -- which after the split is the
+    WRONG PROCESS -- and, worse, put an MCP surface inside the process holding
+    the DuckDB handle, the store's query layer and (when ship is enabled) the
+    writer's lock.  An MCP surface's whole stated authority is one bearer token
+    handed to it per request.
+
+    SECOND, THE MCP IMAGE'S CONTEXT CARRIES `mcp.py` AND NOT THE PACKAGE.  That
+    is the structural half: `store.py`, `duck.py`, `query.py`, `api.py` and
+    `serve.py` are not in the build context at all, so a `COPY server/srv/`
+    added to that Containerfile fails the build by name.
+
+    What is deliberately NOT asserted is that the store images exclude
+    `mcp.py`.  They carry it, on purpose: excluding one file from a
+    `COPY server/srv/` needs a second COPY list, and a list is a place to
+    forget.  What matters is that nothing in those images RUNS it, which is the
+    third assertion below.
+    """
+    serve_src = os.path.join(fx.SRV_DIR, "srv", "serve.py")
+    if not os.path.isfile(serve_src):
+        check("oci/mcp-route: srv/serve.py was found", serve_src,
+              "a file that exists")
+        return
+    text = open(serve_src, encoding="utf-8").read()
+    imports_mcp = re.search(r"^\s*from\s+(\.|srv)\s+import\b[^\n]*\bmcp\b",
+                            text, re.M)
+    check("oci/mcp-route: serve.py imports no mcp module", bool(imports_mcp),
+          False)
+    # AND SERVES NO SUCH ROUTE EITHER.  The import is how it would come back;
+    # the route is what would be wrong.  Asserted on the code and not the prose,
+    # because this file explains at length why the route is not here.
+    code = "\n".join(l for l in text.splitlines()
+                      if not l.lstrip().startswith("#"))
+    check("oci/mcp-route: ...and declares no /mcp path constant",
+          "PATH_MCP" in code, False)
+    check("oci/mcp-route: ...and no handler for one",
+          re.search(r"def _mcp\b", code) is not None, False)
+
+    # THE CONTEXT, which is the half a later edit cannot get around.
+    for name, _t in _oci_containerfiles():
+        if _component_of(name) != "mcp":
+            continue
+        ign = os.path.join(OCI, name + ".containerignore")
+        if not os.path.isfile(ign):
+            ign = os.path.join(OCI, name + ".dockerignore")
+        if not os.path.isfile(ign):
+            check("oci/mcp-route: %s has an ignore file" % name, None,
+                  "an ignore file beside the Containerfile")
+            continue
+        body = [l.strip() for l in
+                open(ign, encoding="utf-8").read().splitlines()
+                if l.strip() and not l.strip().startswith("#")]
+        allowed = [l[1:] for l in body if l.startswith("!")]
+        check_true("oci/mcp-route: %s re-includes srv/mcp.py"
+                   % os.path.basename(ign),
+                   any(a.endswith("server/srv/mcp.py") for a in allowed))
+        for a in allowed:
+            check("oci/mcp-route: ...and no line re-includes the whole package "
+                  "(%s)" % a, a.rstrip("*/").endswith("server/srv"), False)
+
+    # THE STORE IMAGES CARRY IT AND MUST NEVER RUN IT.  `entrypoint.sh` had an
+    # `mcp` mode that exec'd `-m srv.mcp`; it is deleted rather than left to
+    # rot into a `No module named` traceback in an image whose context no
+    # longer has to carry the module for that reason.
+    ep = os.path.join(OCI, "entrypoint.sh")
+    if not os.path.isfile(ep):
+        check("oci/mcp-route: entrypoint.sh was found", ep,
+              "a file that exists")
+        return
+    ep_code = _sh_code(open(ep, encoding="utf-8").read())
+    check("oci/mcp-route: the shared entrypoint has no mcp mode",
+          "mcp" in ep_code.lower(), False)
+
+
+def test_oci_the_staging_script_takes_a_component_and_refuses_an_unknown_one():
+    """One script, three package lists, and no default.
+
+    The component decides which packages go in the image, and the wrong pick is
+    not a build failure -- it is an mcp image carrying DuckDB and the store's
+    query layer, which is the boundary the split exists to draw.  So it is the
+    first argument, it is required, and an unknown value is a NAMED refusal
+    listing the three.
+
+    Exercised rather than described: the refusal happens before anything is
+    fetched, so this test needs no network and no FreeBSD.
+    """
+    path = os.path.join(OCI, "stage-freebsd.sh")
+    if not os.path.isfile(path):
+        check("oci/stage: stage-freebsd.sh was found", path,
+              "a file that exists")
+        return
+    text = open(path, encoding="utf-8").read()
+
+    # The refusal, run for real.  `/bin/sh` is enough: the script exits in its
+    # `case` before it reaches curl, python or the network.
+    proc = subprocess.run(["/bin/sh", path, "nonsense", "FreeBSD:15:amd64",
+                           "amd64", os.path.join(tempfile.gettempdir(),
+                                                 "stage-refusal-check")],
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    check("oci/stage: an unknown component is refused", proc.returncode != 0,
+          True)
+    err = proc.stderr.decode("utf-8", "replace")
+    check_true("oci/stage: ...and the refusal names the component it was given",
+               "nonsense" in err)
+    for comp in COMPONENTS:
+        check_true("oci/stage: ...and names %s as one of the four" % comp,
+                   comp in err)
+    check_true("oci/stage: ...and it refused before staging anything",
+               not os.path.isdir(os.path.join(tempfile.gettempdir(),
+                                              "stage-refusal-check")))
+
+    # AND IT HAS NO DEFAULT, which cannot be shown by running it: give the
+    # parameter a default and every wrong call still refuses, because the
+    # arguments shift and the ABI ends up in a required slot.  What a default
+    # really costs is the bare `stage-freebsd.sh` staging one of the three
+    # without being asked, and the only place that is visible is the
+    # assignment.  Found by mutation: `${1:-door}` left this test green.
+    assign = re.search(r'^COMPONENT="\$\{1(:[-?])', text, re.M)
+    check("oci/stage: the component parameter is required, with no default",
+          assign.group(1) if assign else None, ":?")
+
+    # WHAT EACH COMPONENT STAGES, read out of the script's own `case`.
+    # Derived from the file rather than restated: the point of the check is
+    # that the mcp list has no DuckDB in it, and a copy of the list here would
+    # be a second place for that to be true.
+    def branch(name):
+        m = re.search(r"^    %s\)\n(.*?)^        ;;" % re.escape(name),
+                      text, re.M | re.S)
+        return m.group(1) if m else None
+
+    for comp, wants, forbids in (
+            # THE INGEST BRANCH STAGES NO ENGINE, AND THAT IS THE HALF THIS
+            # LOOP EXISTS FOR NOW.  `import duckdb` happens in exactly one
+            # place in the package -- inside `store.require()`, on the first
+            # query -- so the ship path never reaches it, and staging it here
+            # would put a C++ engine in the one process that holds the write
+            # lock.
+            ("ingest", ["python312"], ["duckdb"]),
+            ("api", ["py312-duckdb", "python312"], []),
+            ("mcp", ["python312"], ["duckdb"]),
+            ("proxy", ["nginx"], ["duckdb", "python"])):
+        b = branch(comp)
+        if b is None:
+            check("oci/stage: the %s branch was found" % comp, None,
+                  "a case branch")
+            continue
+        pkgs = re.search(r'^\s*PKGS="([^"]*)"', b, re.M)
+        check_true("oci/stage: the %s branch names its packages" % comp,
+                   pkgs is not None)
+        if not pkgs:
+            continue
+        named = pkgs.group(1).split()
+        check("oci/stage: %s stages %s" % (comp, ", ".join(wants)),
+              named, wants)
+        for bad in forbids:
+            check("oci/stage: %s stages nothing matching %r" % (comp, bad),
+                  any(bad in n for n in named), False)
+
+    # The mcp branch checks its prune against `mcp.py` and not against `srv/`,
+    # which is what stops the check demanding the very dependency the image
+    # exists to shed.
+    b = branch("mcp")
+    if b:
+        check_true("oci/stage: the mcp branch checks its imports against "
+                   "mcp.py alone", "mcp.py" in b)
+
+
+def _nginx_conf(name):
+    path = os.path.join(OCI, "nginx", name)
+    if not os.path.isfile(path):
+        return None
+    return open(path, encoding="utf-8").read()
+
+
+def test_oci_the_proxy_serves_the_three_routes_and_keeps_the_api_prefix():
+    """The front end is what makes the three images one system.
+
+        /sender  -> door  POST /v1/ship
+        /api/    -> door  GET  /api/v1/*
+        /mcp     -> mcp   POST /mcp
+
+    THE `/api/` PREFIX IS LOAD-BEARING AND IS THE FIRST THING SOMEBODY WILL
+    TIDY.  The door describes itself with ABSOLUTE paths -- OpenAPI `paths`,
+    `capabilities.endpoints[].path`, and the `remedy` on every refusal -- so a
+    matching external prefix makes all three correct as they stand.  Rename it
+    and the MCP surface breaks first and SILENTLY, because it generates its
+    entire tool list from those paths: every tool would be built against a path
+    that 404s from outside.  So the assertion is that this location has no URI
+    part in its `proxy_pass` and that nothing rewrites the prefix.
+    """
+    text = _nginx_conf("claudio-locations.conf")
+    if text is None:
+        check("oci/proxy: nginx/claudio-locations.conf was found", None,
+              "a file that exists")
+        return
+    code = "\n".join(l for l in text.splitlines()
+                      if not l.lstrip().startswith("#"))
+
+    def block(header):
+        m = re.search(r"^\s*location\s+%s\s*\{(.*?)^    \}"
+                      % re.escape(header), code, re.M | re.S)
+        return m.group(1) if m else None
+
+    ship = block("= /sender")
+    api = block("/api/")
+    mcp = block("= /mcp")
+    check_true("oci/proxy: there is a /sender location", ship is not None)
+    check_true("oci/proxy: there is an /api/ location", api is not None)
+    check_true("oci/proxy: there is a /mcp location", mcp is not None)
+
+    if ship:
+        check_true("oci/proxy: /sender reaches the door's /v1/ship",
+                   re.search(r"proxy_pass\s+http://\S+/v1/ship;", ship)
+                   is not None)
+    if api:
+        # NO URI part: `proxy_pass http://upstream;` passes the request URI
+        # through unchanged, and `proxy_pass http://upstream/;` does not.
+        m = re.search(r"proxy_pass\s+(\S+);", api)
+        check_true("oci/proxy: /api/ has a proxy_pass", m is not None)
+        if m:
+            target = m.group(1)
+            # `http://upstream` passes the request URI through unchanged;
+            # `http://upstream/` REPLACES the matched prefix with `/`, which
+            # silently serves `/api/v1/search` to the door as `/v1/search`.
+            # Written first as a count of slashes after `rstrip("/")`, which is
+            # satisfied by the trailing slash it exists to catch -- found by
+            # mutation, and this is the shape that cannot be: the whole value
+            # must be scheme and host, with nothing after them at all.
+            check("oci/proxy: ...with NO URI part, not even a bare `/`, so the "
+                  "/api/ prefix reaches the door unchanged",
+                  re.match(r"^https?://[A-Za-z0-9_.:-]+$", target) is not None,
+                  True)
+            check("oci/proxy: ...and it is not rewritten either",
+                  "rewrite" in api, False)
+    if mcp:
+        check_true("oci/proxy: /mcp reaches the mcp service's /mcp",
+                   re.search(r"proxy_pass\s+http://\S+/mcp;", mcp) is not None)
+        # Buffered, a streamed reply arrives all at once when the upstream
+        # closes, which to a client is indistinguishable from a hang.
+        check_true("oci/proxy: ...with proxy_buffering off",
+                   re.search(r"proxy_buffering\s+off\s*;", mcp) is not None)
+
+    # `/healthz` asks for no token and names the store root, the engine's
+    # availability and the free bytes on the filesystem.  It is an operator's
+    # question and is deliberately not published; the configuration says so
+    # where an operator reads it rather than simply omitting the route.
+    health = re.search(r"location\s+=\s+/healthz\s*\{(.*?)\}", code, re.S)
+    check_true("oci/proxy: /healthz is answered explicitly, not by omission",
+               health is not None)
+    if health:
+        check("oci/proxy: ...and it is not proxied anywhere",
+              "proxy_pass" in health.group(1), False)
+    check_true("oci/proxy: ...and the file says why it is not exposed",
+               "asks for no token" in text or "no token" in text)
+
+    # A 404 WITH NO ROUTE OUT OF IT is how a client author concludes the server
+    # is broken, so the catch-all names the routes that do exist.
+    catch = re.search(r"location\s+/\s*\{(.*?)\}", code, re.S)
+    check_true("oci/proxy: there is a catch-all", catch is not None)
+    if catch:
+        body = catch.group(1)
+        for named in ("/sender", "/api/v1", "/mcp"):
+            check_true("oci/proxy: ...and it names %s" % named, named in body)
+
+
+def test_oci_the_proxy_body_limits_are_the_door_s_own_numbers():
+    """Derived from `serve.py`, because a second copy is a second place to
+    forget -- and both ways of getting it wrong are invisible at the time.
+
+    A SMALLER limit at the proxy means a shipper meets a 413 from nginx
+    carrying none of the door's own explanation of what it refused and why.  A
+    LARGER one means nginx buffers the whole body before the door refuses it.
+    Equal, the refusal comes from the process that knows why.
+    """
+    text = _nginx_conf("claudio-locations.conf")
+    if text is None:
+        check("oci/proxy: nginx/claudio-locations.conf was found", None,
+              "a file that exists")
+        return
+    # Read off the MODULE, not out of the source text: `serve` is already
+    # imported here, so the number compared is the number the door will
+    # actually enforce -- and it stays right if the constant is ever written as
+    # an expression, a `min()` or a value read from somewhere else.
+    # TWO MODULES, BECAUSE THE TWO LIMITS BELONG TO TWO PROCESSES NOW.  The
+    # 32m is the ingest service's `serve.MAX_BODY`; the 1m is the mcp service's
+    # `mcp.MAX_BODY`, which moved there with the route.  Read off the MODULES
+    # rather than out of either source text, so the numbers compared are the
+    # numbers those processes will enforce.
+    door = getattr(serve, "MAX_BODY", None)
+    mcp_max = getattr(mcp, "MAX_BODY", None)
+    check_true("oci/proxy: serve.py declares MAX_BODY", isinstance(door, int))
+    check_true("oci/proxy: mcp.py declares MAX_BODY", isinstance(mcp_max, int))
+    check("oci/proxy: and serve.py no longer declares one for a route it does "
+          "not serve", hasattr(serve, "MCP_MAX_BODY"), False)
+    if not isinstance(door, int) or not isinstance(mcp_max, int):
+        return
+    limits = re.findall(r"client_max_body_size\s+(\d+)m\s*;", text)
+    check_true("oci/proxy: the configuration sets client_max_body_size",
+               len(limits) >= 2)
+    if len(limits) >= 2:
+        check("oci/proxy: the server-wide limit is the door's MAX_BODY",
+              int(limits[0]) * 1024 * 1024, door)
+        check("oci/proxy: and the /mcp limit is the mcp service's MAX_BODY",
+              int(limits[1]) * 1024 * 1024, mcp_max)
+
+
+def test_oci_the_proxy_runs_unprivileged_and_says_what_that_costs():
+    """A process that is not root cannot bind below 1024.
+
+    So the proxy listens on 8080 and 8443 and the PUBLISH mapping is where they
+    become 80 and 443.  Running it as root to get the low port would trade the
+    one privilege this stack does not need for a number the runtime maps for
+    free -- and the `user` directive would then be meaningful, which is the
+    other half of the same decision.
+    """
+    main = _nginx_conf("nginx.freebsd.conf")
+    shared = _nginx_conf("claudio.conf")
+    if main is None or shared is None:
+        check("oci/proxy: the two configurations were found", None,
+              "nginx.freebsd.conf and claudio.conf")
+        return
+    code = "\n".join(l for l in main.splitlines()
+                      if not l.lstrip().startswith("#"))
+    # No `user` directive: with a non-root master nginx warns on every start,
+    # and a warning nobody can act on trains people to ignore warnings.
+    check("oci/proxy: the main configuration sets no `user`",
+          re.search(r"^\s*user\s+\S+\s*;", code, re.M) is not None, False)
+    # `daemon off;` belongs to the ENTRYPOINT, and the two are mutually
+    # exclusive: nginx refuses to start on a duplicate `daemon` directive.
+    check("oci/proxy: ...and no `daemon` directive either, because the "
+          "entrypoint passes it",
+          re.search(r"^\s*daemon\s+", code, re.M) is not None, False)
+    # The pid file's compiled-in path is `/var/run/nginx.pid`, which this
+    # image's uid cannot write and this build has no RUN to chown.
+    check_true("oci/proxy: the pid file is moved somewhere the uid can write",
+               re.search(r"^\s*pid\s+/var/tmp/nginx/", code, re.M) is not None)
+    listens = re.findall(r"^\s*listen\s+(?:\[::\]:)?(\d+)", shared, re.M)
+    check_true("oci/proxy: it listens on at least one port", bool(listens))
+    for port in listens:
+        check_true("oci/proxy: %s is above 1024, which an unprivileged process "
+                   "can bind" % port, int(port) > 1024)
+
+    files = dict(_oci_containerfiles())
+    for name, text in sorted(files.items()):
+        if _component_of(name) != "proxy":
+            continue
+        users = [l.split()[1] for l in text.splitlines()
+                 if l.strip().upper().startswith("USER ")]
+        check("oci/proxy: %s runs as one numeric uid:gid" % name,
+              users, ["65534:65534"])
+
+
+def test_oci_the_mcp_entrypoint_refuses_an_ambient_token_over_http():
+    """A SERVED MCP MUST NOT SEE MORE THAN THE PERSON CALLING IT.
+
+    Over HTTP every caller presents their own bearer token and the door applies
+    that reader's scope, from the same `readers.json` that gates `/api/v1/*`.
+    An ambient `CLAUDIO_API_TOKEN` in the container's environment breaks that in
+    the one direction that matters: a caller who sends NO credential inherits
+    the container's, and the surface starts answering questions the caller was
+    never entitled to ask.
+
+    Refused rather than ignored, because the two differ for the operator.
+    Ignoring it leaves a token in `docker inspect` and in the compose file,
+    doing nothing, waiting for somebody to "fix" the code that ignores it.
+    """
+    path = os.path.join(OCI, "entrypoint-mcp.sh")
+    if not os.path.isfile(path):
+        check("oci/mcp-entry: entrypoint-mcp.sh was found", path,
+              "a file that exists")
+        return
+    text = open(path, encoding="utf-8").read()
+    code = _sh_code(text)
+    check_true("oci/mcp-entry: it refuses when a token is in the environment",
+               "CLAUDIO_API_TOKEN" in code and "exit 7" in code)
+    check_true("oci/mcp-entry: ...and the message says which transport the "
+               "variable belongs to", "stdio" in text)
+    # The stdio transport KEEPS it, and that is where it is correct: there the
+    # launcher is the caller, so one process means one identity.
+    check_true("oci/mcp-entry: stdio is still reachable", "stdio)" in code)
+    # It knows nothing about the store, and must not learn: this component has
+    # no store, no readers file and no tokens file.
+    for forbidden in ("--readers", "--tokens", "/var/lib/claudio-usage",
+                      "preflight", "--no-api"):
+        check("oci/mcp-entry: its CODE never says %r" % forbidden,
+              forbidden in code, False)
+    # And it execs, rather than forking a wrapper that would swallow the exit
+    # status of the thing it launched.
+    check_true("oci/mcp-entry: it execs the module", "exec " in code)
+    # The exit codes do not collide: `serve.py` owns 1, 3 and 4, `preflight.py`
+    # owns 5, both entrypoints own 6 for a missing interpreter, and 7 is this
+    # refusal.  An operator told to look for 4 must not meet a 4 from here.
+    for collide in ("exit 1", "exit 3", "exit 4", "exit 5"):
+        check("oci/mcp-entry: it never exits with %r, which is somebody "
+              "else's code" % collide, collide in code, False)
+
+
+def test_oci_the_workflow_publishes_both_images_and_pairs_base_with_abi():
+    """The matrix is the only place the target list is written down.
+
+    Two properties, and the second is the one that cannot be caught anywhere
+    else.  A FreeBSD image's package ABI must track its base's MAJOR version --
+    a 14.x image takes its packages from the FreeBSD:14 repository -- and
+    crossing them is SILENT at build time, because nothing executes during a
+    FreeBSD build.  Measured from the real published layers: 14.4 carries
+    `libutil.so.9`, 15.1 carries `libutil.so.10`, and `python3.12` from the
+    FreeBSD:14 repository asks for the former.  The build catches it with
+    `pkgindex.py shlibs`; this catches it in the file a human edits.
+
+    Parsed with a regex and not a YAML library on purpose: `server/` has one
+    third-party dependency and it is DuckDB, in `srv/store.py`, and a test that
+    imported PyYAML would make the suite need a second one to run at all.
+    """
+    if not os.path.isfile(WORKFLOW):
+        check("oci/ci: .github/workflows/images.yml was found", WORKFLOW,
+              "a file that exists")
+        return
+    text = open(WORKFLOW, encoding="utf-8").read()
+    # Full-line `#` comments removed for the negative checks below, and only
+    # for those: the workflow EXPLAINS why a single emulated multi-platform
+    # build does not work, so a grep of the raw text matches the paragraph
+    # warning against the thing it is looking for.  The same trap `_sh_code`
+    # exists for one language over.
+    code = "\n".join(l for l in text.splitlines()
+                      if not l.lstrip().startswith("#"))
+
+    rows = re.findall(
+        r"\{\s*slug:\s*(\S+?),\s*base:\s*'([^']+)',\s*arch:\s*(\w+),"
+        r"\s*abi:\s*'([^']+)'\s*\}", text)
+    check_true("oci/ci: the FreeBSD matrix was found at all", len(rows) >= 2)
+    seen_arch = set()
+    for slug, base, arch, abi in rows:
+        parts = abi.split(":")
+        check("oci/ci: %s abi is FreeBSD:<major>:<arch>" % slug, len(parts), 3)
+        if len(parts) != 3:
+            continue
+        check("oci/ci: %s (base %s) takes packages from the matching major "
+              "repository" % (slug, base), parts[1], base.split(".")[0])
+        check("oci/ci: %s arch %s matches its abi" % (slug, arch), parts[2],
+              {"amd64": "amd64", "arm64": "aarch64"}.get(arch, arch))
+        check_true("oci/ci: %s slug names its base" % slug,
+                   base.replace(".", "") in slug.replace(".", ""))
+        seen_arch.add(arch)
+    check("oci/ci: both architectures are built", sorted(seen_arch),
+          ["amd64", "arm64"])
+
+    # Linux is built one architecture per NATIVE runner, and that is measured
+    # rather than preferred: a single emulated multi-platform build installs
+    # the amd64 DuckDB wheel and then segfaults importing it.  A workflow that
+    # went back to one buildx run would publish an image whose engine has never
+    # been imported.
+    check_true("oci/ci: Linux amd64 is built on an amd64 runner",
+               "ubuntu-latest" in text)
+    check_true("oci/ci: Linux arm64 is built on an arm64 runner",
+               "ubuntu-24.04-arm" in text)
+    check("oci/ci: no emulated multi-platform Linux build",
+          "linux/amd64,linux/arm64" in code, False)
+
+    # vfs is not a performance knob: with overlay, buildah leaves
+    # `user.overlay.origin` -- an xattr with an EMPTY value -- on directories a
+    # COPY merges into, and podman on FreeBSD indexes value[0] when applying
+    # it, so the PULL panics.
+    check_true("oci/ci: the storage driver is vfs", "STORAGE_DRIVER: vfs" in text)
+    check_true("oci/ci: ...and the file says why, so it is not tidied away",
+               "index out of range [0]" in text)
+
+    # Which branches CI runs on, and the rule is the opposite of what it looks
+    # like. `pre-release` is the PUBLISHED squash and is exactly where CI
+    # belongs: it is the branch that produces the images anyone pulls.
+    #
+    # `accounts-and-tags` is the local development branch. It is deliberately
+    # never pushed -- its detailed history is the reason the published branch is
+    # squashed at all -- so a trigger naming it would fire on nothing, and the
+    # name sitting in a workflow is an invitation to push it. That is the
+    # invariant worth pinning, and it is about the PRIVATE branch, not the
+    # public one.
+    branches = re.search(r"branches:\s*\[([^\]]*)\]", text)
+    check_true("oci/ci: the push trigger names its branches", bool(branches))
+    if branches:
+        named = branches.group(1)
+        check("oci/ci: CI runs on the published branch", "pre-release" in named, True)
+        check("oci/ci: and never names the private development branch",
+              "accounts-and-tags" in named, False)
+
+    # THE STAGING STEP NAMES ITS COMPONENT.  `stage-freebsd.sh` takes the
+    # component first and has no default, so a workflow written before that
+    # argument existed fails on its next run -- loudly, which is the right
+    # direction, but the suite is where it should be caught rather than a red
+    # CI job on a branch somebody is trying to publish from.
+    #
+    # A MATRIX EXPRESSION IS ALSO AN ANSWER, AND THEN THE AXIS IS WHAT GETS
+    # CHECKED.  The FreeBSD job stages all four components, so the literal in
+    # that line is `${{ matrix.component }}` and asserting "one of the four"
+    # against the string `${{` would fail on a correct workflow.  What matters
+    # is unchanged -- that the argument is there and that it can only ever
+    # expand to a component -- so an expression is accepted and the axis it
+    # names is then required to be exactly the four.  A `component:` axis
+    # holding three of them, which is how a component silently stops being
+    # built, fails here rather than in a registry listing nobody reads.
+    # The alternation is ordered: an expression carries a SPACE inside its
+    # braces (`${{ matrix.component }}`), so a bare `\S+` stops at `"${{` and
+    # the assertion then fails on a correct workflow -- which is how this read
+    # for one run.
+    stage_calls = re.findall(
+        r"stage-freebsd\.sh\s+(?:\\\s*)?(\"?\$\{\{[^}]*\}\}\"?|\S+)", code)
+    check_true("oci/ci: the workflow stages the FreeBSD tree", bool(stage_calls))
+    for got in stage_calls:
+        expr = re.match(r'^"?\$\{\{\s*matrix\.(\w+)\s*\}\}"?$', got)
+        if expr:
+            axis = expr.group(1)
+            check("oci/ci: ...naming its component from a matrix axis",
+                  axis, "component")
+            m = re.search(r"^\s*component:\s*\[([^\]]*)\]", text, re.M)
+            check_true("oci/ci: ...and that axis is declared", m is not None)
+            if m:
+                named = sorted(x.strip() for x in m.group(1).split(",") if x.strip())
+                check("oci/ci: ...and it is exactly the four components",
+                      named, sorted(COMPONENTS))
+        else:
+            check_true("oci/ci: ...naming a component (%s)" % got,
+                       got.strip('"') in COMPONENTS)
+
+    check_true("oci/ci: a testing tag is published", ":testing" in text)
+    check_true("oci/ci: an immutable per-commit tag is published too",
+               "sha-${short}" in text)
+
+
+def test_oci_the_workflow_gates_the_images_on_the_suites_and_pins_its_actions():
+    """Three properties of `images.yml` that nothing else can see.
+
+    Regex and not PyYAML, for the reason the test above gives: `server/` has
+    one third-party dependency and it is DuckDB, and a test that imported a
+    YAML library would make the suite need a second one to run at all.
+
+    1. THE IMAGE JOBS CANNOT RUN ON A RED TREE.  `needs: test` on both builders
+       is the whole of it, and it is asserted per job rather than by grepping
+       the file for the word: `needs:` appears five times in this workflow and
+       four of them are about something else.
+
+    2. THE SUITE THAT RUNS IS THE STRICT ONE.  `server/tests/test_all.py` exits
+       non-zero on a self-skip by itself -- it was caught exiting 0 over 918
+       assertions that had never run -- and `--require-duckdb` is passed on top
+       of that, because a redundant guard is only redundant while the other one
+       holds.
+
+    3. EVERY ACTION IS PINNED TO A COMMIT.  A major tag such as `@v5` is a
+       moving reference its publisher re-points at will, and these jobs carry
+       `packages: write` and a registry token; `@v5` is therefore an unreviewed
+       third party with the ability to push an image under this repository's
+       name.  Asserted as a SHAPE -- forty hex characters -- and not as a list
+       of the four actions used today, because a list would say nothing about
+       the fifth one somebody adds.
+    """
+    if not os.path.isfile(WORKFLOW):
+        check("oci/ci: .github/workflows/images.yml was found", WORKFLOW,
+              "a file that exists")
+        return
+    text = open(WORKFLOW, encoding="utf-8").read()
+
+    # SCOPED TO THE TEXT AFTER `jobs:`, and that is not fastidiousness: `on:`
+    # has children at the same two-space indent, so the unscoped version of
+    # the line below reported `push`, `pull_request`, `schedule` and
+    # `workflow_dispatch` as jobs and then failed each of them for declaring no
+    # permissions -- a guard confidently asserting something about the wrong
+    # part of the file.
+    jtext = text[text.index("\njobs:\n") + 1:]
+
+    # A job block runs from `^  <name>:` to the next line starting with two
+    # spaces and a lower-case letter -- which is the next job, and never one of
+    # the `  # ===== name =====` banners between them.  `header` is everything
+    # before `steps:`, so a `needs:` found in it is THIS job's.
+    def job_block(name):
+        m = re.search(r"^  %s:\n(.*?)(?=^  [a-z]|\Z)" % re.escape(name),
+                      jtext, re.M | re.S)
+        return m.group(1) if m else None
+
+    jobs = re.findall(r"^  ([a-z][\w-]*):\n", jtext, re.M)
+    check("oci/ci: the workflow declares the five jobs", sorted(jobs),
+          ["freebsd", "linux", "manifest", "smoke", "test"])
+
+    # ---- 1. the image jobs are gated on the suites ------------------------
+    for name in ("linux", "freebsd"):
+        block = job_block(name)
+        if block is None:
+            check("oci/ci: the %s job was found" % name, name, "a job")
+            continue
+        header = block.split("    steps:")[0]
+        needs = re.search(r"^    needs:\s*(.+)$", header, re.M)
+        check_true("oci/ci: the %s job declares needs:" % name, needs is not None)
+        if needs:
+            check_true("oci/ci: ...and it is the test job, so a red suite "
+                       "publishes nothing at all -- not even an immutable tag",
+                       "test" in needs.group(1))
+
+    # ---- 2. the test job runs the release gate, strictly ------------------
+    tb = job_block("test")
+    if tb is None:
+        check("oci/ci: the test job was found", "test", "a job")
+    else:
+        check_true("oci/ci: the test job runs `make check`, so a suite added "
+                   "to the Makefile is a suite CI runs", "make check" in tb)
+        check_true("oci/ci: ...with --require-duckdb, so a run that skipped "
+                   "918 assertions cannot pass CI", "--require-duckdb" in tb)
+        check_true("oci/ci: ...and it installs the engine at the version the "
+                   "images pin, read out of the Containerfile",
+                   "ARG DUCKDB_VERSION=" in tb)
+        # The two Containerfiles are separate files with separate ARGs and
+        # nothing but this compares them.
+        check_true("oci/ci: ...and asserts the two Containerfiles pin the "
+                   "same engine", "Containerfile.freebsd.api" in tb
+                   and "Containerfile.linux.api" in tb)
+        # jq alone gates mixed mode, JSON validity and every usage-recording
+        # test in `test.sh`, and its absence is a printed skip and an exit 0.
+        check_true("oci/ci: ...and refuses to run without jq, whose absence "
+                   "test.sh handles by skipping and passing", "jq" in tb)
+
+    # ---- 3. every action is pinned to a commit ----------------------------
+    uses = re.findall(r"^\s*(?:- )?uses:\s*(\S+)(.*)$", text, re.M)
+    check_true("oci/ci: the workflow uses at least one action", len(uses) >= 4)
+    for ref, rest in uses:
+        _, _, version = ref.partition("@")
+        check_true("oci/ci: `%s` is pinned to a commit, not a moving tag"
+                   % ref.split("@")[0],
+                   bool(re.match(r"^[0-9a-f]{40}$", version)))
+        # The trailing comment is what makes a 40-character hex string
+        # readable.  (It is also what Dependabot would rewrite, if this
+        # repository configured it, which it does not.)
+        check_true("oci/ci: ...and the pin says which version it is",
+                   bool(re.search(r"#\s*v?\d", rest)))
+
+    # ---- least privilege --------------------------------------------------
+    #
+    # Per job, not once for the file. A workflow-level `permissions:` block
+    # would grant every job the union, and the test and smoke jobs have no
+    # business holding a token that can push an image.
+    for name in jobs:
+        block = job_block(name) or ""
+        header = block.split("    steps:")[0]
+        # COMMENT LINES INCLUDED, and that is the whole correctness of it.
+        # The first version matched a run of `      key: value` lines and
+        # stopped at the first line that was not one -- so a permission
+        # written UNDER a comment inside the block was simply not seen, and
+        # the "asks for nothing beyond" assertion below would have passed over
+        # a job quietly granted `id-token: write`.  The block now runs to the
+        # first line that is not indented six spaces or more.
+        perms = re.search(r"^    permissions:\n((?:      .*\n)+)",
+                          header, re.M)
+        check_true("oci/ci: the %s job declares its own permissions" % name,
+                   perms is not None)
+        if not perms:
+            continue
+        granted = dict(re.findall(r"^      ([A-Za-z][\w-]*):\s*(\S+)\s*$",
+                                  perms.group(1), re.M))
+        # `id-token` and `attestations` are what `actions/attest-build-
+        # provenance` needs, and they are allowed ONLY on the jobs that push
+        # something to attest.  Nothing published is otherwise
+        # distinguishable, on the registry, from anything a leaked
+        # `write:packages` token pushed under the same moving name -- and this
+        # server has no TLS, no token expiry and no rate limiting, so the
+        # artefact's authenticity is the only integrity control in the chain.
+        signing = {"linux", "freebsd", "manifest"}
+        allowed = {"contents", "packages"}
+        if name in signing:
+            allowed |= {"id-token", "attestations"}
+        check("oci/ci: %s asks for nothing beyond %s"
+              % (name, ", ".join(sorted(allowed))),
+              sorted(set(granted) - allowed), [])
+        check("oci/ci: %s does not ask for write on contents" % name,
+              granted.get("contents"), "read")
+        if name in ("test", "smoke"):
+            check("oci/ci: %s cannot push an image" % name,
+                  granted.get("packages"), None)
+            check("oci/ci: %s cannot sign anything either" % name,
+                  sorted(set(granted) & {"id-token", "attestations"}), [])
+        else:
+            check("oci/ci: %s can attest what it pushes" % name,
+                  (granted.get("id-token"), granted.get("attestations")),
+                  ("write", "write"))
+    check("oci/ci: there is no workflow-level permissions block granting "
+          "every job the union",
+          bool(re.search(r"^permissions:", text, re.M)), False)
+
+    # ---- the tag scheme ---------------------------------------------------
+    mb = job_block("manifest") or ""
+    # `:latest` means "the newest RELEASE". This repository has no tags, so it
+    # must not exist at all yet -- a `:latest` pointing at a development build
+    # is a wrong image served under the one name that promises it is not.
+    tagcase = mb.find("refs/tags/*)")
+    check_true("oci/ci: the manifest job has a refs/tags/* branch",
+               tagcase != -1)
+    for m in re.finditer(r"^.*:latest.*$", mb, re.M):
+        if m.group(0).lstrip().startswith("#"):
+            continue                        # the paragraph explaining the rule
+        check_true("oci/ci: :latest is pushed only from the release branch, "
+                   "so it does not exist before there is a release",
+                   tagcase != -1 and m.start() > tagcase)
+    # The moving tags name ONE branch: with two branches in the push trigger an
+    # unscoped `:testing` means "whichever built last".
+    check_true("oci/ci: the moving tags are scoped to one branch",
+               "DEV_BRANCH" in text and 'refs/heads/${DEV_BRANCH}' in mb)
+
+    # ---- the registry credential ------------------------------------------
+    #
+    # ASSERTED AS A SHAPE, not as a list of the three login lines that exist
+    # today, for the same reason the action pin is.  A `-p` value sits in the
+    # process's argv: readable by any other process in the job for the
+    # lifetime of the command, and liable to be echoed by a `set -x` somebody
+    # adds while debugging.  GitHub's log masking hides a secret in OUTPUT and
+    # does nothing whatever about argv.  Two of the three logins used `-p` and
+    # the third -- in the same file -- already used `--password-stdin`.
+    for pat, why in ((r'-p\s+"\$\{\{\s*secrets\.',
+                      "a secret passed with -p is in the process's argv"),
+                     (r'--password\s+"\$\{\{\s*secrets\.',
+                      "a secret passed with --password is in the argv too")):
+        offenders = [l.strip() for l in text.splitlines()
+                     if re.search(pat, l) and not l.strip().startswith("#")]
+        check("oci/ci: no run: block hands a secret on the command line -- %s"
+              % why, offenders, [])
+    logins = [l.strip() for l in text.splitlines()
+              if re.search(r"\b(docker|buildah) login\b", l)
+              and not l.strip().startswith("#")]
+    check_true("oci/ci: the logins this asserts about were found",
+               len(logins) >= 3)
+    check("oci/ci: and every one of them reads the token from stdin",
+          [l for l in logins if "--password-stdin" not in l], [])
+
+    # ---- the base images --------------------------------------------------
+    #
+    # `python:3.12-slim-bookworm` and `freebsd-runtime:<v>` are MOVING
+    # references their publishers re-point at will, and they are the largest
+    # executable input in either image -- measured moving within eight days in
+    # August 2026.  This file already argues that exact point at length for
+    # GitHub Actions and pins all four of them to commits; the same reasoning
+    # was not applied to the input contributing orders of magnitude more code,
+    # so two builds of one commit produced different images with nothing able
+    # to say so.  Each build job now resolves the tag to a digest, builds FROM
+    # that digest, and records both.
+    for job in ("linux", "freebsd"):
+        b = job_block(job) or ""
+        check_true("oci/ci: the %s job resolves its base to a digest" % job,
+                   "steps.base.outputs.digest" in b
+                   and "steps.base.outputs.ref" in b)
+        check_true("oci/ci: ...builds FROM that digest rather than the tag",
+                   "BASE_REF=${{ steps.base.outputs.ref }}" in b)
+        check_true("oci/ci: ...and records it as image.base.digest",
+                   "base.digest" in b or "BASE_DIGEST=" in b)
+        check_true("oci/ci: the %s job stamps claudio's own VERSION on the "
+                   "image, not a third party's" % job,
+                   "VERSION=${{ steps.ver.outputs.version }}" in b)
+        check_true("oci/ci: ...read from the claudio script rather than "
+                   "written down here",
+                   "sed -n 's/^VERSION=//p' claudio" in b)
+        check_true("oci/ci: and derives image.source from this repository, so "
+                   "a fork does not name someone else's",
+                   "SOURCE_URL=https://github.com/${{ github.repository }}" in b)
+
+    # ---- the manifest lists are assembled from digests ---------------------
+    #
+    # They were assembled from the `sha-<short>-…` TAG NAMES, resolved BY NAME
+    # minutes after being pushed, on the strength of those tags being
+    # immutable.  They are not: any re-run at the same commit re-points them,
+    # and the concurrency group is per-REF with `cancel-in-progress: false`, so
+    # a branch push and a tag push at one commit are two runs writing the same
+    # names -- either able to assemble the other's images under `:testing`.
+    adds = [l.strip() for l in mb.splitlines()
+            if "manifest add" in l and not l.strip().startswith("#")]
+    check_true("oci/ci: the manifest job assembles something at all",
+               len(adds) >= 3)
+    check("oci/ci: and every reference it adds is a DIGEST, never a tag",
+          [l for l in adds if "@$(cat" not in l], [])
+    for job in ("linux", "freebsd"):
+        b = job_block(job) or ""
+        check_true("oci/ci: the %s job writes the digest it pushed into the "
+                   "marker the manifest job reads" % job,
+                   "steps.push.outputs.digest" in b)
+
+    # ---- provenance --------------------------------------------------------
+    att = re.findall(r"uses:\s*actions/attest-build-provenance@([0-9a-f]{40})",
+                     text)
+    check_true("oci/ci: what is published is attested", len(att) >= 2)
+    check_true("oci/ci: ...and the attesting action is pinned to a commit "
+               "like every other one", all(len(x) == 40 for x in att))
+    # The whole expression, not the first token: `${{ steps... }}` has a
+    # space after the braces, so a `\S+` capture returns the literal `${{`
+    # and every assertion about the value is then about that.
+    subjects = [m.strip() for m in
+                re.findall(r"^\s*subject-digest:\s*(.+?)\s*$", text, re.M)]
+    check_true("oci/ci: the attestations name a subject at all", bool(subjects))
+    check("oci/ci: and every one of them is a DIGEST, never a moving tag",
+          [x for x in subjects
+           if "outputs.digest" not in x and "outputs.m_" not in x], [])
+    names = [m.strip() for m in
+             re.findall(r"^\s*subject-name:\s*(.+?)\s*$", text, re.M)]
+    check("oci/ci: each attestation is scoped to this image's own repository",
+          [x for x in names if "IMAGE_NAME" not in x], [])
+
+
+
+def _wf_jobs(text):
+    """Every job in `images.yml`, as `{name: block}`.
+
+    The same scoping the test above explains at length: `on:` has children at
+    the same two-space indent, so anything derived from the whole file reports
+    `push` and `schedule` as jobs.
+    """
+    jtext = text[text.index("\njobs:\n") + 1:]
+    out = {}
+    for m in re.finditer(r"^  ([a-z][\w-]*):\n(.*?)(?=^  [a-z]|\Z)",
+                         jtext, re.M | re.S):
+        out[m.group(1)] = m.group(2)
+    return out
+
+
+def _wf_steps(block):
+    """One job's steps, as a list of text blocks.
+
+    A step starts at a line that is exactly six spaces and `- `; everything up
+    to the next such line -- `run:` body, `with:` block and comments included
+    -- belongs to it.  Splitting on steps is what makes "this condition is on
+    THAT step" answerable at all, and the guard below is entirely about which
+    step a condition sits on.
+    """
+    m = re.search(r"^    steps:\n(.*)\Z", block, re.M | re.S)
+    if not m:
+        return []
+    body = m.group(1)
+    starts = [mm.start() for mm in re.finditer(r"^      - ", body, re.M)]
+    return [body[s:(starts[i + 1] if i + 1 < len(starts) else len(body))]
+            for i, s in enumerate(starts)]
+
+
+def test_oci_the_workflow_publishes_every_component_and_not_one_of_them():
+    """The split is only real if all four halves are PUBLISHED.
+
+    THIS IS THE GUARD THE PREVIOUS SHAPE COULD NOT BE.  An earlier revision
+    built all four components on every FreeBSD cell and pushed exactly one of
+    them: `matrix.component == 'api'` sat on the login, the push, the
+    attestation and the marker steps, so 18 of 24 cells did the whole build,
+    ran every check and threw the image away.  Every assertion in the sibling
+    test above passed -- the component axis was declared, `stage-freebsd.sh`
+    named it, `:testing` and `sha-${short}` were both in the file -- because
+    every one of them asks about the axis or about a string, and none of them
+    asks what happens to the artefact at the END of a cell.
+
+    So this one is about the steps.  A condition that narrows to one component
+    is legitimate on a step that CHECKS something only that component has (the
+    api is the only image with an engine to compare a version against); it is
+    the bug itself on a step that pushes, attests or records.
+
+    The other half is the naming.  `IMAGE_NAME` is a PREFIX now and every
+    published reference is `${IMAGE_NAME}-<component>`; a bare `${IMAGE_NAME}`
+    in a destination would publish four different programs to one repository,
+    where `:testing` cannot be resolved without also saying which program you
+    meant -- and a manifest list has no field for that, its platform keys being
+    already spent on os and architecture.
+    """
+    if not os.path.isfile(WORKFLOW):
+        check("oci/ci4: .github/workflows/images.yml was found", WORKFLOW,
+              "a file that exists")
+        return
+    text = open(WORKFLOW, encoding="utf-8").read()
+    jobs = _wf_jobs(text)
+
+    # ---- the name is a prefix, and every destination appends a component ---
+    m = re.search(r"^  IMAGE_NAME:\s*(.+?)\s*$", text, re.M)
+    check_true("oci/ci4: the workflow declares IMAGE_NAME", m is not None)
+    if m:
+        check("oci/ci4: ...and it is a prefix, not the retired whole-door "
+              "repository -- `claudio-server` means ship AND read in one "
+              "process, and no image is that any more",
+              m.group(1).endswith("claudio-server"), False)
+
+    # Every use of IMAGE_NAME outside its own declaration and outside a comment
+    # must be immediately followed by a component: either the literal `-` and
+    # one of the four, or `-${{ matrix.component }}`.
+    bad = []
+    for line in text.splitlines():
+        if line.strip().startswith("#") or re.match(r"^\s*IMAGE_NAME:", line):
+            continue
+        for mm in re.finditer(r"\$\{\{\s*env\.IMAGE_NAME\s*\}\}|\$\{IMAGE_NAME\}",
+                              line):
+            rest = line[mm.end():]
+            if re.match(r"^-\$\{\{\s*matrix\.component\s*\}\}", rest):
+                continue
+            if re.match(r"^-(%s)\b" % "|".join(COMPONENTS), rest):
+                continue
+            if re.match(r"^-\$\{comp\}", rest):
+                continue
+            bad.append(line.strip())
+    check("oci/ci4: every published reference names a component's own "
+          "repository", bad, [])
+
+    # ---- no publishing step is scoped to one component --------------------
+    #
+    # `matrix.component == '<x>'` on a step that pushes, signs or records is
+    # the exact shape of the regression: everything is built and one thing is
+    # kept.
+    publishing = ("buildah push", "docker push", "attest-build-provenance",
+                  "upload-artifact", "steps.push.outputs.digest",
+                  "buildah login", "docker login")
+    for job in ("linux", "freebsd"):
+        block = jobs.get(job)
+        if block is None:
+            check("oci/ci4: the %s job was found" % job, job, "a job")
+            continue
+        steps = _wf_steps(block)
+        check_true("oci/ci4: the %s job's steps were found" % job,
+                   len(steps) >= 5)
+        offenders = []
+        for step in steps:
+            cond = re.search(r"^\s*if:\s*(.+?)\s*$", step, re.M)
+            if not cond or "matrix.component ==" not in cond.group(1):
+                continue
+            # Comments explaining the rule are not the rule.
+            live = "\n".join(l for l in step.splitlines()
+                             if not l.strip().startswith("#"))
+            for needle in publishing:
+                if needle in live:
+                    offenders.append((job, needle,
+                                      cond.group(1).strip()[:60]))
+        check("oci/ci4: no step in the %s job publishes for one component "
+              "only -- building four and keeping one is a matrix that looks "
+              "like %s cells and ships a quarter of them" % (job, "24"),
+              offenders, [])
+
+        # And the build itself is driven by the axis rather than by a name.
+        live = "\n".join(l for l in block.splitlines()
+                         if not l.strip().startswith("#"))
+        check_true("oci/ci4: the %s job builds Containerfile.<os>.<component> "
+                   "from the matrix, not one hardcoded component" % job,
+                   "${{ matrix.component }}" in live)
+        # SCOPED TO THE BUILD AND THE IGNORE FILE, and deliberately not to
+        # every mention of a Containerfile: both jobs also READ
+        # `Containerfile.<os>.api` to get the pinned DuckDB version, which is
+        # correct -- the api is the only component with an engine to pin, and a
+        # version read out of the file that installs it is one place rather
+        # than two.  What must come from the axis is what gets BUILT.
+        for line in live.splitlines():
+            if not re.search(r"(-f|--ignorefile)\s", line):
+                continue
+            for comp in COMPONENTS:
+                check("oci/ci4: the %s job's build takes its Containerfile "
+                      "from the axis, never a hardcoded %s" % (job, comp),
+                      ("Containerfile.linux.%s" % comp) in line
+                      or ("Containerfile.freebsd.%s" % comp) in line, False)
+
+    # ---- the markers carry the component ----------------------------------
+    #
+    # The manifest job builds one set of lists per component and discovers its
+    # targets by globbing these names.  A marker without the component in it
+    # would make two components' digests collide in one file name, and the
+    # loser would simply not be published -- silently, since the glob would
+    # still match.
+    for job in ("linux", "freebsd"):
+        block = jobs.get(job) or ""
+        markers = re.findall(r'> "out/([^"]+)"', block)
+        check_true("oci/ci4: the %s job writes a marker" % job, bool(markers))
+        for name in markers:
+            check_true("oci/ci4: ...and it names the component (%s)" % name,
+                       "matrix.component" in name)
+
+    # ---- every component is attested, in its own repository ---------------
+    subjects = set()
+    for step in _wf_steps(jobs.get("manifest") or ""):
+        if "attest-build-provenance" not in step:
+            continue
+        mm = re.search(r"^\s*subject-name:\s*(.+?)\s*$", step, re.M)
+        if mm:
+            subjects.add(mm.group(1).strip())
+    named = set()
+    for s in subjects:
+        for comp in COMPONENTS:
+            if s.endswith("-" + comp):
+                named.add(comp)
+    check("oci/ci4: the manifest job attests a list for every component -- an "
+          "attestation on three of four leaves the fourth indistinguishable, "
+          "on the registry, from an image a leaked token pushed",
+          sorted(named), sorted(COMPONENTS))
+
+    # ---- the smoke job runs every component too ---------------------------
+    #
+    # It is the ONLY place a FreeBSD binary is executed anywhere in this
+    # workflow.  Scoped to the api, a completely broken staged tree for the
+    # other three passes every static check and publishes.
+    smoke = jobs.get("smoke") or ""
+    mm = re.search(r"^\s*component:\s*\[([^\]]*)\]", smoke, re.M)
+    check_true("oci/ci4: the smoke job declares a component axis",
+               mm is not None)
+    if mm:
+        got = sorted(x.strip() for x in mm.group(1).split(",") if x.strip())
+        check("oci/ci4: ...and it is exactly the four, because nothing else "
+              "in this workflow executes a FreeBSD instruction",
+              got, sorted(COMPONENTS))
+
+
+def test_oci_buildah_writes_the_credential_where_the_attestation_reads_it():
+    """"No credentials found for registry ghcr.io", and neither side was wrong.
+
+    `buildah login` writes `${XDG_RUNTIME_DIR}/containers/auth.json`.
+    `actions/attest-build-provenance` with `push-to-registry: true` pushes the
+    attestation itself, and its OCI client reads the DOCKER credential chain --
+    `$DOCKER_CONFIG/config.json`, else `~/.docker/config.json` -- and has no
+    option for the other path.  So a job that logs in with buildah and then
+    attests has a valid credential in a file the action does not open.
+
+    The file FORMAT is the same on both sides; only the default LOCATION
+    differs.  So the fix is one flag plus two exported variables, and it is
+    asserted PER JOB rather than as a string somewhere in the file: the Linux
+    job needs none of it, because `docker login` already writes exactly the
+    file the action reads, and asserting the fix globally would have passed on
+    a file where only the job that did not need it had it.
+    """
+    if not os.path.isfile(WORKFLOW):
+        check("oci/ci-auth: .github/workflows/images.yml was found", WORKFLOW,
+              "a file that exists")
+        return
+    text = open(WORKFLOW, encoding="utf-8").read()
+    checked = 0
+    for name, block in _wf_jobs(text).items():
+        live = "\n".join(l for l in block.splitlines()
+                         if not l.strip().startswith("#"))
+        if "buildah login" not in live:
+            continue
+        if "attest-build-provenance" not in live:
+            continue          # nothing to hand a credential to
+        checked += 1
+        login = [l for l in live.splitlines() if "buildah login" in l]
+        check("oci/ci-auth: %s logs in exactly once" % name, len(login), 1)
+        if login:
+            check_true("oci/ci-auth: %s names the Docker-style authfile on "
+                       "the login itself -- $GITHUB_ENV does not reach the "
+                       "step that sets it" % name,
+                       "--authfile" in login[0] and ".docker/config.json" in login[0])
+        for var in ("DOCKER_CONFIG", "REGISTRY_AUTH_FILE"):
+            check_true("oci/ci-auth: %s exports %s, so buildah's later pushes "
+                       "and the action read one file" % (name, var),
+                       ('echo "%s=' % var) in live)
+    # THE COUNT IS ASSERTED, because a guard whose loop body never runs is a
+    # guard that reports success about nothing -- and this one selects its
+    # jobs by two substrings, either of which a rename would take away.
+    check("oci/ci-auth: the jobs this asserts about were found", checked, 2)
+
+def test_oci_the_readme_says_what_about_the_freebsd_image_is_unverified():
+    """An untested assertion in a README is an untested assertion.
+
+    THIS GUARD ONCE ASSERTED THE OPPOSITE OF WHAT IT CLAIMED TO.  Its check was
+    `"never been built" in flat`, labelled "it says no FreeBSD image has been
+    built here" -- and when the README was corrected to say the image builds
+    fine with Docker BuildKit and has never been built *by buildah*, the
+    substring was still there, so the assertion went on passing while its own
+    label became false.  That is the "prose about the thing rather than the
+    thing" defect this file records twice already.
+
+    So the three claims are now asserted separately, because they are three
+    different facts and only one of them changed: `buildah` has never built it
+    (the tool CI uses, and the one three properties in this repository are
+    specifically about), it has never been RUN anywhere (no FreeBSD kernel
+    here, so `import duckdb` on FreeBSD is unexecuted), and nothing has been
+    pushed or pulled.
+    """
+    readme = os.path.join(os.path.dirname(HERE), "README.md")
+    if not os.path.isfile(readme):
+        check("oci/docs-bsd: server/README.md was found", readme,
+              "a file that exists")
+        return
+    flat = " ".join(open(readme, encoding="utf-8").read().split())
+    for needed in ("freebsd/freebsd-runtime", "buildah", "LD_LIBRARY_PATH",
+                   "py312-duckdb", "STORAGE_DRIVER"):
+        check_true("oci/docs-bsd: the README names %s" % needed, needed in flat)
+    check_true("oci/docs-bsd: it says buildah has never built it -- which is "
+               "the tool CI uses, and the one --format oci, --annotation and "
+               "STORAGE_DRIVER: vfs are all specifically about",
+               "never been built by `buildah`" in flat
+               or "never been built **by `buildah`**" in flat)
+    check_true("oci/docs-bsd: it says the image has never been RUN, which is "
+               "the claim a successful build most invites people to skip over",
+               "never been run" in flat.lower())
+    check_true("oci/docs-bsd: and that nothing has been pushed or pulled",
+               "pushed or pulled" in flat or "been pushed" in flat)
+    check_true("oci/docs-bsd: it labels the unverified claims as such",
+               "UNVERIFIED" in flat or "Unverified" in flat)
+    check_true("oci/docs-bsd: it says the workstation half is still not "
+               "containerised for FreeBSD either",
+               "make install" in flat)
+
+def test_mcp_tools_are_generated_from_the_served_spec_and_hold_no_copy():
+    """The tool list is built from `/api/v1/openapi`, not written down here.
+
+    A copy is a place to forget. This package already derives its route list,
+    its refusal vocabulary and its coverage bases from source rather than
+    restating them, and a tool list is the same hazard one layer out: a
+    hardcoded one describes an endpoint the server may not have, which a model
+    then calls and is refused by, with no way to tell a stale client from a
+    broken server.
+    """
+    spec = api.openapi(["/api/v1/" + r for r in
+                        ("search", "aggregate", "health", "diagnostics")])
+    tools = mcp.tools_from_spec(spec)
+    names = sorted(t["name"] for t in tools)
+    check("mcp: a tool per interesting route", names, ["aggregate", "search"])
+    check_true("mcp: operator routes are not handed to a model",
+               "health" not in names and "diagnostics" not in names)
+
+    search = [t for t in tools if t["name"] == "search"][0]
+    props = search["inputSchema"]["properties"]
+    check_true("mcp: parameters come from the spec, with their types",
+               props["since"]["type"] == "number" and
+               props["account"]["type"] == "string")
+
+    # The warning is on EVERY tool, not once in a server description a model may
+    # never read and certainly not in a README.
+    for t in tools:
+        check_true("mcp: %s warns that the empties differ" % t["name"],
+                   "THREE DIFFERENT ANSWERS" in t["description"])
+
+
+def test_mcp_a_refusal_is_an_error_not_an_empty_result():
+    """`no-data`, `filtered-to-nothing` and `unanswerable` reach the model as
+    three different things, and the last is flagged as an error.
+
+    An agent that reads a refusal as an empty list concludes there is no data
+    when there is, which is this project's cardinal sin with a model in the
+    loop instead of a person. `isError` is what stops it: a successful empty
+    answer and a refusal must not arrive looking alike.
+    """
+    ok = mcp._result({"outcome": "ok", "result": {"rows": []}})
+    check("mcp: an ok answer is not an error", ok["isError"], False)
+
+    nodata = mcp._result({"outcome": "no-data",
+                          "empty": {"kind": "no-data"}})
+    check("mcp: an empty corpus is an ANSWER, not an error",
+          nodata["isError"], False)
+    check_true("mcp: ...and says which empty it is",
+               "no-data" in nodata["content"][0]["text"])
+
+    ref = mcp._result({"outcome": "unanswerable",
+                       "refusal": {"reason": "crosses-accounts",
+                                   "remedy": "pass ?account=<uuid>"}})
+    check("mcp: a refusal IS an error", ref["isError"], True)
+    check_true("mcp: ...and carries the remedy through to the model",
+               "pass ?account=" in ref["content"][0]["text"])
+
+
+@contextlib.contextmanager
+def _running_mcp(base):
+    """`mcp.serve_http` in a thread, on a real port, shut down afterwards.
+
+    Same capture as `_running_door` and for the same reason: the `ready`
+    callback is handed the bound port, so there is nothing in it to shut down,
+    and a subclass left installed would mean the suite tested its own wrapper
+    from then on.
+    """
+    box = {}
+    started = threading.Event()
+    real = mcp.ThreadingHTTPServer
+
+    class Captured(real):
+        def __init__(self, *a, **k):
+            real.__init__(self, *a, **k)
+            box["httpd"] = self
+
+    mcp.ThreadingHTTPServer = Captured
+
+    def _run():
+        try:
+            mcp.serve_http(base, "127.0.0.1", 0,
+                           ready=lambda port: (box.__setitem__("port", port),
+                                               started.set()),
+                           quiet=True)
+        finally:
+            started.set()
+
+    err = io.StringIO()
+    old = sys.stderr
+    sys.stderr = err
+    thread = threading.Thread(target=_run, daemon=True)
+    thread.start()
+    started.wait(20)
+    sys.stderr = old
+    try:
+        yield box
+    finally:
+        if "httpd" in box:
+            box["httpd"].shutdown()
+        thread.join(20)
+        mcp.ThreadingHTTPServer = real
+
+
+MCP_MESSAGES = (
+    {"jsonrpc": "2.0", "id": 1, "method": "initialize"},
+    {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+    {"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+     "params": {"name": "accounts", "arguments": {}}},
+    {"jsonrpc": "2.0", "id": 4, "method": "tools/call",
+     "params": {"name": "nonsense", "arguments": {}}},
+    {"jsonrpc": "2.0", "id": 5, "method": "no/such/method"},
+)
+
+
+def test_mcp_both_transports_answer_identically():
+    """One `handle()`, two front ends, and the point is that they cannot drift.
+
+    Stdio is what a desktop client speaks and what composes with `docker run
+    -i`; Streamable HTTP is what sits behind the proxy beside the api.  A tool
+    that existed on one and not the other, or a refusal fixed on one only, is
+    exactly the drift this project spends its comments avoiding -- and it is
+    invisible, because whoever is using the other transport simply gets a
+    worse answer.
+
+    Driven against a REAL api over a real socket, and compared reply for reply:
+    the same five messages, the same token, byte-identical JSON out.
+    """
+    root, _store, _a = ui_store()
+    with open(os.path.join(root, "readers.json"), "w", encoding="utf-8") as fh:
+        json.dump({"r-all": serve.ALL_ACCOUNTS}, fh)
+    with open(os.path.join(root, "tokens.json"), "w", encoding="utf-8") as fh:
+        json.dump({"t": fx.uuid_of("alpha")}, fh)
+
+    with _running_door(root, ship_enabled=False) as (dbox, _out):
+        base = "http://127.0.0.1:%d" % dbox["port"]
+
+        # -- stdio ----------------------------------------------------------
+        stdin = io.StringIO("".join(json.dumps(m) + "\n"
+                                    for m in MCP_MESSAGES))
+        stdout = io.StringIO()
+        mcp.serve(mcp.Api(base, "r-all"), stdin=stdin, stdout=stdout)
+        over_stdio = [json.loads(l) for l in stdout.getvalue().splitlines()
+                      if l.strip()]
+
+        # -- http -----------------------------------------------------------
+        over_http = []
+        with _running_mcp(base) as mbox:
+            url = "http://127.0.0.1:%d%s" % (mbox["port"], mcp.PATH)
+            for msg in MCP_MESSAGES:
+                req = urllib.request.Request(
+                    url, data=json.dumps(msg).encode("utf-8"), method="POST")
+                req.add_header("Authorization", "Bearer r-all")
+                req.add_header("Content-Type", "application/json")
+                with urllib.request.urlopen(req, timeout=20) as fh:
+                    over_http.append(json.loads(fh.read()))
+
+    check("mcp-transports: stdio answered every message",
+          len(over_stdio), len(MCP_MESSAGES))
+    check("mcp-transports: http answered every message",
+          len(over_http), len(MCP_MESSAGES))
+
+    # TWO CALLS TO ONE API DIFFER IN THE CLOCK AND IN A COUNTER, AND THAT IS
+    # NOT THE TRANSPORTS DISAGREEING.  Nothing is cached -- a window's state is
+    # a function of `now`, so a report derived at T and served at T+2h reports
+    # as open a window that closed an hour ago -- and the measured cost travels
+    # in every payload.  So a second call legitimately carries a later `now`, a
+    # different `derived_ms`, one more `derivations` and an older
+    # `last_sample_age_s`.
+    #
+    # THE DIFFERING PATHS ARE ENUMERATED RATHER THAN THE VALUES BLANKED, which
+    # is the whole strength of this assertion.  Blanking a list of keys and
+    # then comparing hides any OTHER difference that happens to sit under one
+    # of them; listing what actually differed and requiring the set to be
+    # exactly the volatile four means a genuine divergence anywhere else -- a
+    # tool missing, a refusal worded differently, a token not forwarded -- is a
+    # named failure with its JSON path in the message.
+    VOLATILE = ("now", "derived_ms", "derivations", "last_sample_age_s")
+
+    def differing(x, y, path=""):
+        if type(x) is not type(y):
+            return [path or "/"]
+        if isinstance(x, dict):
+            out = []
+            for k in sorted(set(x) | set(y)):
+                if k not in x or k not in y:
+                    out.append(path + "/" + str(k))
+                else:
+                    out.extend(differing(x[k], y[k], path + "/" + str(k)))
+            return out
+        if isinstance(x, list):
+            if len(x) != len(y):
+                return [path + "[len]"]
+            out = []
+            for i, (p_, q_) in enumerate(zip(x, y)):
+                out.extend(differing(p_, q_, "%s[%d]" % (path, i)))
+            return out
+        return [] if x == y else [path]
+
+    # The tool results are JSON documents inside a string, so they are parsed
+    # before comparison -- otherwise every difference collapses into "the text
+    # differs" and says nothing about where.
+    def opened(reply):
+        r = reply.get("result")
+        if isinstance(r, dict) and isinstance(r.get("content"), list):
+            out = json.loads(json.dumps(reply))
+            for item in out["result"]["content"]:
+                if item.get("type") == "text":
+                    try:
+                        item["text"] = json.loads(item["text"])
+                    except ValueError:
+                        pass
+            return out
+        return reply
+
+    paths = differing([opened(r) for r in over_stdio],
+                      [opened(r) for r in over_http])
+    unexpected = [pp for pp in paths
+                  if pp.rsplit("/", 1)[-1].split("[")[0] not in VOLATILE]
+    check("mcp-transports: the two transports differ in NOTHING but the clock "
+          "and the derivation counter", unexpected, [])
+    # And the negative that keeps the assertion above from being vacuous: the
+    # walker must be able to SEE a difference, or "no unexpected paths" is a
+    # statement about a function that always returns [].
+    check_true("mcp-transports: ...and the walker can see one when there is one",
+               differing({"a": 1}, {"a": 2}) == ["/a"])
+    # The comparison is only worth anything if the replies have content in
+    # them: two empty lists agree perfectly.  So the shapes are named too.
+    by_id = {r.get("id"): r for r in over_stdio}
+    check_true("mcp-transports: ...over a real tool list",
+               len(by_id.get(2, {}).get("result", {}).get("tools", [])) > 5)
+    check_true("mcp-transports: ...a real tool call",
+               "content" in by_id.get(3, {}).get("result", {}))
+    check_true("mcp-transports: ...an unknown tool, refused",
+               by_id.get(4, {}).get("result", {}).get("isError") is True)
+    check_true("mcp-transports: ...and an unknown method",
+               by_id.get(5, {}).get("error", {}).get("code") == -32601)
+
+
+def test_mcp_a_spec_it_cannot_read_is_an_error_not_an_empty_tool_list():
+    """THE SILENT FAILURE THE HTTP TRANSPORT WOULD HAVE INTRODUCED.
+
+    The tool list is built from `/api/v1/openapi`, and that route sits behind
+    the same reader auth as everything else -- so over HTTP, where the
+    credential arrives on the request, the ordinary first failure is a 401,
+    whose envelope has no `result` key at all.  The line this replaces was
+    `(api.get(...) or {}).get("result") or {}`, which turns a 401, a 503, an
+    unreachable host and a renamed `/api/` prefix alike into `{}` -- and `{}`
+    into an EMPTY TOOL LIST, served with `"jsonrpc": "2.0"` and no error on it.
+    A model reading that concludes the server has no tools.
+
+    Three ways in, and each is named rather than flattened.  The third is the
+    interesting one: a spec that parsed, carried paths, and matched none of
+    `TOOLS` is PREFIX DRIFT -- somebody serving the API under a different
+    external path -- which is precisely the failure the proxy configuration
+    says breaks the MCP "first and silently".
+    """
+    class Refusing(object):
+        def __init__(self, env):
+            self.env = env
+
+        def get(self, path, params=None):
+            return self.env
+
+    unauth = {"outcome": "unanswerable",
+              "refusal": {"reason": "unauthorised",
+                          "detail": "no usable reader token on this request",
+                          "remedy": "send `Authorization: Bearer <token>`"}}
+    tools, refusal = mcp.tools_for(Refusing(unauth))
+    check("mcp-spec: a refused spec yields no tools", tools, [])
+    check("mcp-spec: ...and says so by name", refusal.get("reason"), "no-spec")
+    check_true("mcp-spec: ...carrying the api's own remedy",
+               "Authorization" in refusal.get("remedy", ""))
+
+    empty = mcp.tools_for(Refusing({"result": {"paths": {}}}))
+    check("mcp-spec: a spec with no paths is no-spec's sibling, not silence",
+          empty[1].get("reason"), "no-tools")
+    drift = mcp.tools_for(Refusing({"result": {"paths": {
+        "/read/v1/search": {"get": {}}, "/read/v1/accounts": {"get": {}}}}}))
+    check("mcp-spec: a renamed prefix is named as drift, not answered with []",
+          drift[1].get("reason"), "no-tools")
+    check_true("mcp-spec: ...and the remedy says the prefix is the cause",
+               "prefix" in drift[1].get("remedy", ""))
+
+    # AND THE HANDLER TURNS IT INTO A JSON-RPC ERROR, on both the list and the
+    # call -- not an empty array, and not a tool result with `isError` on it
+    # either: the tool never ran, and saying it did would be a second wrong
+    # answer on top of the first.
+    for method, params in (("tools/list", None),
+                           ("tools/call", {"name": "search", "arguments": {}})):
+        msg = {"jsonrpc": "2.0", "id": 9, "method": method}
+        if params:
+            msg["params"] = params
+        reply = mcp.handle(Refusing(unauth), msg)
+        check("mcp-spec: %s over a refused spec is an ERROR" % method,
+              "error" in reply, True)
+        check("mcp-spec: ...and carries no result at all (%s)" % method,
+              "result" in reply, False)
+        check("mcp-spec: ...at the application-error code (%s)" % method,
+              reply["error"]["code"], -32000)
+        check("mcp-spec: ...with the refusal attached (%s)" % method,
+              reply["error"]["data"]["reason"], "no-spec")
+
+    # `initialize` IS ANSWERED WITHOUT TOUCHING THE API, and that is not an
+    # oversight: it is a handshake about THIS process, and a client that cannot
+    # complete it cannot be told anything else -- including why the api is
+    # unreachable.
+    class Exploding(object):
+        def get(self, path, params=None):
+            raise AssertionError("initialize must not call the api")
+
+    reply = mcp.handle(Exploding(), {"jsonrpc": "2.0", "id": 1,
+                                     "method": "initialize"})
+    check("mcp-spec: initialize needs no api at all",
+          reply["result"]["protocolVersion"], mcp.PROTOCOL)
+
+
+def test_mcp_the_http_transport_holds_no_token_of_its_own():
+    """Its authority is exactly the caller's, and that is the whole component.
+
+    Over stdio the launcher IS the caller, so an ambient `CLAUDIO_API_TOKEN` is
+    right: one process, one client, one identity.  Served over HTTP it is a
+    privilege escalation in the one direction that matters -- a caller who
+    sends NO credential inherits the process's, and the surface starts
+    answering questions the caller was never entitled to ask.
+
+    Refused rather than ignored, and refused IN THE PROCESS THAT WOULD LEAK IT.
+    `entrypoint-mcp.sh` refuses it too, and that is not a duplicate for its own
+    sake: the entrypoint has a documented escape hatch, so the shell check is
+    the one that can be walked around and this one is not.
+    """
+    seen = []
+
+    class Recorder(object):
+        """A stand-in api that records which token reached it."""
+
+        def __init__(self, base, token=None, timeout=None):
+            seen.append(token)
+            self.base, self.token = base, token
+
+        def get(self, path, params=None):
+            return {"result": {"paths": {}}}
+
+    real_api = mcp.Api
+    mcp.Api = Recorder
+    try:
+        with _running_mcp("http://127.0.0.1:1") as box:
+            url = "http://127.0.0.1:%d%s" % (box["port"], mcp.PATH)
+
+            def post(token):
+                req = urllib.request.Request(
+                    url, data=b'{"jsonrpc":"2.0","id":1,"method":"tools/list"}',
+                    method="POST")
+                if token is not None:
+                    req.add_header("Authorization", token)
+                req.add_header("Content-Type", "application/json")
+                try:
+                    with urllib.request.urlopen(req, timeout=20) as fh:
+                        return fh.status, json.loads(fh.read())
+                except urllib.error.HTTPError as exc:
+                    return exc.code, json.loads(exc.read())
+
+            post("Bearer caller-one")
+            check("mcp-http: the caller's token is what reaches the api",
+                  seen[-1], "caller-one")
+            post("Bearer caller-two")
+            check("mcp-http: ...and a second caller gets their own",
+                  seen[-1], "caller-two")
+            post(None)
+            check("mcp-http: a caller with no credential gets NONE, never an "
+                  "ambient one", seen[-1], None)
+            post("Basic dXNlcjpwdw==")
+            check("mcp-http: a non-bearer scheme is not smuggled through",
+                  seen[-1], None)
+
+            # AND IT SPEAKS ONE ROUTE.  A GET, or any other path, is a named
+            # refusal that says where the data actually lives -- a 404 with no
+            # route out of it is how a client author concludes the server is
+            # broken.
+            req = urllib.request.Request(url, method="GET")
+            try:
+                urllib.request.urlopen(req, timeout=20)
+                status, doc = 200, {}
+            except urllib.error.HTTPError as exc:
+                status, doc = exc.code, json.loads(exc.read())
+            check("mcp-http: GET /mcp is a named refusal",
+                  (status, doc.get("refusal", {}).get("reason")),
+                  (404, "no-such-route"))
+            check_true("mcp-http: ...naming the route that does exist",
+                       mcp.PATH in doc["refusal"]["remedy"])
+    finally:
+        mcp.Api = real_api
+
+    # THE AMBIENT-TOKEN REFUSAL, run rather than read.
+    env = dict(os.environ)
+    env["CLAUDIO_API_TOKEN"] = "ambient"
+    proc = subprocess.run(
+        [sys.executable, os.path.join(fx.SRV_DIR, "srv", "mcp.py"),
+         "--http", "--host", "127.0.0.1", "--port", "0",
+         "--api", "http://127.0.0.1:1"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+    check("mcp-http: an ambient token in --http mode exits 7",
+          proc.returncode, 7)
+    err = proc.stderr.decode("utf-8", "replace")
+    check_true("mcp-http: ...and the message names the transport it belongs to",
+               "stdio" in err)
+    check("mcp-http: ...and nothing bound", "listening" in err, False)
+
+
+def test_mcp_holds_no_authority_of_its_own():
+    """It is an HTTP client of the read API, and that is the whole of what it
+    can do.
+
+    Handing it the DuckDB handle would have been fewer moving parts and a
+    privilege escalation: an agent with a database handle is bounded by nothing
+    the operator configured, where a reader token's scope is exactly the
+    accounts someone chose. A transport failure is reported as a refusal with a
+    remedy rather than raised, because a model cannot act on a traceback.
+    """
+    src = open(os.path.join(fx.SRV_DIR, "srv", "mcp.py"),
+               encoding="utf-8").read()
+    for forbidden in ("import duckdb", "from . import store", "from . import duck",
+                      "from . import query"):
+        check_true("mcp: does not reach past the API (%s)" % forbidden,
+                   forbidden not in src)
+    check_true("mcp: the token is the only credential it holds",
+               "Authorization" in src and "Bearer" in src)
+
+    dead = mcp.Api("http://127.0.0.1:1", token="t", timeout=1)
+    env = dead.get("/api/v1/search")
+    check("mcp: an unreachable door is a refusal, not a traceback",
+          env["outcome"], "unanswerable")
+    check_true("mcp: ...naming what to check",
+               "reachable" in env["refusal"]["remedy"])
+
+
+def test_a_key_carries_its_own_account_so_nobody_hunts_a_uuid():
+    """`<account-uuid>.<secret>` says which account it ships for.
+
+    The step this deletes was the entire complaint about setting the server up.
+    A token's value had to EQUAL the shipping account's account_uuid -- the door
+    refuses the batch otherwise -- and that uuid lives in `.claude.json` on the
+    workstation, which is not a machine the person configuring the server can
+    see. So they copied a 36-character string between hosts and got a 409 with
+    no clue in it when they got it wrong.
+    """
+    uuid = fx.uuid_of("alpha")
+    key = uuid + ".k7Qm3vX9pR2wL8nT4bY6cH1sD5fG0jZa"
+
+    acct, secret = serve.split_key(key)
+    check("key: the left half is the account", acct, uuid)
+    check("key: the right half is the secret", secret,
+          "k7Qm3vX9pR2wL8nT4bY6cH1sD5fG0jZa")
+
+    # A bare list is the shape to write now: one line each, nothing to look up.
+    t = serve.Tenants(mapping=[key])
+    check("key: a list of keys needs no account column", t.resolve(key), uuid)
+    check("key: and the account is what it says", t.tenants(), [uuid])
+
+    # The map still works, because it is what is deployed and because a plain
+    # opaque token has nowhere to say which account it means.
+    old = serve.Tenants(mapping={"plain-token": uuid})
+    check("key: an old plain token still resolves", old.resolve("plain-token"),
+          uuid)
+    check("key: and an unknown one still does not", old.resolve("nope"), None)
+
+
+def test_a_key_is_never_guessed_at():
+    """Anything that is not exactly `<valid-uuid>.<secret>` is left alone.
+
+    A token that merely CONTAINS a dot must not be reinterpreted as naming an
+    account it does not name: that would file one tenant's records under
+    another's, silently, which is worse than any refusal.
+    """
+    for bad in ("no-dots-at-all",
+                "not-a-uuid.k7Qm3vX9pR2wL8nT4bY6cH1sD5fG0jZa",
+                fx.uuid_of("alpha") + ".short",
+                fx.uuid_of("alpha") + ".has spaces in it",
+                "." + fx.uuid_of("alpha")):
+        acct, secret = serve.split_key(bad)
+        check("key: %r is not read as a key" % bad[:28], (acct, secret),
+              (None, bad))
+
+    # A list entry that is not self-describing is refused BY NAME, because the
+    # shape carries the meaning and a silent skip would leave a machine
+    # unable to ship with nothing saying why.
+    t = serve.Tenants(mapping=["plain-token-in-a-list"])
+    check("key: a plain token in a list is refused", len(t.refused), 1)
+    check_true("key: ...and told which form it needs",
+               "object form" in t.refused[0][1])
+    blob = repr(t.refused)
+    check("key: the refusal never echoes the token",
+          "plain-token-in-a-list" in blob, False)
 
 
 TESTS = ([v for k, v in sorted(globals().items()) if k.startswith("test_")]

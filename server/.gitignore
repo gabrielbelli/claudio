@@ -1,3 +1,26 @@
 __pycache__/
 *.pyc
 .store/
+
+# The two token files. A token in a repository is not a token; write your own:
+#   echo '{"dev-reader": "*"}'                   > server/readers.json
+#   echo '["<account-uuid>.<secret>"]'            > server/tokens.json
+readers.json
+tokens.json
+
+# The staged FreeBSD package trees: hundreds of MB of somebody else's binaries,
+# one per component, rebuilt by `server/oci/stage-freebsd.sh` in seconds and
+# never a source of truth.
+oci/stage-freebsd*/
+oci/rootfs*
+oci/*.version
+oci/*.manifest
+
+# The compose stack's per-operator settings: the domain, the TLS directory and
+# the paths to the two token files. `compose.yml` tells you to write it, so it
+# is a file that WILL exist on every deployment -- and it names a host's real
+# certificate directory and can point at the token files themselves. Committing
+# one publishes another machine's layout and makes `docker compose up` in a
+# fresh checkout read somebody else's paths. `oci/.env.example` is the copy
+# that IS tracked.
+oci/.env

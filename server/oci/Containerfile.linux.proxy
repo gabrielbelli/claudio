@@ -1,0 +1,124 @@
+# claudio's PROXY, as a Linux OCI image.  The only published port in the stack.
+#
+#       https://host/sender   -> ingest  POST /v1/ship
+#       https://host/api/     -> api     GET  /api/v1/*
+#       https://host/mcp      -> mcp     POST /mcp
+#
+# WHAT IS NOT IN THIS IMAGE, AND WHY THAT IS THE POINT
+#
+#   No Python, no `server/srv/`, no store, no token file, no DuckDB.  This
+#   image proxies bytes: it parses no record, holds no credential, opens no
+#   store and has no interpreter to do any of it with.  Leaving the package out
+#   of the CONTEXT rather than merely out of the COPY list means a later edit
+#   cannot put it back without also editing
+#   `Containerfile.linux.proxy.dockerignore`, which is a decision somebody has
+#   to make on purpose.
+#
+#   IT ADDS NO AUTHENTICATION EITHER, AND MUST NOT BE GIVEN ANY.  The
+#   `Authorization` header is forwarded untouched; who may ship is
+#   `tokens.json` on the ingest service and who may read is `readers.json` on
+#   the api.  A second gate here would be a second place for scope to be
+#   decided, and the two would eventually disagree about an account.
+#
+# WHY THE ROUTES ARE THREE FILES AND NOT ONE
+#
+#   `claudio-locations.conf` is the route list and is included by BOTH server
+#   blocks -- the plain one on 8080 and the TLS one on 8443 -- so a route fixed
+#   once is fixed on both listeners.  `claudio.conf` holds the upstreams and
+#   the plain server, `claudio-tls.conf` the TLS one; both are shared with the
+#   FreeBSD proxy image byte for byte, and only `nginx.linux.conf` is
+#   base-specific.
+#
+# Build, from the REPOSITORY ROOT.  BuildKit finds the ignore file beside this
+# one by name:
+#
+#   docker build -f server/oci/Containerfile.linux.proxy \
+#       -t ghcr.io/<owner>/claudio-proxy:testing-linux-amd64 .
+
+# Alpine here and not Debian, and it is the one image in this stack where that
+# is right: there is no Python and therefore no manylinux wheel to link against
+# a libc, which is the entire reason the other three are Debian.  Built and
+# measured on this machine: 94.2 MB, against 215/302/213 MB for the other
+# three.
+ARG BASE_REF=nginx:alpine
+FROM ${BASE_REF}
+
+# TWO PACKAGES AND ONE `mkdir`, AND BOTH EARN THEIR LAYER.
+#
+# `openssl` is what makes the shipped TLS configuration safe to ship:
+# `entrypoint-proxy.sh` generates a self-signed certificate when none has been
+# mounted, so nginx never meets a missing `ssl_certificate` and exits.  Without
+# it this image would refuse to start on a fresh clone -- see the refusal in
+# that script, which names the openssl command to run on the host instead.
+#
+# `/var/tmp/nginx` is where the pid file and every temporary directory are
+# moved to, because the compiled-in ones are owned by the `nginx` user and this
+# image runs as 65534.  A request with a body large enough to spill would
+# otherwise fail on a write nobody can see coming.
+RUN set -eu; \
+    apk add --no-cache openssl; \
+    mkdir -p /var/tmp/nginx /etc/claudio/tls /etc/claudio/nginx.d; \
+    chown -R 65534:65534 /var/tmp/nginx /etc/claudio/tls; \
+    chmod 700 /etc/claudio/tls
+
+# The configuration.  The default `/etc/nginx/nginx.conf` is REPLACED rather
+# than added to: the base's own carries a `user nginx;` this image cannot
+# honour and a `pid` this image cannot write.
+COPY server/oci/nginx/nginx.linux.conf /etc/nginx/nginx.conf
+COPY server/oci/nginx/claudio.conf \
+     server/oci/nginx/claudio-tls.conf \
+     server/oci/nginx/claudio-locations.conf \
+     /etc/nginx/
+COPY server/oci/entrypoint-proxy.sh /usr/local/bin/entrypoint-proxy.sh
+COPY LICENCE /usr/share/licenses/claudio-proxy/LICENCE
+
+# The base image ships `/docker-entrypoint.sh` and a `/docker-entrypoint.d`
+# that runs envsubst over templates and then `chown`s things as root.  None of
+# it is wanted here -- the configuration is not templated, and this image never
+# runs as root -- and leaving it in place would mean two entrypoints, one of
+# which quietly rewrites the other's inputs.
+RUN rm -rf /docker-entrypoint.sh /docker-entrypoint.d
+
+# NUMERIC, both halves, for the reason the other three Containerfiles give:
+# 65534 is `nobody` on Debian, Alpine and FreeBSD, but the GROUP is `nogroup`
+# on some and `nobody` on others.
+#
+# A PROCESS THAT IS NOT ROOT CANNOT BIND BELOW 1024, which is why this image
+# listens on 8080 and 8443 and the PUBLISH mapping is where they become 80 and
+# 443.  Running as root to get the low port would trade the one privilege this
+# stack does not need for a number the runtime maps for free.
+USER 65534:65534
+
+# Documentation only -- `EXPOSE` publishes nothing.
+EXPOSE 8080 8443
+
+# NO `HEALTHCHECK`: the OCI image spec has no field for one, so a `--format
+# oci` build drops it while a Docker-format build of the identical file keeps
+# it -- it appears to work locally and vanishes on publish.  In compose:
+#
+#   healthcheck:
+#     test: ["CMD", "wget", "-q", "-O-", "http://127.0.0.1:8080/"]
+#
+# and note that a 404 from the catch-all is the HEALTHY answer here: this proxy
+# publishes three routes and `/` is deliberately not one of them.  `wget` exits
+# non-zero on a 404, so gate on the process answering at all rather than on the
+# status -- `nc -z 127.0.0.1 8080` is the honest check.
+
+ARG SOURCE_URL=https://github.com/gabrielbelli/claudio
+ARG REVISION=unspecified
+ARG VERSION=unspecified
+ARG BASE_NAME=docker.io/library/nginx:alpine
+ARG BASE_DIGEST=unspecified
+
+LABEL org.opencontainers.image.title="claudio-proxy" \
+      org.opencontainers.image.description="The claudio stack's front end: nginx, the only published port. /sender to ingest, /api/ to the read API, /mcp to the MCP surface. Holds no token and adds no authentication. Linux build." \
+      org.opencontainers.image.source="${SOURCE_URL}" \
+      org.opencontainers.image.revision="${REVISION}" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.licenses="BSD-2-Clause" \
+      org.opencontainers.image.base.name="${BASE_NAME}" \
+      org.opencontainers.image.base.digest="${BASE_DIGEST}" \
+      com.claudio.engine="none -- this component parses nothing" \
+      com.claudio.component="proxy"
+
+ENTRYPOINT ["/usr/local/bin/entrypoint-proxy.sh"]

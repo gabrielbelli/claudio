@@ -1,0 +1,1969 @@
+name: images
+
+# Builds and publishes the SERVER as OCI images, for Linux and for FreeBSD.
+#
+# WHAT IS PUBLISHED AND WHAT IS NOT.  Only `server/` goes into an image: the
+# ingest service, the read API and its DuckDB query layer, the MCP surface and
+# the nginx front end.  `claudio` itself,
+# the on-demand OTLP receiver and the shipper are the WORKSTATION half -- they
+# are installed with `make install`, have no third-party dependency at all, and
+# `claudio usage show` works offline with no server and no daemon.  Putting them
+# in an image would suggest a container is a supported way to run them.  It is
+# not.
+#
+# TWO OPERATING SYSTEMS, TWO BUILD TOOLS, AND THE REASON IS NOT TASTE.
+#
+#   Linux is built with `docker buildx`, ONE ARCHITECTURE PER NATIVE RUNNER.
+#   That is measured, not preferred: a single
+#   `--platform linux/amd64,linux/arm64` run installs the amd64 DuckDB wheel
+#   perfectly and then dies importing it --
+#   `qemu: uncaught target signal 11 (Segmentation fault)`, exit 139 -- and it
+#   is DuckDB specifically, because CPython, ssl and hashlib all run under the
+#   identical emulated container.  The obvious wrong response is to delete the
+#   build's import assertion so an emulated build goes green; that publishes an
+#   amd64 image whose engine has never once been imported.
+#
+#   FreeBSD is built with `buildah`, all 24 cells on ordinary Linux runners,
+#   because the FreeBSD Containerfiles have NO `RUN` instruction: `FROM`/`COPY`
+#   execute nothing, so with every package staged beforehand by
+#   `stage-freebsd.sh` a Linux kernel never has to execute a FreeBSD binary.
+#   That technique is `gabrielbelli/freebsd-oauth2-proxy-oci`'s and this
+#   repository took it wholesale.
+#
+# FOUR COMPONENTS, FOUR REPOSITORIES, AND THE SAME TAG SCHEME IN EACH.
+#
+#   `claudio-ingest`   POST /v1/ship. The only writer; holds the store lock.
+#                      Standard library only -- no DuckDB.
+#   `claudio-api`      GET /api/v1/*. DuckDB over the JSONL in place plus the
+#                      pure reconciler. Read-only; takes no lock.
+#   `claudio-mcp`      POST /mcp. An HTTP client of claudio-api, forwarding the
+#                      caller's own bearer token. No store, no engine.
+#   `claudio-proxy`    nginx. The only published port.
+#
+#   FOUR REPOSITORIES AND NOT ONE, because a manifest list keys its entries on
+#   os and architecture and there is no third field.  A single repository
+#   carrying all four would make `:testing` a name that cannot be resolved
+#   without also saying which program you meant -- and the runtime, which is
+#   what resolves it, has no way to be told.
+#
+#   THE BUILD MATRICES CROSS COMPONENT AGAINST PLATFORM: 4x2 Linux cells, 4x6
+#   FreeBSD cells, and four FreeBSD smoke cells.  Two of the four need no
+#   DuckDB and that was measured rather than assumed -- ingest and mcp stage
+#   60.5 MiB against the api's 120.7 -- so the per-component checks below
+#   assert the ABSENCE of the engine in the artefact, not merely that no
+#   Containerfile installs it.
+#
+# THE TAG SCHEME, AND WHAT EACH NAME PROMISES.  It is per repository: each of
+# the four carries its own `:testing`, its own `sha-<short>*` set and, when
+# there is a release, its own release tag.
+#
+#   sha-<short>[-<os|base>][-<arch>]   every non-PR build, always
+#
+#       The per-commit half.  It is what a deployment should name and what a
+#       rollback needs, because a moving tag cannot answer "put back exactly
+#       what was running on Tuesday".
+#
+#       IT IS CONVENTIONALLY NOT OVERWRITTEN, AND IT IS NOT IMMUTABLE.  This
+#       comment used to call it "the only tag here that can never be
+#       re-pointed" and that was simply false: a registry tag is mutable by
+#       anyone with push rights, and this workflow re-points it itself on
+#       every re-run, `workflow_dispatch` or scheduled build at the same
+#       commit -- which need not produce the same bytes, since both bases and
+#       the FreeBSD `latest` package branch float.  A DIGEST is the only thing
+#       in a registry that cannot move, so the build jobs print theirs, the
+#       manifest job assembles from them rather than from these names, and a
+#       deployment that must not move pins `@sha256:…`.
+#
+#       Every multi-platform list below is ASSEMBLED from those digests and
+#       then pushed under its moving name, so the moving names are aliases for
+#       a set of images that already exists rather than a second,
+#       separately-built thing.  One set of lists per component, into that
+#       component's own repository.
+#
+#   testing, testing-linux, testing-freebsd, testing-<base>
+#                                      pushes to $DEV_BRANCH only
+#
+#       The moving head of development, and what the user asked for.  It is
+#       explicitly NOT a release: it is published on the build's own checks
+#       and it changes under anyone who pulls it.  It names ONE branch on
+#       purpose -- with two branches in the push trigger, an unscoped
+#       `:testing` would mean "whichever of them built last", which is a name
+#       nobody can reason about and a wrong image nobody is told about.  A run
+#       on any other ref publishes its sha- tags and says out loud that it did
+#       not move `:testing`.
+#
+#   <git tag>, e.g. v0.2.0             refs/tags/v*, and only if smoke passed
+#
+#       The release.  Gated on the FreeBSD smoke job by name, because that job
+#       is the only place `import duckdb` is ever executed on FreeBSD; without
+#       it the numpy/pandas exclusion is an inference and a release is a claim.
+#       The `test` job asserts that the tag and `claudio`'s own VERSION agree,
+#       because an image published under a name it does not answer to is wrong
+#       for ever and silently.
+#
+#   latest                             the same, and NOT BEFORE THEN
+#                                      (all four, or none: the release loop
+#                                       runs after the gate, so a stack cannot
+#                                       go half-released)
+#
+#       `:latest` means "the newest RELEASE", and this repository has no tags
+#       at all -- the same fact `claudio update` has to state when it looks for
+#       one.  So `:latest` does not exist yet, and a `docker pull ...:latest`
+#       today fails with a manifest-unknown.  That is the intended behaviour
+#       and it is the honest one: pointing `:latest` at a development build
+#       would hand an operator an unreleased image while telling them it was
+#       the release, which is this project's cardinal sin in registry form.  An
+#       error message is recoverable; a plausible wrong image is not.
+#
+# DELIBERATELY ABSENT, so nobody adds them back as an oversight:
+#
+#   * a bare `<version>` tag taken from `claudio`'s VERSION.  The git tag
+#     already carries it and the `test` job asserts the two agree; a second
+#     spelling of one fact is a second place for it to be wrong.
+#   * moving PER-ARCHITECTURE tags (`testing-linux-amd64`).  A name that moves
+#     AND names one platform answers no question the per-commit
+#     `sha-<short>-linux-amd64` does not already answer exactly.
+#   * a branch-named moving tag for `master`.  It is strictly behind
+#     $DEV_BRANCH today, so `:master` would advertise an image nobody should
+#     pull.
+#
+# ACTIONS ARE PINNED TO A COMMIT, NOT TO A TAG.  A major tag such as `@v5` is a
+# MOVING reference its publisher re-points at will, and every job below runs
+# with `packages: write` and a registry token in scope -- so `@v5` is "whatever
+# an unreviewed third party means by v5 on the morning of the build", with the
+# ability to push an image under this repository's name.  A commit SHA cannot
+# be re-pointed.  The version in the trailing comment is what makes the pin
+# READABLE -- and it is what Dependabot rewrites IF anybody configures it,
+# which nobody has: there is no `.github/dependabot.yml` in this repository,
+# so bumping these is a manual act and saying otherwise would put a
+# maintenance story on a file that has none.  A bare 40-character hex string
+# is a number nobody can check.  Resolved with `git ls-remote --tags` against
+# each repository on 2026-08-21, and re-resolved when the attestation action
+# was added:
+#
+#   actions/checkout          v5.1.0  fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+#   actions/upload-artifact   v4.6.2  ea165f8d65b6e75b540449e92b4886f43607fa02
+#   actions/download-artifact v4.3.0  d3f86a106a0bac45b974a628896c90dbdf5c8093
+#   vmactions/freebsd-vm      v1.5.3  83b151f58c6047089f4c80eb5ba2039d158ce093
+#   actions/attest-build-provenance
+#                             v4.2.2  4d101475d8b20a2381f78447822ac1eab6504dd8
+#
+# The last one is the newest tag that repository publishes, and it is worth
+# saying how it got here: the first draft of that line carried a 40-hex string
+# that LOOKED like v3.0.0's and matched no commit in that repository at all.
+# `git ls-remote` is the whole difference between a pin and a plausible number.
+#
+# The MAJORS are the ones this workflow was written against and were not bumped
+# while pinning them: pinning is what makes bumping one a deliberate, reviewable
+# act, and doing both in one edit would have been an unverifiable upgrade
+# smuggled in under a security change.  Nothing here has ever been run -- see
+# "WHAT IS NOT VERIFIED" at the foot of this file.
+#
+# TRIGGERS.  `pre-release` is deliberately absent: it is the published squash
+# and nothing here may touch it.
+on:
+  push:
+    # `pre-release` is the published branch and the one CI runs on.
+    # `accounts-and-tags` is the local development branch and is deliberately
+    # absent: it is not pushed, so a trigger naming it would never fire, and
+    # naming it would invite pushing it.
+    branches: [master, pre-release]
+    tags: ['v*']
+  pull_request:
+  # FreeBSD rebuilds every port when a toolchain moves, without the application
+  # version changing, and the DuckDB wheels and the Debian base move on their
+  # own too.  A weekly build picks those up; without it the images sit on
+  # whatever was current the day somebody last pushed.
+  schedule:
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+
+# Two pushes in quick succession would otherwise race to publish the same
+# moving tags, and the winner would be whichever run happened to finish last --
+# a `:testing` naming a commit nobody can predict from the log.  Runs are
+# QUEUED, not cancelled: cancelling a run part-way through `manifest push`
+# leaves a half-assembled list under a name people pull.
+#
+# WHAT THIS DOES NOT SERIALISE, STATED RATHER THAN LEFT TO BE DISCOVERED: the
+# group is per-REF, and a branch push and a tag push AT THE SAME COMMIT are
+# different refs.  Those two runs overlap, and both write the same
+# `sha-<short>-*` names.  That used to mean either run could assemble
+# `:testing` and a release list out of the OTHER run's images, because the
+# manifest job resolved those names at assembly time; it no longer can,
+# because every list is now assembled from the digest each build job captured
+# from its own push.  A wider group keyed on the SHA was considered and
+# rejected: it would make a release build wait behind an unrelated branch
+# build of the same commit, for a race the digests already close.
+concurrency:
+  group: images-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  # A PREFIX, NOT A REPOSITORY.  Every published name is
+  # `${IMAGE_NAME}-<component>`: `claudio-ingest`, `claudio-api`,
+  # `claudio-mcp`, `claudio-proxy`.  `ghcr.io/<owner>/claudio` itself is never
+  # pushed and does not exist.
+  #
+  # `claudio-server` IS RETIRED RATHER THAN RE-POINTED, and that is the whole
+  # of the naming decision.  That name means THE WHOLE DOOR -- ship and read in
+  # one process -- and after the split no single image is that.  Publishing the
+  # api half under it would silently change what an existing puller receives:
+  # `POST /v1/ship` answering 503 `no-ship` under an unchanged name, which is a
+  # wrong image served under a name that promises the right one.  Publishing
+  # the INGEST half under it would be the same fault pointed the other way.  So
+  # nothing is published there at all; a pull fails with manifest-unknown,
+  # which is an error somebody can act on rather than a service that half
+  # works.  (Nothing has ever been pushed to it -- see WHAT IS NOT VERIFIED --
+  # so no puller is being broken today; the rule is written down so that stays
+  # true.)
+  IMAGE_NAME: ${{ github.repository_owner }}/claudio
+  # Which FreeBSD base the unsuffixed FreeBSD tags point at, and the only one
+  # that may appear in the mixed-OS `:testing` list -- see the manifest job.
+  DEFAULT_FREEBSD: freebsd15.1
+  # The one branch the moving `:testing*` tags are published from.  It is
+  # `accounts-and-tags` today because that is where the work is: `master` is
+  # 21 commits behind it and does not yet carry this workflow at all.  When
+  # this lands on master, THIS ONE LINE MOVES and the rest of the file is
+  # unchanged.
+  #
+  # One consequence, stated rather than left to be discovered: GitHub always
+  # runs a `schedule:` on the repository's DEFAULT branch, so while DEV_BRANCH
+  # is not the default branch the weekly build publishes its per-commit sha-
+  # tags and does NOT refresh `:testing`.  The manifest job prints that, by
+  # name, on every such run -- a tag that quietly stopped moving is exactly the
+  # silence this project exists to refuse.
+  DEV_BRANCH: accounts-and-tags
+  # NOT a performance knob, and deleting it publishes an image that panics on
+  # pull.  With the overlay driver buildah leaves overlayfs bookkeeping
+  # attributes (user.overlay.impure, user.overlay.origin) on any directory a
+  # COPY merges into.  user.overlay.origin has an EMPTY value, and podman on
+  # FreeBSD indexes value[0] when applying it, so the pull panics:
+  #   ExtattrSetLink ... index out of range [0] with length 0
+  # vfs produces no such attributes.  The xattr check in the FreeBSD build job
+  # is the belt to this braces.
+  STORAGE_DRIVER: vfs
+
+jobs:
+  # ============================================================ test =======
+  #
+  # THE FOUR SUITES, AND NOTHING IS ALLOWED TO SKIP ITSELF QUIET HERE.
+  #
+  # Every image job below has `needs: test`, so a red suite publishes nothing
+  # at all -- not even a per-commit sha- tag.  That is the whole reason this
+  # job exists first in the file.
+  #
+  # `make check` is what runs, rather than four commands copied out of it.
+  # That target IS this project's release gate and it names the suites in one
+  # place; a CI job holding its own copy of the list is a second place to
+  # forget one, which is the same argument `CONFIG_MAP` and `LOGGING_LEGACY`
+  # are made of.
+  #
+  # THE ENGINE IS INSTALLED AT THE VERSION THE IMAGES PIN, read out of
+  # `Containerfile.linux.api` rather than written here.  Testing one DuckDB and
+  # shipping another is precisely the class of fault `srv/duck.py` spends five
+  # refusals on: every one of those refusals is written against behaviour
+  # MEASURED on the pinned version, so a suite run against a different engine
+  # is evidence about an engine nobody ships.
+  #
+  # `--require-duckdb` is redundant and is passed anyway.  The suite has exited
+  # non-zero on a self-skip since `make check` was caught exiting 0 over 918
+  # assertions that had never run; the flag is `compose.yml`'s convention, an
+  # environment built specifically to supply the engine saying so out loud --
+  # and a redundant guard is only redundant for as long as the other one holds.
+  test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5.1.0
+
+      # ASSERTED, NOT INSTALLED-AND-HOPED.  Each of these is a tool whose
+      # ABSENCE `test.sh` handles by printing `(skipped -- ...)` and carrying
+      # on green: jq alone gates mixed mode, JSON validity and EVERY
+      # usage-recording test.  What is asserted is the CAUSE -- the tool on
+      # $PATH -- and not the message, because a reworded message is exactly how
+      # a guard goes vacuous while still looking like one.
+      - name: The tools whose absence would be a silent skip
+        run: |
+          set -eu
+          sudo apt-get update
+          sudo apt-get install -y dash jq make
+          for tool in bash dash jq make python3; do
+            command -v "$tool" >/dev/null || {
+              echo "$tool is not on PATH. test.sh skips whole sections of" >&2
+              echo "itself when it is missing and still exits 0, so this run" >&2
+              echo "would have reported a pass over assertions that never ran." >&2
+              exit 1
+            }
+          done
+          # `test.sh` self-skips six mode-bit assertions when it is root,
+          # because chmod 500 refuses nothing there.  GitHub's runners are not
+          # root; if that ever changes this says so rather than quietly
+          # asserting less.
+          if [ "$(id -u)" = 0 ]; then
+            echo "running as root: test.sh's mode-bit tests would self-skip." >&2
+            exit 1
+          fi
+
+      - name: The engine, at the version the images pin
+        run: |
+          set -eu
+          pinned=$(sed -n 's/^ARG DUCKDB_VERSION=//p' server/oci/Containerfile.linux.api)
+          if [ -z "$pinned" ]; then
+            echo "no ARG DUCKDB_VERSION in server/oci/Containerfile.linux.api." >&2
+            echo "Without it this step would have installed whatever pip felt" >&2
+            echo "like, and the suite would be evidence about that." >&2
+            exit 1
+          fi
+          # The two Containerfiles must agree.  They are separate files with
+          # separate ARGs, so nothing but this compares them -- and a Linux
+          # image on 1.5.5 beside a FreeBSD image on 1.5.6 is two products
+          # under one tag scheme, tested as one.
+          fbsd=$(sed -n 's/^ARG DUCKDB_VERSION=//p' server/oci/Containerfile.freebsd.api)
+          if [ "$fbsd" != "$pinned" ]; then
+            echo "Containerfile.linux.api pins duckdb $pinned and" >&2
+            echo "Containerfile.freebsd.api pins $fbsd. One suite run cannot be" >&2
+            echo "evidence about both." >&2
+            exit 1
+          fi
+          python3 -m venv /tmp/engine
+          /tmp/engine/bin/pip install --quiet --disable-pip-version-check \
+            "duckdb==${pinned}"
+          # pip is ASKED for a version and the answer is CHECKED.  `pip
+          # install duckdb==X` can be satisfied from a cached wheel, a local
+          # index or a sdist build, and this is the one line that turns the
+          # request into a measurement.
+          got=$(/tmp/engine/bin/python -c 'import duckdb; print(duckdb.__version__)')
+          if [ "$got" != "$pinned" ]; then
+            echo "asked pip for duckdb $pinned and imported $got." >&2
+            exit 1
+          fi
+          echo "duckdb $got, matching both Containerfiles"
+
+      # PYTHON points BOTH Python suites at the interpreter carrying the
+      # engine, and that is not a compromise for the usage half:
+      # `test_nothing_under_usage_imports_duckdb` blocks `duckdb` at the import
+      # system itself and then imports every module under `usage/`, so running
+      # it on an interpreter that HAS the engine is the stronger test rather
+      # than the weaker one -- an interpreter without duckdb cannot tell a
+      # module that refuses to import it from one that never tried.
+      - name: make check -- bash test.sh, dash test.sh, usage, server
+        run: |
+          set -eu -o pipefail
+          make check PYTHON=/tmp/engine/bin/python \
+                     SERVER_SUITE_ARGS=--require-duckdb 2>&1 | tee check.log
+
+      # The belt to the braces two steps up.  `test.sh` has no skip counter and
+      # no non-zero exit for a skip -- its only trace is the line it prints --
+      # so this reads the log.  It is SECOND and not first, and deliberately
+      # so: if the wording ever changes this goes quiet, and the tool-on-$PATH
+      # assertions are what still hold the line when it does.
+      - name: Nothing skipped itself
+        run: |
+          set -eu
+          if grep -n '(skipped' check.log; then
+            echo "" >&2
+            echo "The lines above are sections of the suite that did not run." >&2
+            echo "CI is the one place where a skip must not read as a pass." >&2
+            exit 1
+          fi
+          # `[^0-9]0 skipped`, not `0 skipped`: the latter matches "10 skipped"
+          # and would report a skipping run as a clean one, which is the exact
+          # failure this step is here to make impossible.
+          if ! grep -qE '(^|[^0-9])0 skipped' check.log; then
+            echo "the server suite did not report '0 skipped'. It exits" >&2
+            echo "non-zero on a self-skip by itself, so this line means that" >&2
+            echo "ruling has been changed rather than that a skip slipped by." >&2
+            exit 1
+          fi
+
+      # ONLY ON A TAG PUSH, because a mismatch only publishes something there.
+      # A `v0.2.0` tag over a tree whose `claudio` still says VERSION=0.1.0
+      # produces an image that misreports its own version for ever, with
+      # `:latest` pointing at it.
+      - name: A release tag names the version claudio reports
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -eu
+          tag="${GITHUB_REF#refs/tags/v}"
+          ver=$(sed -n 's/^VERSION=//p' claudio | head -1)
+          if [ "$tag" != "$ver" ]; then
+            echo "the git tag says $tag and claudio says VERSION=$ver." >&2
+            echo "Publishing this would put an image on the registry under a" >&2
+            echo "name it does not answer to. Bump VERSION in claudio, or" >&2
+            echo "move the tag." >&2
+            exit 1
+          fi
+          echo "tag v$tag matches claudio VERSION=$ver"
+
+  # =========================================================== linux =======
+  #
+  # FOUR COMPONENTS, EIGHT CELLS, AND THE SECOND AXIS IS NOT COSMETIC.
+  #
+  # The four images differ in what is INSTALLED, which is the honest reason
+  # four images exist: the ingest service and the mcp surface carry no DuckDB
+  # at all, and the proxy carries no Python.  So the matrix crosses component
+  # against architecture and each cell builds its own Containerfile, its own
+  # base and its own runtime checks.  `Containerfile.linux.<component>` is the
+  # only place the contents are decided; this job asserts what a build cannot
+  # assert about itself.
+  linux:
+    # Nothing is published from a red tree, not even a per-commit tag.
+    needs: test
+    strategy:
+      fail-fast: false
+      # TWO AXES THAT REALLY CROSS.  `include:` does not multiply -- an
+      # `include` object whose keys are none of the axis keys is merged into
+      # EVERY generated combination -- so `component` against an `include:`
+      # list of runners would produce four jobs all carrying the last runner,
+      # a matrix that looks like eight cells and builds four.  A matrix value
+      # may be an object, so the pairing stays one readable line and is
+      # reached as `matrix.target.arch`.
+      #
+      # `runner` and `arch` are still stated separately inside that object,
+      # and the build asserts they agree.  A matrix that derived one from the
+      # other could not catch the transposition it exists to prevent.
+      matrix:
+        component: [ingest, api, mcp, proxy]
+        target:
+          - { arch: amd64, runner: ubuntu-latest }
+          - { arch: arm64, runner: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.target.runner }}
+    permissions:
+      contents: read
+      packages: write
+      # For `actions/attest-build-provenance` at the bottom of this job.
+      # Requested HERE and not at the top of the file, so the three jobs
+      # that sign are the only three that can.
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5.1.0
+
+      - name: The runner really is this architecture
+        run: |
+          set -eu
+          got=$(dpkg --print-architecture)
+          if [ "$got" != "${{ matrix.target.arch }}" ]; then
+            echo "matrix says ${{ matrix.target.arch }}, runner is $got." >&2
+            echo "Building the wrong architecture here would publish an image" >&2
+            echo "whose engine has never been imported on the silicon it names." >&2
+            exit 1
+          fi
+
+      # THE BASE IS RESOLVED TO A DIGEST AND THE BUILD TAKES THAT DIGEST.
+      #
+      # `python:3.12-slim-bookworm` and `nginx:alpine` are moving references
+      # their publishers re-point at will, and each is the largest executable
+      # input in the image that takes it -- see the `FROM` lines for what was
+      # and was not measured about that (a claimed eight-day move could NOT be
+      # reproduced, and the pin rests on what a moving tag is rather than on a
+      # move somebody watched).  Two builds of one commit would otherwise
+      # produce different images with nothing able to say so.  Resolving here
+      # and passing it as `BASE_REF` means the digest recorded on the image is
+      # the digest `FROM` took, rather than one looked up beside the build and
+      # hoped to be the same.
+      #
+      # THE BASE IS THE COMPONENT'S, AND THE `case` IS WHY THE PROXY IS 94 MB
+      # RATHER THAN 400.  The proxy parses nothing and runs no Python; putting
+      # it on the interpreter base to keep this step free of a branch would
+      # add ~300 MB to an image whose whole content is nginx and four
+      # configuration files.
+      - name: Resolve the base image to a digest
+        id: base
+        run: |
+          set -eu
+          case "${{ matrix.component }}" in
+            proxy) ref="nginx:alpine" ;;
+            *)     ref="python:3.12-slim-bookworm" ;;
+          esac
+          docker pull "$ref"
+          rd=$(docker image inspect --format '{{index .RepoDigests 0}}' "$ref")
+          case "$rd" in
+            *@sha256:*) ;;
+            *)
+              echo "docker reported no repo digest for $ref (got '$rd')." >&2
+              echo "Publishing without one would leave the image unable to" >&2
+              echo "say what it was built from, which is the whole point of" >&2
+              echo "this step. Refusing." >&2
+              exit 1
+              ;;
+          esac
+          {
+            echo "ref=$rd"
+            echo "digest=${rd##*@}"
+            echo "name=docker.io/library/${ref}"
+          } >> "$GITHUB_OUTPUT"
+          echo "base resolved: $rd"
+
+      # `claudio`'s own VERSION, read from the script rather than written down
+      # here.  On a tag push the `test` job has already asserted the git tag
+      # equals it, so this is that same number reaching the image.
+      - name: The version claudio reports
+        id: ver
+        run: |
+          set -eu
+          v=$(sed -n 's/^VERSION=//p' claudio | head -1)
+          [ -n "$v" ] || { echo "claudio declares no VERSION" >&2; exit 1; }
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+      # Every provenance value is a `--build-arg`, so the Containerfile's
+      # `LABEL` block is the single place each field is spelled -- on ALL
+      # EIGHT images.  It used to be a `--label` here and an `--annotation` on
+      # the FreeBSD half; labels live in the image config and annotations in
+      # the manifest, so "which commit is this" had to be asked two ways.
+      #
+      # `DOCKER_BUILDKIT=1` IS LOAD-BEARING AND NOT A DEFAULT WORTH RELYING
+      # ON.  Each component has its own `Containerfile.linux.<c>.dockerignore`
+      # and only BuildKit reads a per-Dockerfile ignore file; the classic
+      # builder falls back to the context root, finds nothing, and sends the
+      # whole repository.  That does not change what is COPYed today, so the
+      # image would be identical and the guard would be gone -- the mcp
+      # context would silently regain `store.py`, `duck.py` and `serve.py`, and
+      # an accidental `COPY` of them would build rather than failing by name.
+      # A structural boundary that quietly stops being structural is worse
+      # than one that was never claimed.
+      - name: Build
+        env:
+          DOCKER_BUILDKIT: '1'
+        run: |
+          set -eu
+          docker build \
+            -f "server/oci/Containerfile.linux.${{ matrix.component }}" \
+            --platform "linux/${{ matrix.target.arch }}" \
+            --build-arg "BASE_REF=${{ steps.base.outputs.ref }}" \
+            --build-arg "BASE_NAME=${{ steps.base.outputs.name }}" \
+            --build-arg "BASE_DIGEST=${{ steps.base.outputs.digest }}" \
+            --build-arg "SOURCE_URL=https://github.com/${{ github.repository }}" \
+            --build-arg "REVISION=${{ github.sha }}" \
+            --build-arg "VERSION=${{ steps.ver.outputs.version }}" \
+            -t "localhost/claudio-${{ matrix.component }}:linux-${{ matrix.target.arch }}" \
+            .
+
+      # WHAT IS IN IT, AND -- FOR THREE OF THE FOUR -- WHAT IS NOT.
+      #
+      # The api image asserts its own engine at build time, so what is left to
+      # this step is what a build cannot assert about itself.  Three of those
+      # are common to every component and are asserted for every component: it
+      # runs as uid 65534, it declares no HEALTHCHECK (silently DROPPED under
+      # buildah's `--format oci`, so an image that has one is an image whose
+      # Linux and FreeBSD halves disagree), and the workstation half is absent.
+      #
+      # THE ABSENCE OF DUCKDB IS ASSERTED IN THE ARTEFACT, NOT INFERRED FROM
+      # THE CONTAINERFILE.  `pip install` is in the api's Containerfile and in
+      # no other, which is a fact about the source; that the ingest and mcp
+      # images cannot `import duckdb` is a fact about the image, and it is the
+      # boundary the split exists to draw -- an mcp process that can open the
+      # store has more authority than the one bearer token it is meant to
+      # forward.  A base image that grew a preinstalled engine, or a
+      # `requirements` file copied into the wrong Containerfile, is invisible
+      # to the first check and named by the second.
+      - name: What is in it, and what is not
+        run: |
+          set -eu
+          img="localhost/claudio-${{ matrix.component }}:linux-${{ matrix.target.arch }}"
+
+          uid=$(docker run --rm --entrypoint sh "$img" -c 'id -u')
+          if [ "$uid" != "65534" ]; then
+            echo "this image runs as uid $uid, not 65534." >&2
+            echo "Every component runs unprivileged; a root default is not a" >&2
+            echo "hardening opportunity, it is a regression in one of them." >&2
+            exit 1
+          fi
+
+          hc=$(docker image inspect --format '{{.Config.Healthcheck}}' "$img")
+          if [ -n "$hc" ] && [ "$hc" != "<nil>" ]; then
+            echo "this image declares a HEALTHCHECK: $hc" >&2
+            echo "The OCI spec has no field for one, so the FreeBSD half would" >&2
+            echo "silently not have it. Pass health checks at run time." >&2
+            exit 1
+          fi
+
+          case "${{ matrix.component }}" in
+            ingest|api)
+              docker run --rm --entrypoint sh "$img" -c 'ls /opt/claudio-server'
+              # The mcp surface is its own component and its own image. This
+              # one carries `server/srv/` entire, mcp.py included, and that is
+              # deliberate -- the boundary the split draws is which PROCESS
+              # serves /mcp, and `serve.py` importing it is what was removed.
+              if docker run --rm --entrypoint sh "$img" -c 'test -e /opt/claudio-mcp'; then
+                echo "this image carries the mcp SERVICE's tree at" >&2
+                echo "/opt/claudio-mcp. The module belongs here; the service" >&2
+                echo "and its entrypoint do not, and a second entrypoint in" >&2
+                echo "this image is a second thing it can be started as." >&2
+                exit 1
+              fi
+              ;;
+            mcp)
+              docker run --rm --entrypoint sh "$img" -c 'ls /opt/claudio-mcp'
+              # STRUCTURAL, AND THE ONE ASSERTION THIS IMAGE IS FOR. The mcp
+              # service is an HTTP client of the api and its authority is
+              # exactly the caller's forwarded bearer token. A `srv/` package
+              # in here would mean a store handle in a process that is meant
+              # to hold none.
+              if docker run --rm --entrypoint sh "$img" -c 'test -e /opt/claudio-server'; then
+                echo "the mcp image contains /opt/claudio-server." >&2
+                echo "Its authority is one forwarded bearer token; the store's" >&2
+                echo "query layer in here is a privilege escalation and it" >&2
+                echo "defeats the split. Check the dockerignore." >&2
+                exit 1
+              fi
+              ;;
+            proxy)
+              docker run --rm --entrypoint sh "$img" -c 'nginx -v'
+              for tree in /opt/claudio-server /opt/claudio-mcp; do
+                if docker run --rm --entrypoint sh "$img" -c "test -e $tree"; then
+                  echo "the proxy image carries ${tree}." >&2
+                  echo "It terminates TLS and forwards three routes; it parses" >&2
+                  echo "no record and holds no token. Application code in here" >&2
+                  echo "is a second, unreviewed way into the store." >&2
+                  exit 1
+                fi
+              done
+              ;;
+          esac
+
+          case "${{ matrix.component }}" in
+            api)
+              got=$(docker run --rm --entrypoint python "$img" \
+                      -c 'import duckdb; print(duckdb.__version__)')
+              pinned=$(sed -n 's/^ARG DUCKDB_VERSION=//p' server/oci/Containerfile.linux.api)
+              if [ "$got" != "$pinned" ]; then
+                echo "the api image imports duckdb $got and pins $pinned." >&2
+                exit 1
+              fi
+              echo "api: duckdb $got"
+              ;;
+            ingest|mcp)
+              if docker run --rm --entrypoint python "$img" -c 'import duckdb' 2>/dev/null; then
+                echo "this image can import duckdb, and it is the ${{ matrix.component }}." >&2
+                echo "Two of the four components need no engine and that was" >&2
+                echo "measured rather than assumed -- it is why they are" >&2
+                echo "separate images at all. An engine in here is 60 MiB of" >&2
+                echo "attack surface nothing in this process calls." >&2
+                exit 1
+              fi
+              echo "${{ matrix.component }}: no duckdb, as designed"
+              ;;
+            proxy)
+              # No interpreter at all, so there is nothing to ask.
+              if docker run --rm --entrypoint sh "$img" -c 'command -v python3 python' >/dev/null 2>&1; then
+                echo "the proxy image carries a Python interpreter." >&2
+                echo "It parses nothing and runs no application code." >&2
+                exit 1
+              fi
+              echo "proxy: no interpreter"
+              ;;
+          esac
+
+          # The workstation half is installed with `make install` and has no
+          # third-party dependency at all; putting it in an image would suggest
+          # a container is a supported way to run it. It is not.
+          for banned in claudio usage tests; do
+            for root in /opt/claudio-server /opt/claudio-mcp; do
+              if docker run --rm --entrypoint sh "$img" -c "test -e ${root}/${banned}"; then
+                echo "${root}/${banned} is in the image; the workstation half is not containerised" >&2
+                exit 1
+              fi
+            done
+          done
+
+      # THE REFUSAL EACH COMPONENT MEETS FIRST, AND THEY ARE FOUR DIFFERENT
+      # ONES.  This is the behaviour an operator relies on before anything
+      # works, so it is measured on the artefact rather than read out of the
+      # source.
+      #
+      #   api     exit 9 with a store that has no `accounts/` -- a reader
+      #           cannot create one, so every question would answer `no-data`,
+      #           which is indistinguishable from a store nobody shipped to.
+      #           Then exit 4 with `accounts/` present and no readers file:
+      #           THE ONE HARD REFUSAL.  `_is_loopback` sees the bind address,
+      #           and inside a compose network that is 0.0.0.0 -- so the check
+      #           fires in every container, which is exactly what it is for
+      #           and why it must not be softened to make a stack start.  The
+      #           remedy is `readers.json`, never a narrower bind.
+      #   ingest  `--no-api` is already in its argv, so adding `--no-ship`
+      #           leaves nothing to serve: exit 8, by name.  It is the cheapest
+      #           run that proves the entrypoint, the preflight and `serve.py`
+      #           all load and agree about the flags.
+      #   mcp     exit 7 for an ambient `CLAUDIO_API_TOKEN` under the HTTP
+      #           transport: a caller who sends no credential would inherit the
+      #           container's and see more than they are entitled to.
+      #   proxy   it starts, self-signs, and answers on the three routes.
+      #
+      # MEASURED ON THIS REPOSITORY'S OWN IMAGES before being written here --
+      # every exit code below was observed, and the api's was NOT the one the
+      # single-door version of this step asserted: with an empty store it
+      # exits 9, not 4, because the reader's `accounts/` refusal comes first.
+      # Copying the old assertion across would have gone red on the first run.
+      - name: The refusal it meets first
+        run: |
+          set -eu
+          img="localhost/claudio-${{ matrix.component }}:linux-${{ matrix.target.arch }}"
+          case "${{ matrix.component }}" in
+            api)
+              rm -rf store && mkdir -p store && chmod 777 store
+              rc=0
+              docker run --rm -v "$PWD/store:/var/lib/claudio-usage:ro" "$img" > out.txt 2>&1 || rc=$?
+              cat out.txt
+              [ "$rc" = 9 ] || { echo "expected exit 9 for a store with no accounts/, got $rc" >&2; exit 1; }
+              grep -q 'no accounts/ directory' out.txt
+
+              mkdir -p store/accounts
+              rc=0
+              docker run --rm -v "$PWD/store:/var/lib/claudio-usage:ro" "$img" > out.txt 2>&1 || rc=$?
+              cat out.txt
+              [ "$rc" = 4 ] || { echo "expected exit 4 for an unauthenticated read API, got $rc" >&2; exit 1; }
+              grep -q 'no reader auth' out.txt
+              ;;
+            ingest)
+              rc=0
+              docker run --rm "$img" --no-ship > out.txt 2>&1 || rc=$?
+              cat out.txt
+              [ "$rc" = 8 ] || { echo "expected exit 8, got $rc" >&2; exit 1; }
+              grep -q 'leave nothing to serve' out.txt
+              ;;
+            mcp)
+              rc=0
+              docker run --rm -e CLAUDIO_API_TOKEN=not-a-real-token "$img" > out.txt 2>&1 || rc=$?
+              cat out.txt
+              [ "$rc" = 7 ] || { echo "expected exit 7, got $rc" >&2; exit 1; }
+              grep -q 'CLAUDIO_API_TOKEN is set' out.txt
+              ;;
+            proxy)
+              # `--add-host`, AND IT IS NOT A WORKAROUND FOR A BROKEN CONFIG.
+              # nginx resolves every `upstream` host at startup and EXITS when
+              # one does not resolve, which is correct: a front end that came
+              # up with a dead upstream would answer 502 for a reason nobody
+              # could see. Alone in this job there is no compose network, so
+              # the three names are pointed at a port nothing is listening on
+              # -- which is what makes 502 the RIGHT answer here and proves
+              # the route exists rather than that the upstream works.
+              docker rm -f pxcheck >/dev/null 2>&1 || :
+              docker run -d --name pxcheck -p 127.0.0.1:18443:8443 \
+                --add-host ingest:127.0.0.1 \
+                --add-host api:127.0.0.1 \
+                --add-host mcp:127.0.0.1 \
+                "$img" >/dev/null
+              ok=no
+              for _ in 1 2 3 4 5 6 7 8 9 10; do
+                if curl -s -k -o /dev/null "https://127.0.0.1:18443/" ; then ok=yes; break; fi
+                sleep 2
+              done
+              docker logs pxcheck 2>&1 | tail -20
+              if [ "$ok" != yes ]; then
+                echo "the proxy never answered on 8443." >&2
+                docker rm -f pxcheck >/dev/null 2>&1 || :
+                exit 1
+              fi
+              fail=no
+              for probe in "/api/v1/capabilities 502" "/sender 502" "/mcp 502" \
+                           "/healthz 404" "/ 404"; do
+                p=${probe% *}; want=${probe#* }
+                got=$(curl -s -k -o /dev/null -w '%{http_code}' "https://127.0.0.1:18443${p}")
+                echo "  ${p} -> ${got} (want ${want})"
+                [ "$got" = "$want" ] || fail=yes
+              done
+              # `/healthz` is 404 BY DESIGN and that is asserted, not tolerated.
+              # It is the door's own liveness route and it names the store's
+              # free bytes and its accepted-batch counters; publishing it
+              # through the one port the internet can reach would hand an
+              # unauthenticated caller an inventory of the machine. The compose
+              # file's health checks reach it on the internal network, where it
+              # belongs.
+              body=$(curl -s -k "https://127.0.0.1:18443/")
+              echo "  / body: ${body}"
+              case "$body" in
+                *unanswerable*no-such-route*) ;;
+                *)
+                  echo "the catch-all did not answer in the API's refusal envelope." >&2
+                  echo "A bare nginx 404 page reaches an MCP or API client as" >&2
+                  echo "something it cannot parse; a refusal object is readable." >&2
+                  fail=yes
+                  ;;
+              esac
+              docker rm -f pxcheck >/dev/null 2>&1 || :
+              [ "$fail" = no ] || exit 1
+              ;;
+          esac
+
+      # `docker login` writes `~/.docker/config.json`, which is where
+      # `actions/attest-build-provenance` looks -- see the FreeBSD job, where
+      # `buildah` does not and that had to be made to.
+      - name: Log in to the registry
+        if: github.event_name != 'pull_request'
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login "${REGISTRY}" -u "${{ github.actor }}" --password-stdin
+
+      # ONE tag, and it is the per-commit one.  A build job publishes only
+      # `sha-<short>-<os>-<arch>`; every moving name is a manifest list the
+      # `manifest` job assembles FROM these, so a moving tag is an alias for
+      # images that already exist rather than a second thing built under a
+      # different name.  A `testing-linux-amd64` would be a name that moves AND
+      # names one platform, answering nothing this does not answer exactly.
+      - name: Push the per-architecture tag, and capture its digest
+        id: push
+        if: github.event_name != 'pull_request'
+        run: |
+          set -eu
+          dest="${REGISTRY}/${IMAGE_NAME}-${{ matrix.component }}"
+          short=$(echo "${{ github.sha }}" | cut -c1-7)
+          tag="sha-${short}-linux-${{ matrix.target.arch }}"
+          docker tag "localhost/claudio-${{ matrix.component }}:linux-${{ matrix.target.arch }}" "${dest}:${tag}"
+          docker push "${dest}:${tag}"
+          # THE DIGEST, BECAUSE THE TAG IS NOT IMMUTABLE AND SAYING SO WAS
+          # WRONG.  A registry tag is mutable by anyone with push rights and
+          # this workflow re-points it itself: any re-run, `workflow_dispatch`
+          # or scheduled build on the same commit pushes over these names,
+          # and with the bases and the FreeBSD `latest` package branch both
+          # floating, a re-run does not necessarily produce the same bytes.
+          # The manifest job used to `manifest add` these names, resolving
+          # them BY NAME minutes later -- so with two runs on different refs
+          # (a branch push and a tag push at one commit are different refs,
+          # and the concurrency group is per-ref with cancel-in-progress
+          # false) either run could assemble `:testing` out of the other's
+          # images. A digest is the only thing in a registry that cannot move.
+          #
+          # TWO WAYS OF ASKING AND A REFUSAL, because neither has been run
+          # against a real registry from the machine this was written on.
+          # `RepoDigests` is populated by the push and is the cheap answer;
+          # with the containerd image store and an attestation manifest in
+          # play it is the one most likely to come back empty, and
+          # `imagetools inspect` asks the registry itself.  If both fail this
+          # exits rather than writing a marker the manifest job would then
+          # `manifest add` as an empty reference -- a wrong value written from
+          # an assumption is the thing this repository refuses; a red job is
+          # recoverable.
+          d=$(docker image inspect --format '{{index .RepoDigests 0}}' "${dest}:${tag}" 2>/dev/null || true)
+          d=${d##*@}
+          case "$d" in
+            sha256:*) ;;
+            *)
+              echo "RepoDigests gave nothing usable; asking the registry" >&2
+              d=$(docker buildx imagetools inspect "${dest}:${tag}" \
+                    --format '{{.Manifest.Digest}}' 2>/dev/null || true)
+              ;;
+          esac
+          case "$d" in
+            sha256:*) ;;
+            *)
+              echo "could not determine the digest of ${dest}:${tag}." >&2
+              echo "The manifest lists are assembled from digests, so a" >&2
+              echo "missing one would put an empty reference into a" >&2
+              echo "published tag. Refusing." >&2
+              exit 1
+              ;;
+          esac
+          echo "digest=${d}" >> "$GITHUB_OUTPUT"
+          echo "pushed ${dest}:${tag}"
+          echo "digest ${d}"
+
+      # WHAT THIS ATTESTS IS THE DIGEST, not a tag.  `:testing` is a moving
+      # name anyone holding a `write:packages` token on the namespace can
+      # overwrite -- a leaked PAT, a compromised action in a later job, a
+      # fork's misconfiguration -- and nothing on the registry would tell a
+      # puller that apart from a legitimate build. That matters more here than
+      # usual: this server has no TLS, no mTLS, no token expiry and no rate
+      # limiting anywhere, and `server/README.md` says so plainly, which
+      # leaves the artefact's authenticity as the only integrity control in
+      # the chain.  `gh attestation verify oci://ghcr.io/<owner>/claudio-api@sha256:...`
+      # then answers "was this built by this workflow from this commit", with
+      # no key for anyone to manage or lose.
+      #
+      # SCOPED TO THE COMPONENT'S OWN REPOSITORY.  An attestation names its
+      # subject, and a subject naming the wrong repository verifies against
+      # nothing -- silently, since `gh attestation verify` on the image the
+      # operator actually pulled would simply find no attestation and report
+      # the image unattested.
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
+        if: github.event_name != 'pull_request'
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-${{ matrix.component }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+
+      # The manifest job discovers what to assemble from these markers, so the
+      # matrices above are the only place the target list is written down --
+      # and the marker now CARRIES THE DIGEST rather than a platform string
+      # nothing read, because that is what the manifest job assembles from.
+      #
+      # `<component>__<os>__<arch>`, three fields where there were two: the
+      # manifest job builds one list per component and globs on the first.
+      - name: Record what this job produced
+        if: github.event_name != 'pull_request'
+        run: |
+          mkdir -p out
+          echo "${{ steps.push.outputs.digest }}" > "out/${{ matrix.component }}__linux__${{ matrix.target.arch }}"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        if: github.event_name != 'pull_request'
+        with:
+          name: built-${{ matrix.component }}-linux-${{ matrix.target.arch }}
+          path: out/
+
+  # ========================================================= freebsd =======
+  freebsd:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      # For `actions/attest-build-provenance`; see the Linux job.
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: false
+      # One entry per (base release, architecture).  The package ABI tracks the
+      # base's MAJOR version -- a 14.x image must take its packages from the
+      # FreeBSD:14 repository, not FreeBSD:15 -- and it is spelled out rather
+      # than derived, because a derived value cannot catch the pairing mistake
+      # it exists to prevent.
+      #
+      # THE MISMATCH IS SILENT AT BUILD TIME.  Nothing executes during a
+      # FreeBSD build, so a 14-repository package on a 15.x base builds and
+      # pushes perfectly: measured from the real published layers, 14.4 carries
+      # `libutil.so.9` and 15.1 carries `libutil.so.10`, and `python3.12` from
+      # the FreeBSD:14 repository asks for the former.  `pkgindex.py shlibs`
+      # against the unpacked base is what turns that into a refusal here.
+      #
+      # Supported releases as of 2026-08-21: 15.1 (EoL 2027-03-31), 15.0
+      # (2026-09-30), 14.4 (2026-12-31).  13.x is end of life and absent.
+      # CURRENT is absent for the reference repository's reason: its base image
+      # and its packages both move on their own, so a weekly job would keep
+      # republishing a tag nobody watches against a branch carrying no support
+      # commitment.
+      #
+      # THE SECOND AXIS IS THE COMPONENT, AND THE ROWS ARE OBJECTS BECAUSE
+      # THAT IS THE ONLY SHAPE THAT CROSSES.
+      #
+      # `include:` does not multiply.  An `include` object whose keys are none
+      # of the axis keys is merged into EVERY generated combination, so four
+      # component values against six `include` rows would produce four jobs
+      # each carrying the last row's base -- a matrix that looks like 24 cells
+      # and builds 4.  Two real axes cross properly, and a matrix value may be
+      # an object, so the six pairings stay one readable line each and are
+      # reached as `matrix.target.abi`.  The six rows themselves are unchanged:
+      # 15.1, 15.0 and 14.4 on amd64 and arm64, with the ABI spelled per row.
+      matrix:
+        component: [ingest, api, mcp, proxy]
+        target:
+          - { slug: freebsd15.1, base: '15.1', arch: amd64, abi: 'FreeBSD:15:amd64'   }
+          - { slug: freebsd15.1, base: '15.1', arch: arm64, abi: 'FreeBSD:15:aarch64' }
+          - { slug: freebsd15.0, base: '15.0', arch: amd64, abi: 'FreeBSD:15:amd64'   }
+          - { slug: freebsd15.0, base: '15.0', arch: arm64, abi: 'FreeBSD:15:aarch64' }
+          - { slug: freebsd14.4, base: '14.4', arch: amd64, abi: 'FreeBSD:14:amd64'   }
+          - { slug: freebsd14.4, base: '14.4', arch: arm64, abi: 'FreeBSD:14:aarch64' }
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5.1.0
+
+      - name: Install buildah and skopeo
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y buildah skopeo
+
+      # The base's own rootfs, unpacked, so the DT_NEEDED check has something
+      # real to resolve against.
+      - name: Unpack the base rootfs for the shared-library check
+        run: |
+          set -eu
+          mkdir -p baserootfs
+          # `--override-os freebsd` is not optional: without it skopeo asks for
+          # the LINUX image of that name, which for `freebsd-runtime` is either
+          # a different manifest entry or nothing, and the shared-library check
+          # would compare the staged FreeBSD tree against a Linux base -- which
+          # fails for the wrong reason and teaches people to ignore the check.
+          skopeo --override-os freebsd --override-arch "${{ matrix.target.arch }}" copy \
+            "docker://docker.io/freebsd/freebsd-runtime:${{ matrix.target.base }}" \
+            "dir:basedir"
+          for blob in basedir/*; do
+            tar tf "$blob" >/dev/null 2>&1 && tar xf "$blob" -C baserootfs || :
+          done
+          echo "base rootfs: $(find baserootfs -type f | wc -l) files"
+
+      # THE BASE IS RESOLVED TO A DIGEST, for the Linux job's reason: a moving
+      # tag as the largest executable input means two builds of one commit can
+      # differ with nothing able to say so.  `skopeo inspect --raw` prints the
+      # manifest BYTES and the digest is their sha256 by definition, so this is
+      # the digest a registry would compute rather than a value read out of a
+      # field that may or may not be there.
+      - name: Resolve the base image to a digest
+        id: base
+        run: |
+          set -eu
+          ref="docker.io/freebsd/freebsd-runtime:${{ matrix.target.base }}"
+          d=$(skopeo inspect --raw "docker://${ref}" | sha256sum | cut -d' ' -f1)
+          case "$d" in
+            ????????????????????????????????????????????????????????????????) ;;
+            *)
+              echo "could not hash the manifest of ${ref} (got '$d')." >&2
+              echo "Building FROM a moving tag would leave the image unable" >&2
+              echo "to say what it was built from. Refusing." >&2
+              exit 1
+              ;;
+          esac
+          echo "ref=${ref}@sha256:${d}" >> "$GITHUB_OUTPUT"
+          echo "digest=sha256:${d}" >> "$GITHUB_OUTPUT"
+          echo "base resolved: ${ref}@sha256:${d}"
+
+      - name: The version claudio reports
+        id: ver
+        run: |
+          set -eu
+          v=$(sed -n 's/^VERSION=//p' claudio | head -1)
+          [ -n "$v" ] || { echo "claudio declares no VERSION" >&2; exit 1; }
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+      # The staging script fetches the signed package index, verifies every
+      # blake2b checksum against it, resolves the closure, unpacks, prunes,
+      # and then runs three checks: the architecture of every ELF file, that
+      # every module the component imports survived the prune, and that every
+      # DT_NEEDED is satisfied by the staged tree or the base.
+      #
+      # THE COMPONENT IS THE FIRST ARGUMENT AND IT HAS NO DEFAULT.  The four
+      # images differ in exactly what this script decides -- which packages go
+      # in -- and the wrong pick is not a build failure but an mcp image
+      # carrying DuckDB and the store's query layer, which is the boundary the
+      # split exists to draw.
+      #
+      # Staged sizes, MEASURED by running this script against the live index on
+      # 2026-08-25 on all four matrix ABIs -- the STAGED column, not the index's
+      # `flatsize`, which overstates by nearly four because
+      # `lib/python3.12/test` and `config-3.12` never reach an image with no
+      # compiler:  api 120.7 MiB, ingest 60.5, mcp 60.5, proxy 6.4.
+      - name: Stage the FreeBSD packages
+        id: stage
+        run: |
+          set -eu
+          ./server/oci/stage-freebsd.sh "${{ matrix.component }}" \
+            "${{ matrix.target.abi }}" "${{ matrix.target.arch }}" \
+            "server/oci/stage-freebsd-${{ matrix.component }}" baserootfs
+          echo "version=$(cat server/oci/stage-freebsd-${{ matrix.component }}/rootfs.version)" >> "$GITHUB_OUTPUT"
+
+      # `pkg` has one version of a package and no way to ask for another, so
+      # unlike the Linux build this one cannot REQUEST an engine version -- it
+      # can only check what the repository gave it and refuse a surprise.  A
+      # silent drift here would publish a FreeBSD image running an
+      # engine nobody has measured; `srv/duck.py` refuses five things DuckDB
+      # does silently and every one of those refusals is written against
+      # behaviour measured on the pinned version.
+      #
+      # ONLY THE api STAGES AN ENGINE, so this step is scoped to it.  Run on
+      # the other three it would compare `python312`'s version against a DuckDB
+      # pin and fail every one of them -- a red build that says nothing about
+      # anything.
+      - name: The engine is the version the measurements cite
+        if: matrix.component == 'api'
+        run: |
+          set -eu
+          pinned=$(sed -n 's/^ARG DUCKDB_VERSION=//p' server/oci/Containerfile.freebsd.api)
+          got="${{ steps.stage.outputs.version }}"
+          if [ "$got" != "$pinned" ]; then
+            echo "The FreeBSD repository now holds py312-duckdb $got, but this" >&2
+            echo "repository pins $pinned and every refusal in srv/duck.py was" >&2
+            echo "measured against that version. Bump ARG DUCKDB_VERSION in" >&2
+            echo "both Containerfiles, re-run the suite against $got, and" >&2
+            echo "check the five refusals still describe what it does." >&2
+            exit 1
+          fi
+          echo "py312-duckdb $got, matching the pin"
+
+      - name: Build
+        run: |
+          set -eu
+          # `--format oci`, and it is the reason a HEALTHCHECK is banned from
+          # both Containerfiles: the OCI image spec has no field for one and
+          # buildah drops it silently, so an image with a health check would
+          # have it on Linux and not on FreeBSD, under one tag scheme.
+          #
+          # `--annotation` rather than `--label` for the provenance fields the
+          # registry reads: labels live in the image CONFIG and annotations in
+          # the MANIFEST, and ghcr.io links a package to a repository from the
+          # annotation.  The Containerfile carries the labels; both are set
+          # from the same `--build-arg` values, so they cannot disagree.
+          #
+          # `org.opencontainers.image.licenses` is BSD-2-Clause, which is what
+          # this repository's LICENCE is -- the value used to be MIT here, so
+          # the two halves of one image contradicted itself and every SBOM and
+          # licence scanner read the label.
+          buildah bud \
+            --platform "freebsd/${{ matrix.target.arch }}" \
+            --format oci \
+            --ignorefile "server/oci/Containerfile.freebsd.${{ matrix.component }}.containerignore" \
+            --build-arg "BASE_REF=${{ steps.base.outputs.ref }}" \
+            --build-arg "BASE_NAME=docker.io/freebsd/freebsd-runtime:${{ matrix.target.base }}" \
+            --build-arg "BASE_DIGEST=${{ steps.base.outputs.digest }}" \
+            --build-arg "SOURCE_URL=https://github.com/${{ github.repository }}" \
+            --build-arg "REVISION=${{ github.sha }}" \
+            --build-arg "VERSION=${{ steps.ver.outputs.version }}" \
+            --build-arg "STAGE=server/oci/stage-freebsd-${{ matrix.component }}" \
+            --annotation "org.opencontainers.image.source=https://github.com/${{ github.repository }}" \
+            --annotation "org.opencontainers.image.revision=${{ github.sha }}" \
+            --annotation "org.opencontainers.image.version=${{ steps.ver.outputs.version }}" \
+            --annotation "org.opencontainers.image.base.name=docker.io/freebsd/freebsd-runtime:${{ matrix.target.base }}" \
+            --annotation "org.opencontainers.image.base.digest=${{ steps.base.outputs.digest }}" \
+            --annotation "org.opencontainers.image.licenses=BSD-2-Clause" \
+            -t "localhost/claudio-${{ matrix.component }}:${{ matrix.target.slug }}-${{ matrix.target.arch }}" \
+            -f "server/oci/Containerfile.freebsd.${{ matrix.component }}" .
+
+      # The staging checks prove the tree is right.  This proves the LAYER is
+      # applyable on the target OS, which is a different failure: in the
+      # reference repository an overlay-driver build produced a layer whose
+      # xattrs made podman on FreeBSD PANIC on pull.
+      - name: No overlayfs xattrs in the layer
+        run: |
+          set -eu
+          rm -rf /tmp/imgdir
+          buildah push "localhost/claudio-${{ matrix.component }}:${{ matrix.target.slug }}-${{ matrix.target.arch }}" dir:/tmp/imgdir
+          python3 - <<'PY'
+          import glob, tarfile, sys
+          bad, layers = [], 0
+          for path in glob.glob("/tmp/imgdir/*"):
+              try:
+                  tf = tarfile.open(path)
+              except Exception:
+                  continue
+              layers += 1
+              for m in tf:
+                  for k in getattr(m, "pax_headers", {}) or {}:
+                      if "overlay" in k.lower():
+                          bad.append((m.name, k))
+          if not layers:
+              sys.exit("no layer tarballs found; this check asserted nothing")
+          if bad:
+              for name, k in bad[:20]:
+                  print("%s carries %s" % (name, k))
+              sys.exit("overlayfs xattrs in the layer: podman on FreeBSD "
+                       "panics applying user.overlay.origin, whose value is "
+                       "empty. STORAGE_DRIVER must be vfs.")
+          print("%d layers, no overlay xattrs" % layers)
+          PY
+
+      # A HEALTHCHECK is silently DROPPED by `--format oci`, so an image
+      # carrying one would have it on Linux and not here.  Asserted rather
+      # than trusted to the Containerfile not having grown one.
+      - name: The OCI config declares no health check
+        run: |
+          set -eu
+          buildah inspect --type image \
+            "localhost/claudio-${{ matrix.component }}:${{ matrix.target.slug }}-${{ matrix.target.arch }}" \
+            > inspect.json
+          python3 - <<'PY'
+          import json, sys
+          d = json.load(open("inspect.json"))
+          cfg = (d.get("OCIv1") or {}).get("config") or {}
+          if "Healthcheck" in cfg or "healthcheck" in cfg:
+              sys.exit("this image declares a health check; --format oci drops "
+                       "it, so the two halves would disagree")
+          print("no health check, as both Containerfiles intend")
+          PY
+
+      # `--password-stdin` and not `-p`: a `-p` value sits in the process's
+      # argv, readable by any other process in the job and liable to be echoed
+      # by a `set -x` somebody adds while debugging.  GitHub masks secrets in
+      # OUTPUT and does nothing whatever about argv.  Two of the three logins
+      # in this file used `-p` for a long time and the third, right here, did
+      # not; the rule is now the same in all three and a test asserts it.
+      #
+      # It matters most in THIS job, which has already unpacked and parsed
+      # third-party archives in the same process tree.
+      #
+      # THE AUTH FILE IS THE DOCKER-STYLE ONE, AND THAT IS THE ATTESTATION FIX.
+      #
+      #   `buildah login` writes `${XDG_RUNTIME_DIR}/containers/auth.json`.
+      #   `actions/attest-build-provenance` with `push-to-registry: true`
+      #   pushes the attestation itself, and its OCI client reads the DOCKER
+      #   credential chain -- `$DOCKER_CONFIG/config.json`, else
+      #   `~/.docker/config.json` -- and nothing else.  It has no option for
+      #   containers/auth.json.  So the previous run's
+      #   "No credentials found for registry ghcr.io" was not a permissions
+      #   fault and not a wrong pin: the credential existed, in a file the
+      #   action does not look in.
+      #
+      #   THE FIX IS ON THE buildah SIDE, because the other side has no knob to
+      #   turn.  `--authfile` names the Docker-style path on the login itself
+      #   (the file FORMAT is the same `{"auths": {...}}`; only the default
+      #   LOCATION differs), and `REGISTRY_AUTH_FILE` in $GITHUB_ENV is what
+      #   every later `buildah push`/`manifest add` in this job reads, so the
+      #   credential is written once and read by both tools.  `DOCKER_CONFIG`
+      #   is exported alongside it so that the action finds the directory
+      #   whether it honours that variable or defaults to $HOME -- both spell
+      #   the same path here, which is the point: there is no branch in which
+      #   it looks somewhere this does not write.
+      #
+      #   The Linux job needs none of this: `docker login` already writes
+      #   exactly that file, which is why the two jobs differ here and why
+      #   only one of them could ever have produced that message.
+      - name: Log in to the registry
+        if: github.event_name != 'pull_request'
+        run: |
+          set -eu
+          mkdir -p "$HOME/.docker"
+          echo "DOCKER_CONFIG=$HOME/.docker" >> "$GITHUB_ENV"
+          echo "REGISTRY_AUTH_FILE=$HOME/.docker/config.json" >> "$GITHUB_ENV"
+          echo "${{ secrets.GITHUB_TOKEN }}" | buildah login --authfile "$HOME/.docker/config.json" -u "${{ github.actor }}" --password-stdin "${REGISTRY}"
+
+      # The per-commit per-cell tag, for the Linux job's reason.
+      - name: Push the per-(base, architecture) tag, and capture its digest
+        id: push
+        if: github.event_name != 'pull_request'
+        run: |
+          set -eu
+          dest="${REGISTRY}/${IMAGE_NAME}-${{ matrix.component }}"
+          short=$(echo "${{ github.sha }}" | cut -c1-7)
+          src="localhost/claudio-${{ matrix.component }}:${{ matrix.target.slug }}-${{ matrix.target.arch }}"
+          # `--digestfile` for the Linux job's reason: the manifest job
+          # assembles from digests now, because a tag is mutable and a re-run
+          # on the same commit re-points these names.
+          buildah push --digestfile digest.txt "$src" \
+            "docker://${dest}:sha-${short}-${{ matrix.target.slug }}-${{ matrix.target.arch }}"
+          d=$(cat digest.txt)
+          case "$d" in
+            sha256:*) ;;
+            *) echo "buildah wrote no usable digest (got '$d')" >&2; exit 1 ;;
+          esac
+          echo "digest=$d" >> "$GITHUB_OUTPUT"
+          echo "digest $d"
+
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
+        if: github.event_name != 'pull_request'
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-${{ matrix.component }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+
+      # The marker CARRIES THE DIGEST now.  It used to carry the staged DuckDB
+      # version, which nothing read; the manifest job assembles from these.
+      # THE MARKER IS THE MANIFEST JOB'S TARGET LIST, so only a cell that
+      # actually pushed may write one.  A marker naming a digest nobody pushed
+      # would make `buildah manifest add` fail in another job, several minutes
+      # later, with the wrong job's name on it.
+      - name: Record what this job produced
+        if: github.event_name != 'pull_request'
+        run: |
+          mkdir -p out
+          echo "${{ steps.push.outputs.digest }}" > "out/${{ matrix.component }}__${{ matrix.target.slug }}__${{ matrix.target.arch }}"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        if: github.event_name != 'pull_request'
+        with:
+          name: built-${{ matrix.component }}-${{ matrix.target.slug }}-${{ matrix.target.arch }}
+          path: out/
+
+      # The staged tree, for the smoke job.  Only the default pairing, because
+      # that is the only one the smoke job can run: the FreeBSD VM is amd64.
+      #
+      # ALL FOUR COMPONENTS NOW, WHERE IT USED TO BE THE api ALONE.  The
+      # argument for the api-only version was that the smoke job exists for the
+      # numpy/pandas exclusion and there is no engine in the other three -- true
+      # of that question, and it left a bigger one unasked: whether the staged
+      # FreeBSD interpreter and the staged nginx RUN AT ALL on a FreeBSD
+      # kernel.  Nothing else in this workflow executes a FreeBSD binary, so
+      # for three of the four components a completely broken tree would pass
+      # every static check and publish.  The trees are small (60.5 MiB for
+      # ingest and mcp, 6.4 for the proxy) and each cell asks a different
+      # question of a different binary; see the smoke job.
+      #
+      # TARRED FIRST, and that is not tidiness.  `upload-artifact` zips what it
+      # is given and the zip loses the EXECUTABLE BIT and turns symlinks into
+      # copies -- so an uploaded rootfs arrives with a non-executable
+      # `python3.12` and a `libpython3.12.so.1` that is a file rather than a
+      # link to the real one.  The smoke job would then fail on something that
+      # is an artifact-format artefact and not a fault in the image, which is
+      # the worst kind of red: it teaches people to ignore the job.
+      - name: Tar the staged tree so permissions and symlinks survive
+        if: matrix.target.slug == 'freebsd15.1' && matrix.target.arch == 'amd64'
+        run: tar cf staged.tar -C "server/oci/stage-freebsd-${{ matrix.component }}/rootfs" .
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        if: matrix.target.slug == 'freebsd15.1' && matrix.target.arch == 'amd64'
+        with:
+          name: staged-${{ matrix.component }}-freebsd15.1-amd64
+          path: staged.tar
+          retention-days: 3
+
+  # =========================================================== smoke =======
+  #
+  # THE ONE THING THE BUILD CANNOT DO IS RUN WHAT IT BUILT, AND THIS IS WHERE
+  # THAT IS ANSWERED.
+  #
+  # Everything above is static: checksums, ELF headers, DT_NEEDED sets, a
+  # package graph.  None of it executes a single FreeBSD instruction.  This job
+  # unpacks the staged tree over a real FreeBSD 15.1 VM -- base plus staged
+  # tree is exactly what the image is -- and asks each component the one
+  # question its own image turns on.
+  #
+  # FOUR CELLS, AND THEY ARE NOT FOUR COPIES OF ONE TEST.  The ingest and mcp
+  # trees are the same package set, but the code they carry is not: one is
+  # `server/srv/` entire and the other is a single module that must import
+  # nothing but the standard library.  The proxy carries no interpreter at all
+  # and its question is whether the staged `nginx` links.
+  #
+  #   api     the full server suite on the staged interpreter, plus `import
+  #           duckdb` with py312-numpy and py312-pandas absent.  That exclusion
+  #           is the judgement this build makes that nothing else can measure:
+  #           `databases/py-duckdb` declares both as RUN_DEPENDS, and the
+  #           evidence for dropping them is upstream's optional extras, a
+  #           static read of the staged package and the suite passing on Linux
+  #           -- three inferences and no measurement.  This is the measurement.
+  #   ingest  `srv.serve` imports and `store.available()` is False.  That is
+  #           the whole claim of the engine-free image: the ship path never
+  #           reaches `store.require()`, so the absence is a smaller image and
+  #           not a broken one.
+  #   mcp     `mcp.py --http` with an ambient token exits 7.  It executes the
+  #           module, which is the standard library and nothing else, and lands
+  #           on the refusal that is the component's privilege boundary.
+  #   proxy   the staged `nginx` runs.  `nginx -t` is deliberately NOT used:
+  #           it resolves every `upstream` host at parse time and there is no
+  #           compose network in a VM, so it would fail for a reason that has
+  #           nothing to do with the image.
+  #
+  # It covers amd64 and 15.1 ONLY. The VM is amd64, so arm64 and the 15.0 and
+  # 14.4 pairings are NOT covered by it and are not claimed to be.
+  smoke:
+    needs: freebsd
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        component: [ingest, api, mcp, proxy]
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5.1.0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          name: staged-${{ matrix.component }}-freebsd15.1-amd64
+          path: staged
+      - name: FreeBSD 15.1, the staged tree, on a real kernel
+        uses: vmactions/freebsd-vm@83b151f58c6047089f4c80eb5ba2039d158ce093  # v1.5.3
+        with:
+          release: '15.1'
+          usesh: true
+          copyback: false
+          run: |
+            set -eu
+            # base + staged tree IS the image, so this is the image's contents
+            # on a real kernel.  A throwaway VM, so unpacking over / is the
+            # honest reproduction rather than a shortcut.
+            tar xf staged/staged.tar -C /
+            export LD_LIBRARY_PATH=/usr/local/lib
+            case "${{ matrix.component }}" in
+              proxy)
+                # The binary runs, which resolves every DT_NEEDED for real --
+                # the static check said the base provides libssl, libcrypto,
+                # libz, libcrypt, libthr and libc, and this is where that stops
+                # being a claim about a header.
+                /usr/local/sbin/nginx -v
+                /usr/local/sbin/nginx -V 2>&1 | head -2
+                ;;
+              *)
+                PY=/usr/local/bin/python3.12
+                $PY -c 'import sys; print("python", sys.version)'
+                ;;
+            esac
+            case "${{ matrix.component }}" in
+              api)
+                $PY -c 'import duckdb; print("duckdb", duckdb.__version__)'
+                $PY -c 'import duckdb; print(duckdb.connect(":memory:").execute("select 42").fetchall())'
+                # The exclusion, asserted rather than assumed: these must be
+                # absent AND the engine must work anyway.  If a future ports
+                # change makes duckdb import numpy eagerly, the line above
+                # fails and this one says which side of the trade broke.
+                $PY - <<'PYEOF'
+            import importlib.util as u
+            for m in ("numpy", "pandas"):
+                assert u.find_spec(m) is None, m + " is present; the exclusion did not apply"
+            print("numpy and pandas absent, engine works")
+            PYEOF
+                $PY server/tests/test_all.py
+                ;;
+              ingest)
+                # The engine must be ABSENT here, and the ship path must not
+                # care.  Both halves, because either alone is half the claim.
+                if $PY -c 'import duckdb' 2>/dev/null; then
+                  echo "the ingest tree carries duckdb; it is meant to be the" >&2
+                  echo "component that proves the engine is not needed." >&2
+                  exit 1
+                fi
+                PYTHONPATH=server $PY - <<'PYEOF'
+            import srv.serve, srv.store
+            assert srv.store.available() is False, "duckdb reported available with no engine staged"
+            print("srv.serve imports and store.available() is False, as designed")
+            PYEOF
+                ;;
+              mcp)
+                if $PY -c 'import duckdb' 2>/dev/null; then
+                  echo "the mcp tree carries duckdb; its authority is one" >&2
+                  echo "forwarded bearer token and it holds no store." >&2
+                  exit 1
+                fi
+                rc=0
+                CLAUDIO_API_TOKEN=not-a-real-token \
+                  $PY server/srv/mcp.py --http --host 127.0.0.1 --port 8788 \
+                  --api http://127.0.0.1:8787 > out.txt 2>&1 || rc=$?
+                cat out.txt
+                [ "$rc" = 7 ] || { echo "expected exit 7, got $rc" >&2; exit 1; }
+                grep -q 'CLAUDIO_API_TOKEN is set' out.txt
+                ;;
+            esac
+
+  # ======================================================== manifest =======
+  manifest:
+    # `smoke` is in `needs` so its RESULT is readable below, and the `if` is
+    # written so that a failing smoke does not stop `:testing` being published.
+    # That split is deliberate and is stated rather than slipped in.
+    #
+    #   `:testing` is explicitly not a release. It is published on the build's
+    #   own checks -- checksums, architecture, the module set, DT_NEEDED, the
+    #   layer's xattrs, the engine version, what each image does and does not
+    #   contain, and the refusal each component meets first -- all of which run
+    #   in the build jobs. Letting VM jobs that this repository has never been
+    #   able to run locally block every publish would mean that the day they
+    #   break for their own reasons, nobody gets an image at all.
+    #
+    #   A RELEASE tag is different and is gated on them below, by name.
+    needs: [linux, freebsd, smoke]
+    if: >-
+      ${{ github.event_name != 'pull_request'
+          && !cancelled()
+          && needs.linux.result == 'success'
+          && needs.freebsd.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      # For the manifest-list attestations at the bottom of this job.
+      id-token: write
+      attestations: write
+    steps:
+      - name: Install buildah
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y buildah
+
+      # `pattern:` matters: without it this also pulls the staged trees the
+      # smoke job uses, into the directory whose listing IS the target list.
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          path: built
+          pattern: built-*
+          merge-multiple: true
+
+      # `--password-stdin`; see the FreeBSD job.  A `-p` value is in argv.
+      #
+      # And the same authfile, for the same reason: this job attests three
+      # manifest lists per component with `actions/attest-build-provenance`,
+      # which reads the DOCKER credential chain and cannot see
+      # `containers/auth.json`.  That is the "No credentials found for registry
+      # ghcr.io" of the previous run, fixed on the buildah side because the
+      # other side has no knob.
+      - name: Log in to the registry
+        run: |
+          set -eu
+          mkdir -p "$HOME/.docker"
+          echo "DOCKER_CONFIG=$HOME/.docker" >> "$GITHUB_ENV"
+          echo "REGISTRY_AUTH_FILE=$HOME/.docker/config.json" >> "$GITHUB_ENV"
+          echo "${{ secrets.GITHUB_TOKEN }}" | buildah login --authfile "$HOME/.docker/config.json" -u "${{ github.actor }}" --password-stdin "${REGISTRY}"
+
+      # WHY `:testing` IS A MIXED-OS MANIFEST LIST, AND WHY THE SPLIT TAGS
+      # EXIST ANYWAY.
+      #
+      # An OCI manifest list keys its entries on os AND architecture, so one
+      # list can legitimately carry linux/amd64, linux/arm64, freebsd/amd64 and
+      # freebsd/arm64: `docker pull :testing` on Linux picks the Linux image and
+      # `podman pull :testing` on FreeBSD picks the FreeBSD one, from the same
+      # name.  That is what the manifest list is for and it is the answer to
+      # "BSD images alongside Docker ones" that does not make the operator
+      # choose.
+      #
+      # It carries exactly ONE FreeBSD base, because nothing in the list
+      # distinguishes 15.1 from 14.4 -- both are `freebsd/amd64`, and a runtime
+      # picking between two identical platform keys picks whichever came first,
+      # which is a coin toss dressed as a decision.  The other bases get their
+      # own tags.
+      #
+      # `:testing-linux` and `:testing-freebsd` exist as unambiguous fallbacks
+      # and that is stated rather than implied: the mixed-OS list is correct per
+      # the specification and is NOT verified against every runtime this project
+      # could be pulled by, so there is always a tag naming one operating system
+      # that cannot be got wrong.
+      #
+      # EVERY LIST IS ASSEMBLED FROM DIGESTS, AND THAT IS A CORRECTION.
+      #
+      # It used to `manifest add` the `sha-<short>-…` TAG NAMES the build jobs
+      # had pushed minutes earlier, on the strength of those tags being
+      # immutable.  They are not.  A registry tag is mutable by anyone with
+      # push rights and this workflow re-points them itself -- any re-run,
+      # `workflow_dispatch` or scheduled build on the same commit pushes over
+      # them, and with both bases and the FreeBSD `latest` package branch
+      # floating, a re-run does not necessarily produce the same bytes.  Worse,
+      # the concurrency group is per-REF with `cancel-in-progress: false`, and
+      # a branch push and a tag push at one commit are different refs: two runs
+      # are not serialised against each other, both write the same
+      # `sha-<short>-*` names, and either could assemble `:testing`, the git
+      # tag and `:latest` out of the OTHER run's images.  A release list whose
+      # contents are not what the run that published it built.
+      #
+      # So each build job now captures the digest its push returned, writes it
+      # into the marker file this job discovers targets from, and this job adds
+      # `docker://<repo>@sha256:…`.  A digest is the only thing in a registry
+      # that cannot move.  `buildah manifest add` still takes them BY REMOTE
+      # REFERENCE, so this job never rebuilds anything and never pulls a layer
+      # into local storage.  The consequence worth having: `:testing` and
+      # `sha-<short>` are the same bytes under two names, so "what is
+      # `:testing` right now" always has an answer a human can write down --
+      # and now it is an answer that cannot have been written by a different
+      # run.
+      #
+      # ONE SET OF LISTS PER COMPONENT, INTO FOUR SEPARATE REPOSITORIES.  The
+      # four components are four different programs with four different
+      # authorities; a single repository carrying all of them would make
+      # `:testing` a name that cannot be resolved without also naming which
+      # program you meant, and there is no field in a manifest list for that.
+      # The platform keys are already spent on os and architecture.
+      - name: Assemble the multi-platform tags
+        id: lists
+        run: |
+          set -eu
+          short=$(echo "${{ github.sha }}" | cut -c1-7)
+          # THE DIGESTS, IN THE LOG.  This is what a rollback needs and what
+          # an attestation is verified against; a marker whose content is
+          # never printed is a fact only the machine has.
+          echo "markers (component__target -> digest):"
+          # `|| continue` rather than a trailing `[ -e "$f" ] && echo`, and
+          # the reason is stated as what was MEASURED and not as what it looks
+          # like.  Measured under bash 5, `set -e`, with the glob matching
+          # nothing: the inline loop is FINE -- the failing `[` is not the
+          # command after the final `&&`, so `set -e` is exempt and the script
+          # carries on, rc 0.  Wrap the identical loop in a shell function and
+          # it exits 1, silently, with no output at all.  So this is not a live
+          # bug being fixed; it is a shape that is one refactor away from being
+          # one, in a file that already defines `publish()` below.  `test.sh`
+          # carries the same scar twice, once in its own `fail()`.
+          for f in built/*__*; do
+            [ -e "$f" ] || continue
+            echo "  ${f#built/} -> $(cat "$f")"
+          done
+
+          # THE MOVING TAGS ARE SCOPED TO ONE BRANCH.  With two branches in the
+          # push trigger an unscoped `:testing` means "whichever built last",
+          # which is a name nobody can reason about; and a scheduled run always
+          # runs on the repository's DEFAULT branch, so while $DEV_BRANCH is
+          # not the default branch the weekly build cannot refresh it.  Both
+          # cases are the same rule and both are said out loud, because a tag
+          # that quietly stopped moving is indistinguishable from a build that
+          # quietly stopped running.
+          moving=no
+          if [ "${GITHUB_REF:-}" = "refs/heads/${DEV_BRANCH}" ]; then
+            moving=yes
+          else
+            echo "NOTE: this run is on ${GITHUB_REF:-<no ref>}."
+            echo "      The moving :testing* tags are published from"
+            echo "      refs/heads/${DEV_BRANCH} only, so two branches can"
+            echo "      never fight over one name. They are NOT moved by this"
+            echo "      run. The per-commit sha-${short}* tags below ARE"
+            echo "      published, and :testing still points wherever the last"
+            echo "      ${DEV_BRANCH} build left it."
+            if [ "${GITHUB_EVENT_NAME:-}" = "schedule" ]; then
+              echo "      This was the weekly build, whose whole purpose is to"
+              echo "      pick up moved FreeBSD ports and a moved Debian base."
+              echo "      It has done so and stamped them sha-${short}*, but"
+              echo "      nobody pulling :testing will see them until"
+              echo "      DEV_BRANCH is this repository's default branch."
+            fi
+          fi
+
+          # A RELEASE IS GATED ON THE SMOKE JOB AND THE GATE IS COMPUTED HERE,
+          # SPENT BELOW.  `needs.smoke.result` is `success`, `failure`,
+          # `cancelled` or `skipped`, and with a matrix it is the aggregate of
+          # the four cells -- so one broken component refuses the whole
+          # release, which is the right direction for a set of images that are
+          # meant to be deployed together.
+          #
+          # Read here and acted on AFTER every moving tag has been pushed, not
+          # instead of them: the sha- and :testing names are published on the
+          # build's own checks either way, and only the release names are
+          # withheld.  Refusing at the top would withhold both, which is a
+          # bigger claim than the smoke job supports.
+          release=
+          case "${GITHUB_REF:-}" in
+            refs/tags/*) release="${GITHUB_REF#refs/tags/}" ;;
+          esac
+
+          # publish <manifest> <tag>...   -- moving names are filtered here, in
+          # ONE place, so a tag added later cannot miss the rule by being added
+          # somewhere else.  `$dest` is the component's repository and is
+          # reassigned by the loop below; the function reads it rather than
+          # taking it, so a caller cannot pass one repository's list to another
+          # repository's name.
+          publish() {
+            _m=$1; shift
+            for _t in "$@"; do
+              case "$_t" in
+                testing*)
+                  if [ "$moving" != yes ]; then
+                    echo "  skip ${dest}:${_t} (not ${DEV_BRANCH})"
+                    continue
+                  fi
+                  ;;
+              esac
+              buildah manifest push --all --digestfile "dig-${_m}" \
+                "$_m" "docker://${dest}:${_t}"
+              echo "  push ${dest}:${_t} -> $(cat "dig-${_m}")"
+            done
+          }
+
+          # ---- one set of lists per component ----------------------------
+          for comp in ingest api mcp proxy; do
+            dest="${REGISTRY}/${IMAGE_NAME}-${comp}"
+            echo ""
+            echo "=== ${dest} ==="
+
+            # ---- one manifest per FreeBSD base ---------------------------
+            #
+            # Discovered from the markers, so the build matrix stays the only
+            # place the target list is written down.  A glob rather than `ls`:
+            # the names are the matrix's own and carry no spaces, but a
+            # pipeline off `ls` is a habit that stops being safe the moment
+            # they do.
+            fslugs=
+            for f in "built/${comp}"__freebsd*__*; do
+              [ -e "$f" ] || continue
+              s=${f#"built/${comp}__"}; s=${s%%__*}
+              case " $fslugs " in *" $s "*) ;; *) fslugs="$fslugs $s" ;; esac
+            done
+            echo "freebsd bases built for ${comp}:${fslugs:- none}"
+            for slug in $fslugs; do
+              m="m-${comp}-${slug}"
+              buildah manifest create "$m"
+              for arch in amd64 arm64; do
+                if [ ! -f "built/${comp}__${slug}__${arch}" ]; then
+                  echo "NOTE: ${comp}/${slug} has no ${arch} build; its manifest will not include ${arch}"
+                  continue
+                fi
+                buildah manifest add "$m" "docker://${dest}@$(cat "built/${comp}__${slug}__${arch}")"
+              done
+              publish "$m" "sha-${short}-${slug}" "testing-${slug}"
+            done
+
+            # ---- the Linux manifest --------------------------------------
+            m="m-${comp}-linux"
+            buildah manifest create "$m"
+            larches=
+            for arch in amd64 arm64; do
+              if [ ! -f "built/${comp}__linux__${arch}" ]; then
+                echo "NOTE: ${comp}/linux has no ${arch} build; its manifest will not include ${arch}"
+                continue
+              fi
+              buildah manifest add "$m" "docker://${dest}@$(cat "built/${comp}__linux__${arch}")"
+              larches="${larches} ${arch}"
+            done
+            if [ -z "$larches" ]; then
+              echo "no Linux image was built for ${comp} at all" >&2
+              exit 1
+            fi
+            publish "$m" "sha-${short}-linux" "testing-linux"
+
+            # ---- the combined list ---------------------------------------
+            #
+            # Refused rather than published half-complete: a `:testing` that
+            # silently contained only Linux would be indistinguishable, to
+            # somebody on FreeBSD, from a registry that had never heard of
+            # them.
+            if [ ! -f "built/${comp}__${DEFAULT_FREEBSD}__amd64" ] && \
+               [ ! -f "built/${comp}__${DEFAULT_FREEBSD}__arm64" ]; then
+              echo "the default FreeBSD base ${DEFAULT_FREEBSD} produced nothing" >&2
+              echo "for ${comp}, so ${dest}:testing would be a Linux-only list" >&2
+              echo "under a name that promises both. Refusing to publish it;" >&2
+              echo "${dest}:testing-linux is published and unambiguous." >&2
+              exit 1
+            fi
+            m="m-${comp}-all"
+            buildah manifest create "$m"
+            for arch in $larches; do
+              buildah manifest add "$m" "docker://${dest}@$(cat "built/${comp}__linux__${arch}")"
+            done
+            for arch in amd64 arm64; do
+              [ -f "built/${comp}__${DEFAULT_FREEBSD}__${arch}" ] || continue
+              buildah manifest add "$m" "docker://${dest}@$(cat "built/${comp}__${DEFAULT_FREEBSD}__${arch}")"
+            done
+            publish "$m" "sha-${short}" "testing"
+
+            # `:testing-freebsd` is the default base under an OS name -- the
+            # FreeBSD twin of `:testing-linux` -- so it is pushed from that
+            # base's own manifest and NOT from the combined list.  Pushing the
+            # combined list here would put Linux images behind a tag whose name
+            # says FreeBSD.
+            publish "m-${comp}-${DEFAULT_FREEBSD}" "testing-freebsd"
+          done
+
+          # ---- releases ---------------------------------------------------
+          #
+          # UNREACHABLE TODAY AND SAID SO: this repository has no tags at all,
+          # which is the same fact `claudio update` has to state when it looks
+          # for one. Until something is tagged, `testing` and `sha-<short>` are
+          # the whole of the scheme, and `:latest` DOES NOT EXIST -- a pull of
+          # it fails with manifest-unknown, which is the honest answer. A
+          # `:latest` pointing at a development build would be a wrong image
+          # served under the one name that promises it is not.
+          #
+          # These do NOT go through `publish`: they are release names, not
+          # moving-development names, and their gate is the smoke job rather
+          # than the branch.  A SECOND LOOP, so that no component's release
+          # name is published before every component's has been allowed --
+          # four repositories that are meant to be deployed together must not
+          # be able to go half-released.
+          if [ -n "$release" ]; then
+            if [ "${{ needs.smoke.result }}" != "success" ]; then
+              echo "REFUSING to publish ${release} and :latest --" >&2
+              echo "  the FreeBSD smoke job did not pass (${{ needs.smoke.result }})." >&2
+              echo "  It is the only place anything is EXECUTED on FreeBSD:" >&2
+              echo "  the engine, the interpreter and nginx all run there and" >&2
+              echo "  nowhere else, so without it the numpy/pandas exclusion" >&2
+              echo "  and three staged trees are inferences and not" >&2
+              echo "  measurements. The sha- tags above ARE published; a" >&2
+              echo "  release is not." >&2
+              exit 1
+            fi
+            for comp in ingest api mcp proxy; do
+              dest="${REGISTRY}/${IMAGE_NAME}-${comp}"
+              m="m-${comp}-all"
+              buildah manifest push --all --digestfile "dig-${m}" \
+                "$m" "docker://${dest}:${release}"
+              echo "  push ${dest}:${release} -> $(cat "dig-${m}")"
+              buildah manifest push --all --digestfile "dig-${m}" \
+                "$m" "docker://${dest}:latest"
+              echo "  push ${dest}:latest -> $(cat "dig-${m}")"
+            done
+          fi
+
+          # THE LIST DIGESTS, FOR THE ATTESTATIONS BELOW.
+          #
+          # The build jobs attest each per-architecture IMAGE.  A tag such as
+          # `:testing` resolves to the manifest LIST, which is a different
+          # digest, so `gh attestation verify oci://…:testing` would find
+          # nothing without this -- and `:testing` is the name this repository
+          # tells people to pull.  Three lists PER COMPONENT are attested and
+          # the rest are not, which is stated in `server/README.md` rather than
+          # left to be discovered: the combined list (`:testing`,
+          # `sha-<short>`, a release tag and `:latest`), the Linux list and the
+          # default FreeBSD base's.  A non-default FreeBSD base gets the
+          # per-architecture attestations only.
+          #
+          # FIXED OUTPUT NAMES, DERIVED FROM THE ROLE AND NEVER FROM THE
+          # BASE'S OWN NAME.  A key built out of `$DEFAULT_FREEBSD` -- which
+          # is what the loop this replaces did -- stops matching the moment
+          # that variable moves to 15.2: the `if:` on the attest steps below
+          # then evaluates false, the default FreeBSD list quietly stops being
+          # attested, and every job stays green.  `if` blocks rather than a
+          # trailing `&&`, because this job runs under `set -e` and a false
+          # `[` as the last command of a compound is the scar `test.sh`
+          # carries twice.
+          for comp in ingest api mcp proxy; do
+            if [ -f "dig-m-${comp}-all" ]; then
+              echo "m_all_${comp}=$(cat "dig-m-${comp}-all")" >> "$GITHUB_OUTPUT"
+            fi
+            if [ -f "dig-m-${comp}-linux" ]; then
+              echo "m_linux_${comp}=$(cat "dig-m-${comp}-linux")" >> "$GITHUB_OUTPUT"
+            fi
+            if [ -f "dig-m-${comp}-${DEFAULT_FREEBSD}" ]; then
+              echo "m_fbsd_${comp}=$(cat "dig-m-${comp}-${DEFAULT_FREEBSD}")" >> "$GITHUB_OUTPUT"
+            fi
+          done
+
+      # ATTESTING THE LIST DIGESTS.  See the note in the assemble step for why
+      # the per-architecture attestations the build jobs make are not enough:
+      # a tag resolves to the manifest LIST, which is its own digest.  Each is
+      # conditional on the output existing, because a run on a branch that is
+      # not $DEV_BRANCH publishes no moving tag and a FreeBSD base that
+      # produced nothing has no list at all -- and a `subject-digest` of the
+      # empty string would fail the job for a list that was never published.
+      #
+      # TWELVE STEPS AND NOT A LOOP, because a step is the unit of `if:` and
+      # `uses:` in this file's only language.  Written out, each one names the
+      # repository it attests, which is the value that must not be wrong: an
+      # attestation whose subject names the wrong repository verifies against
+      # nothing, and `gh attestation verify` on the image the operator pulled
+      # would report it unattested rather than reporting a mismatch.
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
+        if: steps.lists.outputs.m_all_ingest != ''
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-ingest
+          subject-digest: ${{ steps.lists.outputs.m_all_ingest }}
+          push-to-registry: true
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
+        if: steps.lists.outputs.m_linux_ingest != ''
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-ingest
+          subject-digest: ${{ steps.lists.outputs.m_linux_ingest }}
+          push-to-registry: true
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
+        if: steps.lists.outputs.m_fbsd_ingest != ''
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-ingest
+          subject-digest: ${{ steps.lists.outputs.m_fbsd_ingest }}
+          push-to-registry: true
+
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
+        if: steps.lists.outputs.m_all_api != ''
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-api
+          subject-digest: ${{ steps.lists.outputs.m_all_api }}
+          push-to-registry: true
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
+        if: steps.lists.outputs.m_linux_api != ''
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-api
+          subject-digest: ${{ steps.lists.outputs.m_linux_api }}
+          push-to-registry: true
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
+        if: steps.lists.outputs.m_fbsd_api != ''
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-api
+          subject-digest: ${{ steps.lists.outputs.m_fbsd_api }}
+          push-to-registry: true
+
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
+        if: steps.lists.outputs.m_all_mcp != ''
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-mcp
+          subject-digest: ${{ steps.lists.outputs.m_all_mcp }}
+          push-to-registry: true
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
+        if: steps.lists.outputs.m_linux_mcp != ''
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-mcp
+          subject-digest: ${{ steps.lists.outputs.m_linux_mcp }}
+          push-to-registry: true
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
+        if: steps.lists.outputs.m_fbsd_mcp != ''
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-mcp
+          subject-digest: ${{ steps.lists.outputs.m_fbsd_mcp }}
+          push-to-registry: true
+
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
+        if: steps.lists.outputs.m_all_proxy != ''
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-proxy
+          subject-digest: ${{ steps.lists.outputs.m_all_proxy }}
+          push-to-registry: true
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
+        if: steps.lists.outputs.m_linux_proxy != ''
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-proxy
+          subject-digest: ${{ steps.lists.outputs.m_linux_proxy }}
+          push-to-registry: true
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
+        if: steps.lists.outputs.m_fbsd_proxy != ''
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-proxy
+          subject-digest: ${{ steps.lists.outputs.m_fbsd_proxy }}
+          push-to-registry: true
+
+# ===========================================================================
+# WHAT IS NOT VERIFIED
+# ===========================================================================
+#
+# Stated here rather than left to be inferred from a green tick, because an
+# untested assertion in a workflow is the same defect as an untested assertion
+# in code.
+#
+#   * THE FOUR-WAY SPLIT'S PUBLISHING HALF HAS NEVER RUN, AND THAT IS THE
+#     NEWEST GAP. Nothing has ever been pushed to `claudio-ingest`,
+#     `claudio-api`, `claudio-mcp` or `claudio-proxy` -- the repositories do
+#     not exist on ghcr.io yet, so the first run also creates them, and a
+#     package created by a workflow is PRIVATE by default. `server/README.md`
+#     says how to make one public; nothing here can, and nothing here pretends
+#     the first `docker pull` will work without that step.
+#
+#   * THE ATTESTATION CREDENTIAL FIX IS REASONED, NOT WATCHED. The previous
+#     run failed with "No credentials found for registry ghcr.io", and the
+#     cause is a difference in default file LOCATION that is documented on both
+#     sides: `buildah login` writes `${XDG_RUNTIME_DIR}/containers/auth.json`
+#     and `actions/attest-build-provenance` reads the Docker credential chain.
+#     The fix -- `buildah login --authfile` at the Docker-style path, with
+#     `DOCKER_CONFIG` and `REGISTRY_AUTH_FILE` exported so both tools read the
+#     one file -- has not been observed to succeed, because nothing here has
+#     ever pushed an attestation at all. What IS established is that the two
+#     tools use the same file FORMAT, so the file buildah writes is a file the
+#     action can parse. If it still fails, the next thing to try is a
+#     `docker login` beside the buildah one, and the reason that is not what
+#     this file does is that it takes the credential out twice for one job.
+#
+#   * THE PER-COMPONENT RUNTIME CHECKS IN THE LINUX JOB WERE MEASURED, ON THIS
+#     REPOSITORY'S OWN LOCALLY BUILT LINUX IMAGES, and that is the one part of
+#     this change that is not an inference: uid 65534 and no HEALTHCHECK on all
+#     four; `import duckdb` succeeding in the api and raising ModuleNotFoundError
+#     in ingest and mcp; exit 8 from `ingest --no-ship`; exit 7 from mcp with an
+#     ambient token; exit 9 from the api over a store with no `accounts/` and
+#     exit 4 once it has one; and the proxy answering 502 on `/api/v1/...`,
+#     `/sender` and `/mcp`, 404 on `/healthz` and 404 in the API refusal
+#     envelope on `/`. The api's exit 4 is worth naming: the single-door
+#     version of this step asserted 4 unconditionally, and over an empty store
+#     the reader refuses with 9 first -- so that assertion would have gone red
+#     on the first run for a reason that is not a fault. What is NOT
+#     established is that any of it behaves the same on a GitHub runner or on
+#     arm64; these were amd64 Docker builds on one workstation.
+#
+#   * NOTHING IN THIS FILE HAS EVER BEEN RUN ON GITHUB ACTIONS. It has never
+#     executed there, from any branch. `buildah` and `skopeo` are absent from the
+#     machine it was written on, with no Darwin build of buildah to install,
+#     and `podman` is present there only as a client with no machine behind
+#     it -- so NOTHING BUILT BY buildah HAS EVER EXISTED, and nothing has been
+#     pushed or pulled from anywhere.
+#
+#     One FreeBSD image HAS been built there, by `docker build --platform
+#     freebsd/amd64`, in 2.9 s -- the no-RUN design working as intended. It
+#     establishes that the Containerfile is sound and that the labels land;
+#     it establishes nothing about the three things in this file that are
+#     specifically buildah's, namely `--format oci` dropping HEALTHCHECK, the
+#     `--annotation` flags, and the STORAGE_DRIVER: vfs xattr trap.
+#
+#   * What HAS been checked locally, and how: `actionlint 1.7.12` (which runs
+#     `shellcheck` over every `run:` block and validates every expression and
+#     action reference), `yamllint`, and a Python `yaml.safe_load`. Those
+#     prove the file parses and that the shell in it is sound. They prove
+#     nothing whatever about whether the jobs pass.
+#
+#   * The FIVE action pins were resolved with `git ls-remote --tags` against
+#     each repository on 2026-08-21 and are real commits -- re-resolved after
+#     `attest-build-provenance` was added, and worth saying why: the first
+#     draft of that line carried a 40-hex string that LOOKED like v3.0.0's and
+#     was not any commit in that repository. A pin nobody resolved is a pin
+#     that fails the job at best. That the pinned versions BEHAVE as this file
+#     assumes is not checked by anything here.
+#
+#   * NOTHING HAS EVER BEEN ATTESTED OR VERIFIED. The attestation steps request
+#     `id-token: write` and name a digest as their subject, and none of them
+#     has run. `gh attestation verify oci://...@sha256:...` is what they are
+#     for; it is not something anybody has watched succeed.
+#
+#   * THE BASE-DIGEST RESOLUTION AS THESE JOBS SPELL IT has not been run: the
+#     `skopeo inspect --raw | sha256sum` step needs skopeo, which is not on
+#     the development machine. The equivalent WAS run there by other means --
+#     `docker buildx imagetools inspect --format {{.Manifest.Digest}}` and a
+#     stdlib registry client whose bytes were hashed locally -- and all of
+#     them, plus `RepoDigests` on the pulled image, agree. So the operation
+#     produces a real digest; the exact command in this file is untested.
+#
+#   * AND ONE CLAIM WAS WITHDRAWN RATHER THAN INHERITED. A review asserted
+#     that `python:3.12-slim-bookworm` moved from sha256:a116514e... to
+#     sha256:356b0d18... inside eight days, and that sentence was written into
+#     this file as a measurement. Re-checking it on 2026-08-21 by all three
+#     methods above returns a116514e -- the same digest as the 13 August pull.
+#     356b0d18 could not be reproduced. No movement has been observed here.
+#
+#   * The mixed-OS `:testing` manifest list is correct per the OCI image
+#     specification and has not been pulled by any runtime. `:testing-linux`
+#     and `:testing-freebsd` exist so that the unverified part is never the
+#     only way to get an image.
+#
+#   * The `smoke` job is the only place anything is EXECUTED on FreeBSD, and it
+#     covers freebsd15.1/amd64 alone. The 15.0 and 14.4 bases and every arm64
+#     cell are checked statically -- checksums, ELF architecture, DT_NEEDED
+#     against the unpacked base, the module set -- and are NOT claimed to have
+#     run.
+#
+#     It now covers all four components rather than the api alone, which
+#     closes a gap worth naming: for three of the four, a completely broken
+#     staged tree passed every check in this file and published, because
+#     nothing else here executes a FreeBSD instruction. That is a NEW cell in
+#     each case and none of the four has run.

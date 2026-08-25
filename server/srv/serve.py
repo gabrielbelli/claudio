@@ -119,6 +119,18 @@ PATH_API = "/api/"
 # The versioned API.  `api.PATH_V1` is the same string; it is compared in the
 # suite rather than duplicated by hand.
 PATH_API_V1 = "/api/v1/"
+# THERE IS NO `PATH_MCP` HERE, AND ITS ABSENCE IS A DECISION.
+#
+# `POST /mcp` was served from this file for exactly one commit.  Its tell was
+# the self-call: the handler built `http://127.0.0.1:<own port>` and talked to
+# itself over HTTP, which the moment the door split in two is the WRONG
+# PROCESS.  More to the point, an MCP surface's whole stated authority is one
+# bearer token handed to it per request -- so serving it from the process that
+# holds the DuckDB handle, the store's query layer and (when ship is enabled)
+# the writer's lock hands an agent every one of those to be careful with.
+#
+# It lives in `srv/mcp.py`, which imports no sibling module and runs flat, and
+# `srv/mcp.py` is not in the ingest image's build context at all.
 
 # Spelled to match `cu.ship.CONTENT_TYPE`, and a test compares the two rather
 # than trusting this line.
@@ -162,6 +174,55 @@ TENANT_OK = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 
 def valid_tenant(name):
     return bool(name) and bool(TENANT_OK.match(name)) and ".." not in name
+
+
+# A KEY carries the account it ships for, so nobody has to go and find one.
+#
+# The setup step this deletes was the whole of the complaint: a token's value
+# had to equal the shipping account's `account_uuid` exactly -- the door refuses
+# the batch otherwise -- and that uuid lives in `.claude.json` on the
+# WORKSTATION, which is not a machine the person configuring the server is
+# looking at. So the operator hunted a 36-character string across hosts, and
+# got a 409 with no clue in it when they guessed.
+#
+#     <account-uuid>.<secret>
+#
+# One line, generated where the uuid already is, pasted where the server is.
+# The left half says which account, the right half is the secret that proves
+# entitlement to it; `.` separates them because a uuid cannot contain one and
+# the secret is chosen from an alphabet that excludes it.
+#
+# NOTHING ON THE WIRE CHANGES. It is still `Authorization: Bearer <one line>`,
+# so an installed shipper needs no update and an old plain token in the map
+# keeps working -- `split` returns no account for it and the map's value is
+# used, exactly as before.
+KEY_SECRET_OK = re.compile(r"^[A-Za-z0-9_-]{16,}$")
+# The left half must LOOK like a uuid, not merely be a legal tenant name.
+# `valid_tenant` accepts any safe folder name, so without this a perfectly
+# ordinary token containing a dot -- `mytoken.somethingsomething` -- would be
+# read as naming an account called `mytoken`, and its records would be filed
+# under a tenant nobody created. Refusing to split is always safe; guessing
+# wrong files one machine's usage under another's name, silently.
+KEY_UUID_OK = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}"
+    r"-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+
+
+def split_key(token):
+    """(account, secret) for a self-describing key, else (None, token).
+
+    Never raises and never guesses: anything that is not exactly
+    `<valid-uuid>.<secret>` is returned unsplit, so a token that merely
+    contains a dot is not silently reinterpreted as an account it does not
+    name.
+    """
+    if not token or "." not in token:
+        return None, token
+    account, _, secret = token.partition(".")
+    if not KEY_UUID_OK.match(account) or not valid_tenant(account) \
+            or not KEY_SECRET_OK.match(secret):
+        return None, token
+    return account, secret
 
 
 # --------------------------------------------------------------------------
@@ -246,9 +307,38 @@ class Tenants(object):
             self.load()
 
     def _absorb(self, doc):
+        """The file, in either shape.
+
+        A LIST of self-describing keys is the shape to write now -- one line
+        each, nothing to look up:
+
+            ["9a701c41-....k7Qm3v...", "c0235ad1-....pR2wL8..."]
+
+        The MAP is still read, because it is what is deployed and because a
+        plain opaque token has nowhere else to say which account it means:
+
+            {"<token>": "<account-uuid>"}
+        """
+        if isinstance(doc, list):
+            for i, key in enumerate(doc):
+                where = "entry %d" % (i + 1)
+                if not isinstance(key, str) or not key:
+                    self.refused.append((where, "not a non-empty string"))
+                    continue
+                account, _secret = split_key(key)
+                if account is None:
+                    self.refused.append(
+                        (where, "a bare list holds SELF-DESCRIBING keys, and "
+                                "this is not one: a key is "
+                                "<account-uuid>.<secret>. A plain token has "
+                                "nowhere to say which account it means, so it "
+                                "needs the object form"))
+                    continue
+                self.map[key] = account
+            return
         if not isinstance(doc, dict):
-            self.refused.append(("(file)", "not a JSON object of token -> "
-                                           "account_uuid"))
+            self.refused.append(("(file)", "neither a list of keys nor an "
+                                           "object of token -> account_uuid"))
             return
         for i, (token, tenant) in enumerate(doc.items()):
             where = "entry %d" % (i + 1)
@@ -278,6 +368,18 @@ class Tenants(object):
         return self
 
     def resolve(self, token):
+        """The account this token ships for, or None.
+
+        One lookup, both shapes. A self-describing key gets its account column
+        filled in by `_absorb` when the file is read, so there is nothing extra
+        to do here -- and deliberately so: an earlier draft re-derived the
+        account from the key at lookup time, which was dead code for the list
+        form AND would have silently overridden an explicit value in the object
+        form. A file that says `{"<uuid1>.<secret>": "<uuid2>"}` is somebody
+        being confused, and the honest answer is the value they wrote, not the
+        one the key happens to carry. Mutation testing found it: deleting the
+        branch failed nothing.
+        """
         return self.map.get(token) if token else None
 
     def tenants(self):
@@ -392,9 +494,24 @@ class Readers(object):
         return self.map.get(token) if token else None
 
     def permits(self, scope, account):
-        """May this scope read this account?  An unscoped read is always fine;
-        it is the ROUTE that decides whether omitting an account is allowed,
-        and `store` already refuses to total across accounts."""
+        """May this scope read this account?
+
+        `account is None` -- the caller named none -- answers True HERE and is
+        then refused one layer in, by `api.Api._scope_refusal`.  It used to
+        answer True and be refused nowhere, on the strength of a sentence in
+        this docstring that said the route and `store` between them covered
+        it.  THAT WAS FALSE and was measured against the running stack:
+        `store` refuses to TOTAL across accounts and returns ROWS across them
+        happily, so a token scoped to one account read every other account's
+        rows, identities and email addresses through `/api/v1/search`,
+        `/lookup`, `/accounts` and `/diagnostics` -- and through the MCP
+        surface with them -- as long as it never named an account.
+
+        This function is deliberately still only about the NAMED case.  The
+        omitted case is a question about the ROUTE, and `api.py` is the module
+        that knows the routes; putting it there is also what makes it pure and
+        what makes it apply to any transport that ever reaches `handle`.
+        """
         if scope == ALL_ACCOUNTS or account is None:
             return True
         return account in scope
@@ -484,7 +601,7 @@ class Store(object):
     rather than left to interleave offsets files.
     """
 
-    def __init__(self, root, reserve=DISK_RESERVE, counters=None):
+    def __init__(self, root, reserve=DISK_RESERVE, counters=None, create=True):
         self.root = os.path.abspath(root)
         self.reserve = reserve
         self.counters = counters if counters is not None else Counters()
@@ -493,8 +610,23 @@ class Store(object):
         # A hook, not a global: two Stores in one process must be able to
         # disagree about how much room they have.
         self.statvfs = os.statvfs
-        os.makedirs(os.path.join(self.root, "accounts"), mode=0o700, exist_ok=True)
-        os.makedirs(os.path.join(self.root, "offsets"), mode=0o700, exist_ok=True)
+        # `create=False` IS THE READER, AND THESE TWO LINES ARE THE ONLY
+        # REASON IT NEEDS TO EXIST.
+        #
+        # A reader-only door (`--no-ship`) is handed the store volume READ
+        # ONLY.  `os.makedirs(..., exist_ok=True)` on a read-only mount raises
+        # EROFS when the directory is absent -- so constructing this object at
+        # all would abort a process that is not going to write a byte, and the
+        # operator would read a permission error as a broken mount rather than
+        # as the correct configuration it is.  Nothing else in `__init__`
+        # touches the filesystem, and `accept` -- the only method that writes
+        # -- is unreachable with shipping off (`ShipHandler.do_POST` refuses by
+        # name above it).
+        if create:
+            os.makedirs(os.path.join(self.root, "accounts"),
+                        mode=0o700, exist_ok=True)
+            os.makedirs(os.path.join(self.root, "offsets"),
+                        mode=0o700, exist_ok=True)
 
     # -- paths -----------------------------------------------------------
 
@@ -752,6 +884,41 @@ def lock_root(root):
     waits, for `claudio usage ingest`'s reason: a silent wait hides the
     concurrency from the only person who can do anything about it.  `flock`
     dies with the process, so a crash cannot strand it.
+
+    NARROWED DELIBERATELY WHEN THE DOOR SPLIT IN TWO, AND THE PARAGRAPH ABOVE
+    IS WHY IT COULD BE.
+
+      Read the reason again and notice what it does NOT say.  It does not say
+      "two processes on one root".  It says two processes interleaving the
+      OFFSETS, and the offsets are written in exactly one place -- the
+      read-modify-write inside `Store.accept`, from `load_offsets` to
+      `save_offsets`, held under `Store.lock`.  A reader never opens that file.
+      So this is the WRITER's lock, and it is taken only by a process that
+      serves `POST /v1/ship`: `serve()` calls it under `ship_enabled`, and a
+      reader-only door (`--no-ship`) never reaches it.
+
+      TWO WRITERS ARE STILL REFUSED, AND LOUDLY.  Both would be ship-enabled,
+      both take this lock, the second gets None and exits 3 with the same
+      message it always printed.  Nothing about that path changed.
+
+      WHAT WAS GIVEN UP, STATED RATHER THAN DISCOVERED.  Before, a second
+      process of ANY kind on one root was refused, so the lock incidentally
+      prevented a reader too.  That refusal was never load-bearing: the reader
+      inside this very process has always read the JSONL with no lock at all --
+      `View.load` and `DuckStore` take nothing -- so a separate reader process
+      is the concurrency that was already happening between two threads, moved
+      across a process boundary.  What covers it is what covered it before: a
+      final line with no newline is a write in progress and `_append`
+      terminates it rather than gluing onto it, `read_batches` reports a
+      manifest whose byte range is not fully on disk instead of skipping it,
+      and `duck.py` excludes and COUNTS the `request_id IS NULL` set a torn
+      line becomes.  Those three are asserted in the suite and none of them
+      mentions a lock.
+
+      AND WHAT THIS LOCK HAS NEVER COVERED.  `flock` is advisory and is not
+      dependable across NFS or SMB.  A store on a network filesystem with two
+      writers on two machines is refused by nothing here and never was; that is
+      unchanged by the split and is not a thing to fix in this function.
     """
     os.makedirs(root, mode=0o700, exist_ok=True)
     fd = os.open(os.path.join(root, "door.lock"),
@@ -784,8 +951,10 @@ class Door(object):
     """
 
     def __init__(self, store, tenants, max_body=MAX_BODY,
-                 max_decompressed=MAX_DECOMPRESSED, counters=None):
+                 max_decompressed=MAX_DECOMPRESSED, counters=None,
+                 ship_enabled=True):
         self.readers = None
+        self.ship_enabled = ship_enabled
         self.store = store
         self.tenants = tenants
         self.max_body = max_body
@@ -908,9 +1077,19 @@ class Door(object):
             if got is not None and got != tenant:
                 return self._refuse(
                     409, "identity",
-                    detail="line %d names another account; the token names "
-                           "this one, and nothing from a batch that disagrees "
-                           "is written" % (i + 2),
+                    # NAME the value, because this is the error a first-time
+                    # setup actually hits: the token's value must equal the
+                    # shipping account's `account_uuid` exactly, and that UUID
+                    # lives in `~/.claudio/accounts/<name>/.claude.json` on the
+                    # WORKSTATION -- not anywhere the person configuring the
+                    # server can see. Printing it turns one failed shipment
+                    # into the answer, instead of a 409 that says only that two
+                    # values disagree without saying what either of them is.
+                    detail="line %d names account %s; this token names %s. "
+                           "Nothing from a batch that disagrees is written. If "
+                           "you are setting this up, the token's value must BE "
+                           "the shipping account's uuid: put %s in tokens.json"
+                           % (i + 2, got, tenant, got),
                     offset=held)
 
         ok, free = self.store.room_for(len(body))
@@ -947,6 +1126,38 @@ class Door(object):
         out["tenants_configured"] = len(self.tenants.tenants())
         out["tokens_refused"] = [{"where": w, "why": y}
                                  for w, y in self.tenants.refused]
+        # THE ENGINE, BECAUSE THIS IS THE ONLY SURFACE THAT ANSWERS WITHOUT A
+        # CREDENTIAL.  `/api/v1/capabilities` and `/api/v1/health` both name
+        # it and both sit behind reader auth -- and `readers.json` is not an
+        # exotic configuration, it is the only one `serve()` permits on a
+        # non-loopback bind, i.e. every container.  Measured before this line
+        # existed: the key sets of an engine-present and an engine-absent door
+        # were identical, so the health check this project's own README
+        # recommends reported HEALTHY for a door whose entire stream-A half
+        # refuses every question.  A 200 from `/healthz` means the door is up
+        # and taking shipments; `engine.available` is the separate question of
+        # whether stream A can be QUERIED, and it has to be askable here or it
+        # is not askable by monitoring at all.  Additive, so the shape the
+        # README calls exact is unchanged for every existing reader.
+        out["engine"] = {"name": "duckdb", "available": duckstore.available()}
+        # THE ROLE, BECAUSE A READER'S ZERO IS A PLAUSIBLE ZERO.
+        #
+        # Every write counter in this payload comes from THIS process's own
+        # `Counters`.  A reader-only process accepts no batch, so
+        # `records_written: 0` is structurally true of it and says nothing at
+        # all about the store -- and a monitor reading the same key set off
+        # both halves of a split door would conclude a healthy stack had
+        # ingested nothing.  The shape is otherwise unchanged, so every
+        # existing reader keeps working; these two keys are added, and the
+        # second one is a sentence rather than a flag because the number it
+        # explains is already on the screen next to it.
+        out["role"] = "writer" if self.ship_enabled else "reader"
+        if not self.ship_enabled:
+            out["counters_are"] = (
+                "this process's own; it accepts no batches, so every write "
+                "counter here is structurally zero -- and tenants_configured "
+                "with it, because a reader never opens the shipping tokens "
+                "file. Ask the ingest service.")
         return out
 
 
@@ -1201,8 +1412,34 @@ class ShipHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _reader_refusal(self, params):
-        """(status, body) when this caller may not read, else None.
+    def _reader_auth(self, params):
+        """(refusal, scope) for this request.
+
+        `refusal` is (status, body) when the caller may not read at all, and
+        `scope` is the account list to hand `api.Api.handle` -- None for
+        everything, which is both the `"*"` token and the no-auth-configured
+        case.
+
+        AUTHENTICATION IS HERE; AUTHORISATION IS ONE LAYER IN.  This function
+        decides who the caller is; `api.Api._scope_refusal` decides what that
+        caller may ask, because that is a question about the ROUTE and `api.py`
+        is the module that knows the routes.  Splitting them this way is what
+        closed the hole: the check used to live entirely here, keyed on the
+        `?account=` parameter, so a scoped token that simply never named an
+        account was answered in full.  A gate that only holds against a caller
+        who cooperates is not a gate.
+
+        THE `account-not-permitted` CHECK BELOW IS DELIBERATELY ALSO IN
+        `api.Api._scope_refusal`, AND THE DUPLICATION IS ADMITTED RATHER THAN
+        TIDIED.  This one runs at the transport, before the path is even
+        resolved, and is what `Readers.permits` exists for; that one is the
+        rule itself and is what makes it hold for a caller that reaches
+        `handle` without going through this handler -- which is how the suite
+        asks it, and is the shape a second transport would take.  Neither is
+        redundant in the way that matters: each is exercised by a case the
+        other cannot see, and both are pinned.  If you delete one, delete the
+        test that only that one satisfies in the same commit, so the loss is
+        visible.
 
         Absent `readers.json` means reader auth is not configured. On loopback
         that is the development default and `serve()` has already warned about
@@ -1211,7 +1448,7 @@ class ShipHandler(BaseHTTPRequestHandler):
         """
         readers = self.door.readers
         if readers is None or not readers.configured:
-            return None
+            return None, None
         token = bearer(self.headers.get("Authorization"))
         scope = readers.scope(token)
         if scope is None:
@@ -1220,7 +1457,9 @@ class ShipHandler(BaseHTTPRequestHandler):
                 "no usable reader token on this request",
                 "send `Authorization: Bearer <token>` with a token from the "
                 "server's readers file; ask whoever runs the door for one",
-                status=401)
+                status=401), None
+        if scope == ALL_ACCOUNTS:
+            return None, None
         asked = params.get("account")
         if asked and not readers.permits(scope, asked):
             return api._refusal(
@@ -1228,8 +1467,8 @@ class ShipHandler(BaseHTTPRequestHandler):
                 "this token may not read account %s" % asked,
                 "ask for an account this token covers, or ask the door's "
                 "operator to widen the token's scope",
-                status=403)
-        return None
+                status=403), None
+        return None, list(scope)
 
     def do_GET(self):
         path, _, qs = self.path.partition("?")
@@ -1255,12 +1494,12 @@ class ShipHandler(BaseHTTPRequestHandler):
             # it is named, because an empty result would be indistinguishable
             # from an account that has shipped nothing, and telling those two
             # apart is the whole point of this API's vocabulary.
-            denied = self._reader_refusal(params)
+            denied, scope = self._reader_auth(params)
             if denied is not None:
                 self._respond(denied[0], denied[1])
                 return
             try:
-                status, obj = self.api.handle(path, params, multi)
+                status, obj = self.api.handle(path, params, multi, scope=scope)
             except duckstore.DuckDBMissing as exc:
                 # LOUD and specific, never an empty result: "0 requests" is a
                 # perfectly plausible answer for an account that has not
@@ -1297,10 +1536,36 @@ class ShipHandler(BaseHTTPRequestHandler):
                                       "%s" % (PATH_SHIP, PATH_API_V1)})
 
     def do_POST(self):
-        if self.path.split("?")[0] != PATH_SHIP:
+        path = self.path.split("?")[0]
+        if path != PATH_SHIP:
             self.door.counters.refused("not-found")
             self._respond(404, {"ok": False, "reason": "not-found",
                                 "detail": "the door is POST %s" % PATH_SHIP})
+            return
+        # SHIPPING OFF IS A NAMED REFUSAL, NEVER A 404 AND NEVER AN ACK.
+        #
+        # A reader-only process answering 404 here would tell a shipper that
+        # this URL does not exist, and a shipper that concludes that stops
+        # trying.  It exists; this process is not the one that serves it.  The
+        # offset is untouched either way, so the client still holds every byte
+        # and resends the identical range to the process that does.
+        if not self.door.ship_enabled:
+            self.door.counters.refused("no-ship")
+            self._respond(503, {"ok": False, "reason": "no-ship",
+                                "detail": "this process was started with "
+                                          "--no-ship: it reads the store and "
+                                          "never writes to it. Nothing was "
+                                          "written and nothing was "
+                                          "acknowledged; ship to the process "
+                                          "that holds the store read-write.",
+                                # The same two numbers every other refusal
+                                # carries. A reader can read them, so it says
+                                # them: `cu.ship` prints `disk_free_bytes` from
+                                # any response it gets, and a null here would
+                                # be this process declining to answer a
+                                # question it knows the answer to.
+                                "disk_free_bytes": self.door.store.free_bytes(),
+                                "disk_reserve_bytes": self.door.store.reserve})
             return
 
         if "chunked" in (self.headers.get("Transfer-Encoding") or "").lower():
@@ -1385,30 +1650,99 @@ def _is_loopback(host):
 
 
 def serve(host, port, root, tokens_path, reserve=DISK_RESERVE, quiet=False,
-          ready=None, api_enabled=True, ui_enabled=None, readers_path=None):
+          ready=None, api_enabled=True, ui_enabled=None, readers_path=None,
+          ship_enabled=True):
     """Bind and serve until interrupted.  Returns a process exit status.
 
     `ui_enabled` is the old keyword and still works; there is no UI to enable
     any more, so it is only ever the API it switches.
+
+    TWO SWITCHES, ONE PAIR, AND THEY NAME THE TWO HALVES OF THE DOOR.
+
+      `api_enabled`  (`--no-api`)   GET /api/v1/*  -- reading the store.
+      `ship_enabled` (`--no-ship`)  POST /v1/ship  -- writing to it.
+
+    Both on is the whole door and is still the default, so nothing that ran
+    before this existed runs differently.  `--no-api` alone is the ingest
+    service; `--no-ship` alone is the api service; and both off serves nothing
+    but `/healthz`, which is refused by name rather than started.
     """
     if ui_enabled is not None:
         api_enabled = ui_enabled
-    fd = lock_root(root)
-    if fd is None:
-        sys.stderr.write("[door] another door already holds %s (door.lock)\n"
-                         % root)
-        return 3
+    if not api_enabled and not ship_enabled:
+        # A process with both halves off answers `/healthz` and 404s
+        # everything else.  It would come up, bind a port, and look exactly
+        # like a working door to anything that pings it -- which is the shape
+        # this project calls its cardinal sin.  Refuse it while somebody is
+        # still reading the terminal.
+        sys.stderr.write(
+            "[door] --no-api and --no-ship together leave nothing to serve.\n"
+            "[door]   --no-api  is the INGEST service: POST %s only.\n"
+            "[door]   --no-ship is the API service:    GET %s only.\n"
+            "[door]   Neither flag is the whole door. Both flags is a process\n"
+            "[door]   that binds a port, answers /healthz and does nothing "
+            "else.\n" % (PATH_SHIP, PATH_API_V1))
+        return 8
+    if not ship_enabled and not os.path.isdir(os.path.join(root, "accounts")):
+        # NEW DAMAGE THE SPLIT CREATES, AND IT IS REFUSED RATHER THAN
+        # DISCOVERED.
+        #
+        # `accounts_in` swallows `OSError` and returns `[]`, and
+        # `Paths.accounts` does the same -- both deliberately, because an
+        # account directory that is not there yet is not an error on the write
+        # path.  On the READ path with a wrong `--root`, or a bind mount whose
+        # source path was mistyped, those two zeros compose into a server that
+        # answers `no-data` about every account in a store it is not looking
+        # at.  The writer creates `accounts/` in `Store.__init__`; a reader
+        # cannot, and must not pretend it did.
+        sys.stderr.write(
+            "[door] --no-ship and %s has no accounts/ directory in it.\n"
+            "[door]   A reader cannot create one -- the writer does, at its "
+            "own start -- so\n"
+            "[door]   this is either the wrong --root, a bind mount that did "
+            "not land, or an\n"
+            "[door]   ingest service that has never run. Every question would "
+            "be answered\n"
+            "[door]   `no-data`, which is indistinguishable from a store "
+            "nobody has shipped to.\n"
+            % os.path.abspath(root))
+        return 9
+    # THE LOCK IS THE WRITER'S.  See `lock_root`, which carries the whole
+    # argument: what two processes must not interleave is the OFFSETS file, and
+    # that is written in exactly one place, on the ship path.  A reader takes
+    # nothing, which is what lets the api service run beside the ingest service
+    # over one store -- and is the same no-lock read the View and DuckStore
+    # inside this very process have always done.
+    fd = None
+    if ship_enabled:
+        fd = lock_root(root)
+        if fd is None:
+            sys.stderr.write("[door] another door already holds %s "
+                             "(door.lock)\n" % root)
+            return 3
     counters = Counters()
-    store = Store(root, reserve=reserve, counters=counters)
-    tenants = Tenants(tokens_path)
-    for where, why in tenants.refused:
-        sys.stderr.write("[door] tokens: %s refused -- %s\n" % (where, why))
-    if not tenants.map:
-        # Not fatal: a door with no tokens answers 401 to everything, which is
-        # a running server saying "I do not know you" rather than a silence
-        # someone spends an afternoon on.
-        sys.stderr.write("[door] WARNING no usable token -> account mapping in "
-                         "%s; every batch will be refused 401\n" % tokens_path)
+    store = Store(root, reserve=reserve, counters=counters,
+                  create=ship_enabled)
+    # SHIPPING TOKENS ARE THE WRITER'S SECRET AND THE READER NEVER OPENS THE
+    # FILE.  `tokens.json` says which account a MACHINE may ship for; a
+    # reader-only process accepts no shipment, so reading it would put a secret
+    # in a process with no use for it and would make the api service's compose
+    # entry mount a file it must not need.  The consequence -- a
+    # `tenants_configured: 0` that means "did not ask" rather than "none
+    # configured" -- is said out loud in `health()` beside the number.
+    if ship_enabled:
+        tenants = Tenants(tokens_path)
+        for where, why in tenants.refused:
+            sys.stderr.write("[door] tokens: %s refused -- %s\n" % (where, why))
+        if not tenants.map:
+            # Not fatal: a door with no tokens answers 401 to everything, which
+            # is a running server saying "I do not know you" rather than a
+            # silence someone spends an afternoon on.
+            sys.stderr.write("[door] WARNING no usable token -> account "
+                             "mapping in %s; every batch will be refused 401\n"
+                             % tokens_path)
+    else:
+        tenants = Tenants(mapping={})
 
     readers = Readers(readers_path) if readers_path else None
     if readers is not None:
@@ -1428,13 +1762,15 @@ def serve(host, port, root, tokens_path, reserve=DISK_RESERVE, quiet=False,
                 "email addresses included.\n"
                 "[door]   Write %s, or start with --no-api.\n"
                 % (host, readers_path or os.path.join(root, "readers.json")))
-            os.close(fd)
+            if fd is not None:
+                os.close(fd)
             return 4
         sys.stderr.write(
             "[door] WARNING the read API asks for no token (no %s). "
             "Loopback only.\n" % (readers_path or "readers.json"))
 
-    ShipHandler.door = Door(store, tenants, counters=counters)
+    ShipHandler.door = Door(store, tenants, counters=counters,
+                            ship_enabled=ship_enabled)
     ShipHandler.door.readers = readers
     # Two readers, because there are two questions: the reconciler for stream
     # B, the windows and the coverage, and DuckDB over the same JSONL for the
@@ -1442,7 +1778,28 @@ def serve(host, port, root, tokens_path, reserve=DISK_RESERVE, quiet=False,
     # and opens nothing until a query needs it, so a door on a machine with no
     # duckdb still starts, still takes shipments, and refuses the stream-A
     # routes BY NAME with the install command.
-    ShipHandler.api = (api.Api(View(root), duck_store=duckstore.DuckStore(root),
+    duck_store = duckstore.DuckStore(root) if api_enabled else None
+    if duck_store is not None:
+        # WHERE DUCKDB SPILLS, PROBED AT BOOT RATHER THAN DISCOVERED AT 500.
+        #
+        # DuckDB's own `temp_directory` default is `.tmp`, RELATIVE TO THE
+        # PROCESS'S CWD.  Measured inside the api container -- no `WORKDIR`, so
+        # cwd is `/`, running as 65534, with the store mounted read-only -- the
+        # first query that spilled died `IO Error: Failed to create directory
+        # ".tmp": Permission denied`, and reached the caller as `reader-failed`
+        # with the detail reduced to the exception TYPE.  An operator read a
+        # fault with no cause, and the cause was a directory name.
+        #
+        # A warning rather than a refusal to start: a door that cannot spill
+        # still answers every small question correctly and still takes
+        # shipments, so exiting would turn a degraded reader into no reader at
+        # all.  It is said at the only moment anybody is reading, and it names
+        # the variable that fixes it.
+        why = duck_store.temp_dir_problem()
+        if why:
+            sys.stderr.write("[door] WARNING duckdb spill directory: "
+                             "%s\n" % why)
+    ShipHandler.api = (api.Api(View(root), duck_store=duck_store,
                                counters=counters)
                        if api_enabled else None)
     ShipHandler.quiet = quiet
@@ -1453,22 +1810,65 @@ def serve(host, port, root, tokens_path, reserve=DISK_RESERVE, quiet=False,
         return 1
     httpd.daemon_threads = True
     bound = httpd.server_address[1]
-    sys.stderr.write("[door] listening on http://%s:%d%s\n"
-                     "[door] store   %s\n"
+    # The role first, because it is what an operator staring at two
+    # near-identical banners in one `docker compose logs` needs to tell them
+    # apart -- and because "holds the store lock" is the one line that says
+    # which of the two may write.
+    sys.stderr.write("[door] role    %s (%s)\n"
+                     % ("writer" if ship_enabled else "reader",
+                        "POST %s, holds door.lock" % PATH_SHIP if ship_enabled
+                        else "no shipments, no lock, no writes"))
+    if ship_enabled:
+        sys.stderr.write("[door] listening on http://%s:%d%s\n"
+                         % (host, bound, PATH_SHIP))
+    else:
+        sys.stderr.write("[door] listening on http://%s:%d%s\n"
+                         "[door] POST %s answers 503 no-ship here; ship to "
+                         "the ingest service\n"
+                         % (host, bound, PATH_API_V1, PATH_SHIP))
+    sys.stderr.write("[door] store   %s\n"
                      "[door] tenants %d, reserve %d bytes, free %s\n"
-                     % (host, bound, PATH_SHIP, store.root,
-                        len(tenants.tenants()), reserve, store.free_bytes()))
+                     % (store.root, len(tenants.tenants()), reserve,
+                        store.free_bytes()))
+    # `read_auth` and not a bare "no token", because these two lines predate
+    # `Readers` and went on asserting the old world after it landed: a door
+    # started WITH a readers file printed "(read-only, no token)" and then
+    # "it asks for no token" on every start, which is a false statement about
+    # the one property an operator reads this banner to confirm.  Believing it
+    # is what puts a door behind a proxy that was only ever there to add the
+    # authentication the door already had -- or, the other way round, leaves
+    # one exposed because the banner cried wolf and nobody reads it any more.
+    read_auth = readers is not None and readers.configured
     if api_enabled:
         sys.stderr.write(
-            "[door] api     http://%s:%d%s  (read-only, no token)\n"
+            "[door] api     http://%s:%d%s  (read-only, %s)\n"
             "[door] engine  duckdb %s\n"
             % (host, bound, PATH_API_V1,
+               ("%d reader token(s)" % len(readers.map)) if read_auth
+               else "NO TOKEN -- every record in the store, to anyone who "
+                    "can reach this port",
                "present" if duckstore.available()
-               else "MISSING -- stream A routes will refuse by name; "
-                    "python3 -m pip install duckdb"))
+               else "MISSING -- stream A routes will refuse by name"))
+        sys.stderr.write("[door] spill   %s%s\n"
+                         % (duck_store.temp_dir,
+                            (", limit %s" % duck_store.temp_dir_max)
+                            if duck_store.temp_dir_max else ""))
+        if not duckstore.available():
+            # The command itself comes from `store.INSTALL_HINT` rather than
+            # being spelled again here: it is platform-specific (pip on one
+            # machine, `pkg install py312-duckdb` on another), and a second
+            # copy in a startup banner is the copy that goes on naming the
+            # wrong package manager after the first one is corrected.
+            sys.stderr.write("[door]         %s\n"
+                             % duckstore.INSTALL_HINT.replace(
+                                 "\n", "\n[door]         "))
     if host not in LOOPBACK:
         sys.stderr.write("[door] NOTE %s\n" % TRUST_NOTE)
-        if api_enabled:
+        if api_enabled and not read_auth:
+            # Unreachable off loopback -- `serve()` returned 4 above rather
+            # than reach here -- and kept anyway, because the condition it
+            # states is the one this line exists to say out loud and a future
+            # bind that is neither loopback nor refused must not be silent.
             sys.stderr.write(
                 "[door] NOTE the API at %s serves every record in this "
                 "store, including email addresses, to anyone who can reach "
@@ -1483,7 +1883,8 @@ def serve(host, port, root, tokens_path, reserve=DISK_RESERVE, quiet=False,
         pass
     finally:
         httpd.server_close()
-        os.close(fd)
+        if fd is not None:
+            os.close(fd)
     return 0
 
 
@@ -1505,18 +1906,35 @@ def main(argv=None):
                         "Absent means the read API asks for no token, which is "
                         "allowed on loopback and refused on any other bind.")
     p.add_argument("--quiet", action="store_true")
+    # THE PAIR, AND IT IS A PAIR ON PURPOSE.  One process, two halves; each
+    # flag switches off one half and names the service the other half is.
+    #
+    #   (neither)   the whole door -- ships in, reads out. The default, so
+    #               nothing that ran before the split runs differently.
+    #   --no-api    the INGEST service. POST /v1/ship. Holds the store lock,
+    #               holds the store read-write, needs no DuckDB.
+    #   --no-ship   the API service.    GET /api/v1/*. Takes no lock, wants
+    #               the store read-only, and is the half DuckDB is for.
+    #   both        refused by name (exit 8): a port that answers /healthz.
     p.add_argument("--no-api", "--no-ui", dest="api", action="store_false",
                    default=True,
-                   help="do not serve the read-only API at /api/v1/*; it is "
-                        "unauthenticated and shows everything in the store. "
-                        "`--no-ui` is the old spelling and still works -- "
-                        "there is no bundled UI to disable any more, omini is "
-                        "the front end.")
+                   help="do not serve the read-only API at /api/v1/*; what is "
+                        "left is the INGEST service, POST /v1/ship. `--no-ui` "
+                        "is the old spelling and still works -- there is no "
+                        "bundled UI to disable any more, omini is the front "
+                        "end.")
+    p.add_argument("--no-ship", dest="ship", action="store_false", default=True,
+                   help="do not accept shipments at /v1/ship; what is left is "
+                        "the API service, GET /api/v1/*. It takes no store "
+                        "lock and writes nothing, so it runs beside an ingest "
+                        "service over one store and wants the store mounted "
+                        "read-only. POST /v1/ship then answers 503 `no-ship` "
+                        "-- named, never a 404 and never an ack.")
     args = p.parse_args(argv)
     return serve(args.host, args.port, args.root,
                  args.tokens or os.path.join(args.root, "tokens.json"),
                  reserve=args.disk_reserve_bytes, quiet=args.quiet,
-                 api_enabled=args.api,
+                 api_enabled=args.api, ship_enabled=args.ship,
                  readers_path=(args.readers
                                or os.path.join(args.root, "readers.json")))
 

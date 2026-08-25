@@ -1,0 +1,24 @@
+# The ignore file for `Containerfile.linux.proxy`.
+#
+# BuildKit looks for `<dockerfile>.dockerignore` beside the Dockerfile before
+# it looks for `.dockerignore` at the context root, so this scopes the rules to
+# this one image and leaves the root alone -- which matters, because a test in
+# `usage/tests/test_all.py` walks the repository root for container files by
+# NAME and refuses them there.
+#
+# WHAT IS NOT IN THIS CONTEXT, AND WHY THAT IS THE POINT
+#
+#   `server/srv/` in its entirety.  This image proxies bytes: it parses no
+#   record, holds no token, opens no store and has no interpreter to do any of
+#   it with.  Leaving the package out of the CONTEXT rather than merely out of
+#   the COPY list means a later edit cannot put it back without also editing
+#   this file, which is a decision somebody has to make on purpose.
+#
+# The context is the REPOSITORY ROOT, because the image needs `LICENCE`, the
+# configuration under `server/oci/nginx/` and `server/oci/entrypoint-proxy.sh`,
+# and no one of them is a parent of the others.
+*
+!/LICENCE
+!/server/oci/nginx/**
+!/server/oci/entrypoint-proxy.sh
+**/__pycache__

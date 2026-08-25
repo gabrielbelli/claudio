@@ -1,0 +1,311 @@
+# claudio's INGEST service, as a Linux OCI image.  The writer, and the only one.
+#
+#   POST /v1/ship.  Parse a manifest, check a bearer token against
+#   `tokens.json`, append the client's own bytes verbatim, fsync, acknowledge.
+#   It holds the store lock (`door.lock`), it holds the store volume READ-WRITE,
+#   and it is the only process in this stack that writes a byte.
+#
+# WHY THIS IMAGE HAS NO DUCKDB IN IT, WHICH IS MOST OF WHY IT EXISTS
+#
+#   MEASURED, NOT ASSUMED.  `import duckdb` appears exactly once in the whole
+#   package, inside `store.require()`, and `DuckStore.con()` calls it on the
+#   first query -- so nothing imports it at module level and the door starts,
+#   binds and takes shipments on a stdlib-only interpreter.  Checked directly
+#   on a machine with no duckdb installed: `import srv.serve` succeeds,
+#   `duckdb in sys.modules` is False, `store.available()` is False, and
+#   `serve.py` prints `engine duckdb MISSING` for exactly this case.
+#
+#   BUILT AND MEASURED, not derived from a layer listing.  `docker images` on
+#   the four images built from these files: ingest 215 MB, api 302 MB, mcp
+#   213 MB, proxy 94.2 MB.  So the engine is 87 MB of the api, and this image
+#   is the api minus the engine.  (A layer-arithmetic estimate made before the
+#   build said 208 MB, from the published whole-door image's 274 MB less its
+#   65.6 MB pip layer.  It was close and it was an estimate; the numbers above
+#   are the images.)
+#
+#   BE HONEST ABOUT WHAT THAT IS WORTH: this image is still ~76% base image,
+#   and the split is not primarily a size win.  It is an AUTHORITY win.  The
+#   process that holds the write lock and the store read-write has no query
+#   engine in it, and the process that answers arbitrary caller-shaped
+#   questions cannot write.
+#
+# THE OTHER HALF IS `Containerfile.linux.api`, AND IT IS THE SAME SOURCE.
+#
+#   Both images COPY `server/srv/` entire.  They differ by what is INSTALLED --
+#   duckdb, in one of them -- and by the flag each one's CMD carries:
+#   `--no-api` here, `--no-ship` there.  That is the honest reason two images
+#   exist rather than one image run twice, because a package manager is the
+#   thing that differs.
+#
+# Build, from the REPOSITORY ROOT -- that is the context, because the image
+# needs `server/srv/` and `server/oci/` and neither is a parent of the other.
+# ONE ARCHITECTURE PER RUN, on a runner of that architecture:
+#
+#   docker build -f server/oci/Containerfile.linux.ingest \
+#       -t ghcr.io/<owner>/claudio-ingest:testing-linux-amd64 .
+#
+# and then a manifest list assembled from the per-architecture tags.  A single
+# `buildx --platform linux/amd64,linux/arm64` run is NOT equivalent and does not
+# work; the measurement and the reason are with the version assertion below.
+#
+#
+# WHY THIS IS NOT `server/Dockerfile`
+#
+#   `server/Dockerfile` exists and is kept, and it is the opposite image.  Its
+#   `.dockerignore` is a bare `*` and it contains no `COPY` at all, on purpose:
+#   its whole documented property is that it carries NO source, so a developer
+#   bind-mounts the working tree and nobody rebuilds an image to run a test.
+#   A published image has to carry the source -- that is what publishing it
+#   means -- so making one file do both would delete the property that makes
+#   the other one worth having, and would hand `docker run` two unrelated jobs
+#   with a default that quietly picks one.  `compose.yml` already refuses to
+#   give that image a default command for exactly this reason.  Two jobs, two
+#   files, and neither one has to hedge.
+#
+#
+# WHAT IS IN THIS IMAGE
+#
+#   `server/srv/` -- the door, the reconciliation core and the DuckDB query
+#   layer -- a pinned Python, a pinned DuckDB, and the two shared files next to
+#   this one.  Nothing else.
+#
+#   Specifically NOT `claudio`, NOT the OTLP receiver and NOT the shipper.
+#   Those three run on a WORKSTATION, are installed with `make install`, and
+#   have no third-party dependency at all; putting them in this image would
+#   suggest a container is a supported way to run them, which it is not.  The
+#   Makefile refuses to install `server/` for the mirror-image reason, and a
+#   test asserts neither it nor the Homebrew formula ever names duckdb.
+
+# The base is a Debian point release rather than `python:3.12-slim`, because
+# `slim` alone floats onto the next Debian and quietly changes the libc the
+# DuckDB wheel is linked against.  It is a TAG and not a digest, and that is
+# stated rather than implied: a tag can be repointed by its publisher, so this
+# is reproducible in the sense of "the same Python and the same DuckDB", not in
+# the cryptographic sense.  Writing a digest here would mean writing down a
+# hash nobody on this machine has verified against a registry, which is a value
+# written from an assumption -- the failure the rest of this project spends its
+# comments avoiding.
+#
+# GLIBC, NOT MUSL, AND THAT IS MEASURED.  DuckDB 1.5.5 publishes 35 files on
+# PyPI; the only two that are Linux and CPython 3.12 are
+# `manylinux_2_26_x86_64.manylinux_2_28_x86_64` and the aarch64 pair.  There is
+# no `musllinux` wheel, so an Alpine base would fall back to the sdist and
+# compile the C++ engine -- hours per architecture under emulation, for an
+# engine whose measured behaviour is the reason the version is pinned at all.
+# Bookworm is glibc 2.36, comfortably above the 2.28 the wheel asks for.
+#
+# Python 3.12 rather than a newer one: every module under `server/` parses
+# under `ast.parse(..., feature_version=(3, 9))`, so 3.12 is far above the
+# floor, and it is the version with the longest-standing DuckDB wheels on both
+# architectures -- which is the whole of the multi-architecture story here,
+# because a wheel that exists is a download and a wheel that does not is a
+# compile.
+#
+# AND IT IS BUILT FROM A DIGEST, NOT FROM THIS TAG.
+#
+# `python:3.12-slim-bookworm` is a MOVING reference its publisher re-points at
+# will, and it is the largest executable input in this image -- the whole
+# userland the door runs on.  This workflow already argues that point at
+# length for GitHub Actions and pins all four of them to 40-hex commits; the
+# same reasoning was not applied to the input that contributes orders of
+# magnitude more code.
+#
+# WHAT THE ARGUMENT DOES *NOT* REST ON, because the check was run and came
+# back the other way.  A review of this file claimed the tag had moved inside
+# eight days -- a116514e on 2026-08-13, 356b0d18 on 2026-08-21 -- and that
+# sentence was pasted in here as a measurement.  It is not one.  Asked three
+# ways on 2026-08-21 (`RepoDigests` on the locally pulled image,
+# `docker buildx imagetools inspect`, and a direct registry fetch whose bytes
+# were hashed here), `python:3.12-slim-bookworm` resolves to
+# sha256:a116514e19457bcb7af7efe9c3dd0b9b71e85b317694e7882a1c52aa15a78134 --
+# the SAME digest the 13 August pull recorded.  356b0d18 could not be
+# reproduced from anywhere.  So no movement has been observed, and the pin
+# stands on what a moving tag IS rather than on a move somebody watched: the
+# publisher may re-point it at any time, and an image that cannot say what it
+# was built from cannot be rebuilt or rolled back either.
+#
+# So CI resolves the tag to a digest, builds `FROM` that digest, and records
+# BOTH -- `base.name` for the readable moving name and `base.digest` for what
+# was actually used.  They cannot disagree, because the digest recorded is the
+# one `FROM` took.  The default below is the readable tag, so a hand build
+# still works and still floats; a hand build that wants the pin passes
+# `--build-arg BASE_REF=python@sha256:...`.
+ARG BASE_REF=python:3.12-slim-bookworm
+FROM ${BASE_REF}
+
+# THERE IS NO `pip install` IN THIS FILE AT ALL, AND THAT IS THE ASSERTION.
+#
+# The duckdb pin, its hash file and the version check live in
+# `Containerfile.linux.api`, which is the image that needs an engine.  A
+# `RUN pip install` here would be invisible in the running service -- the ingest
+# path never imports duckdb, so the image would work perfectly while carrying
+# 65.6 MB and a C++ engine into the one process that holds the write lock.  A
+# test reads this file and refuses the string.
+#
+# `requirements-linux.txt` is therefore NOT copied here either.  It is the api's
+# input; naming it in this context would be the first half of somebody adding
+# the install back.
+
+# The source.  `srv/serve.py` puts the parent of its own directory on
+# `sys.path`, so the package has to sit exactly one level under the entrypoint,
+# which is what this layout is.
+COPY server/srv/ /opt/claudio-server/srv/
+COPY server/oci/entrypoint.sh server/oci/preflight.py /opt/claudio-server/
+COPY LICENCE /opt/claudio-server/LICENCE
+
+# `srv/mcp.py` COMES WITH THE PACKAGE AND NOTHING IN THIS IMAGE CAN REACH IT.
+#
+# It is one stdlib module and excluding it from a `COPY server/srv/` would need
+# a second COPY list -- a list that goes stale.  What matters is that nothing
+# here RUNS it: `entrypoint.sh` has no `mcp` mode any more (it had one, and it
+# is deleted rather than left to fail as a traceback), `serve.py` imports no
+# `mcp`, and the MCP surface is its own image whose build context contains
+# `mcp.py` and not one other module of this package.  A test pins all three.
+
+# Byte-compiled at build time, as root, so nothing is written at run time.  The
+# image runs as 65534 and `/opt` is root-owned, so without this every start
+# would attempt a `__pycache__` write, fail, and carry on in silence -- which
+# works, but it also means the image cannot honestly claim to run under
+# `--read-only`, and it should be able to.
+RUN python -m compileall -q /opt/claudio-server/srv
+
+# Two directories, created here so their ownership is right before anything is
+# mounted over them, and separate on purpose.
+#
+#   /var/lib/claudio-usage  the STORE: append-only JSONL, the record of truth.
+#                           A volume.  See the shared `preflight.py`, which
+#                           warns loudly when nothing is mounted here.
+#   /etc/claudio            the two token files, mounted READ-ONLY.  They are
+#                           secrets and they are not records; keeping them out
+#                           of the store means the store stays a directory that
+#                           can be tailed, backed up and handed to a log
+#                           shipper without handing over the tokens with it.
+#
+# There is deliberately no `VOLUME` instruction.  `VOLUME` would make a
+# forgotten `-v` create an ANONYMOUS volume: the records would survive
+# `docker rm` in a directory named by a 64-character hex string that the
+# operator does not know exists and will never back up.  That is a worse
+# failure than losing them, because it looks like success.  The preflight says
+# out loud that nothing is mounted instead.
+RUN set -eu; \
+    mkdir -p /var/lib/claudio-usage /etc/claudio; \
+    chown 65534:65534 /var/lib/claudio-usage; \
+    chmod 700 /var/lib/claudio-usage
+
+# NUMERIC, and both halves numeric.  65534 is `nobody` on Debian and `nobody`
+# on FreeBSD, but the GROUP is `nogroup` on one and `nobody` on the other, so a
+# name here would be a name the other image cannot use -- and the whole point of
+# the shared entrypoint is that the two images differ in their base and in
+# nothing an operator has to learn twice.  65534 also already exists in both
+# bases, which is what lets the FreeBSD image have a non-root user at all: it
+# cannot create one, because it has no `RUN`.
+#
+# The ingest service needs no privilege of any kind.  It binds 8787, appends to
+# one directory and reads one token file.
+USER 65534:65534
+
+# Documentation only -- `EXPOSE` publishes nothing.  8787 is the door's own
+# default and the port `claudio`'s shipper is pointed at.
+EXPOSE 8787
+
+# NO `HEALTHCHECK` INSTRUCTION, and the reason is that its absence would be
+# invisible.  The OCI image spec has no field for one, so a `--format oci`
+# build drops it and the published config simply would not contain it, while a
+# Docker-format build of the identical file keeps it -- so it appears to work
+# locally and vanishes on publish.  This project ships two images and one of
+# them is built with buildah under `--format oci`; a health check that exists in
+# one and not the other is a health check nobody can rely on.
+#
+# Pass it at run time instead.  `/healthz` is unversioned, unenveloped and
+# served BEFORE reader auth (`serve.py` answers it above the token check on
+# purpose, because operators and scripts read that one), so it needs no
+# credential.  There is no curl in this base and there is not going to be, so
+# use the Python that is already here:
+#
+#   docker run --health-cmd \
+#     "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8787/healthz',timeout=5).status==200 else 1)\"" \
+#     --health-interval 30s --health-retries 3 ...
+#
+# In compose, the same string under `healthcheck: test: ["CMD", "python", ...]`.
+#
+# AND A 200 FROM `/healthz` IS NOT A STATEMENT THAT STREAM A CAN BE QUERIED.
+# It means the door is up and taking shipments.  Whether the DuckDB half
+# answers is `engine.available` in that same payload -- which is there because
+# `/healthz` is the only surface served BEFORE reader auth, so a monitor with
+# no reader token could otherwise not detect a half-functional door at all.
+# To gate on that too, read the JSON instead of the status:
+#
+#   ... sys.exit(0 if json.load(urllib.request.urlopen(URL, timeout=5))["engine"]["available"] else 1)
+
+# PROVENANCE, AND EVERY VALUE IN IT IS PASSED IN RATHER THAN WRITTEN DOWN.
+#
+# Three separate faults lived in the block this replaces.
+#
+#   `image.source` was HARDCODED to this repository while the workflow derived
+#   its destination from `github.repository_owner`.  On a fork, or after a
+#   rename, the published image asserted one origin in its config labels, a
+#   second in its manifest annotations, and sat in a third owner's namespace.
+#   GHCR reads that label to link a package to a repository and inherit its
+#   visibility, so a fork pointed its provenance at somebody else's repository.
+#
+#   `image.licenses` said MIT.  This project is BSD 2-Clause and the image
+#   `COPY`s the BSD text in a few lines above, so the artefact contradicted
+#   itself internally -- and that field is an SPDX expression read by registry
+#   UIs, SBOM generators and licence scanners as the authoritative statement
+#   for the artefact.  The value came from the reference repository, where
+#   oauth2-proxy really is MIT: a convention copied without re-checking it
+#   against this project's own facts.  The suite now derives the expected
+#   identifier from the repository's own `LICENCE` file.
+#
+#   And `image.revision` was a `--label` here and an `--annotation` on the
+#   FreeBSD half.  Labels live in the image config and annotations in the
+#   manifest; they are different fields with different readers, so "which
+#   commit is this" had to be asked two ways of two images that differ in
+#   their base and in nothing an operator should have to learn twice.  Every
+#   field below is a LABEL on both images, set by the same mechanism.
+#
+# The defaults are `unspecified` rather than a plausible-looking constant.  A
+# hand build then makes NO claim, which is the honest answer; a stale constant
+# would make a wrong one, and this is the field somebody reads to find out
+# what they are running.
+# THE ROLE, DECLARED BY THE IMAGE AND NOT BY A `CMD`.
+#
+# `entrypoint.sh` turns this into `--no-api`, which is what makes this image the
+# ingest service: POST /v1/ship, the store lock, the store read-write, and no
+# read API at all.
+#
+# A `CMD ["--no-api"]` would have said the same thing in fewer lines and would
+# have broken the entrypoint's own contract: a CMD is replaced WHOLESALE, so
+# `docker run IMAGE --port 9000` would silently drop the flag that makes this
+# image what it is and start a whole door -- with the query engine that is
+# deliberately not in here, and an unauthenticated read API it has no
+# `readers.json` for.  As an environment variable the role survives every argv
+# override, is visible in `docker inspect`, and is printed on every start.
+#
+# `entrypoint.sh` REFUSES an unrecognised value (exit 11) rather than falling
+# back to the whole door.
+ENV CLAUDIO_SERVER_ROLE=ingest
+
+ARG SOURCE_URL=https://github.com/gabrielbelli/claudio
+ARG REVISION=unspecified
+ARG VERSION=unspecified
+ARG BASE_NAME=docker.io/library/python:3.12-slim-bookworm
+ARG BASE_DIGEST=unspecified
+
+LABEL org.opencontainers.image.title="claudio-ingest" \
+      org.opencontainers.image.description="The claudio store's ingest service: POST /v1/ship, the only writer, holds the store lock. Standard library only -- no DuckDB. Linux build." \
+      org.opencontainers.image.source="${SOURCE_URL}" \
+      org.opencontainers.image.revision="${REVISION}" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.licenses="BSD-2-Clause" \
+      org.opencontainers.image.base.name="${BASE_NAME}" \
+      org.opencontainers.image.base.digest="${BASE_DIGEST}" \
+      com.claudio.engine="none -- this component never queries" \
+      com.claudio.component="ingest"
+
+# `ENTRYPOINT` and no `CMD`.  Everything after the image name on the command
+# line is appended to the door's argv, and argparse takes the last occurrence
+# of a repeated option, so one flag can be overridden without retyping the
+# other four.  A `CMD` carrying the full flag list would be replaced wholesale
+# and the flag people forget to retype is `--readers`.  See `entrypoint.sh`.
+ENTRYPOINT ["/opt/claudio-server/entrypoint.sh"]

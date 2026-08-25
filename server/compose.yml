@@ -74,6 +74,23 @@ services:
   # included.  This is for a trusted network.  It must never face the internet.
   # Publishing this as `8787:8787` instead of `127.0.0.1:8787:8787` is exactly
   # how it would.
+  # A THIRD THING, ADDED AFTER READER AUTH LANDED AND FOUND BY RUNNING IT.
+  # `serve.py` refuses to serve the read API on a non-loopback bind with no
+  # reader auth and returns 4 -- so this service, which binds `0.0.0.0` for the
+  # reason above, EXITED 4 ON EVERY START from the moment that refusal existed
+  # until the mount below was added.  The refusal is right and the container
+  # was wrong: the exposure and the auth are decided together or not at all.
+  #
+  # `readers.json` is therefore a mount, and it is gitignored: a token
+  # committed to a repository is not a token.  Until you write one, this
+  # service prints the refusal and exits 4, which is the intended first
+  # experience and not a fault:
+  #
+  #     echo '{"dev-reader": "*"}' > server/readers.json
+  #
+  # `"*"` is the ordinary case -- see `Readers` in serve.py, which explains why
+  # a front end is meant to hold a universal token and why isolation between
+  # people belongs one layer up.
   door:
     image: claudio-server:duckdb-1.5.5
     build:
@@ -82,6 +99,7 @@ services:
     volumes:
       # The code, read-only: the door writes to the store, never to the source.
       - ..:/repo:ro
+      - ${SERVER_READERS:-./readers.json}:/etc/claudio/readers.json:ro
       # The store is the record of truth -- append-only JSONL the door writes
       # and a Wazuh agent may one day tail.  It is a bind mount rather than a
       # named volume so it is visible, greppable and backup-able on the host
@@ -105,6 +123,8 @@ services:
       - 0.0.0.0
       - --port
       - "8787"
+      - --readers
+      - /etc/claudio/readers.json
 
   # A shell in the same image, for `python -c "import duckdb; ..."` and for
   # running one test file.  Named rather than left to `docker run` so that the

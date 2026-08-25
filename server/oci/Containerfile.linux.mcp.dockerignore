@@ -1,0 +1,36 @@
+# The ignore file for `Containerfile.linux.mcp`, and it is the strongest
+# statement this repository makes about what the mcp component is.
+#
+# BuildKit looks for `<dockerfile>.dockerignore` beside the Dockerfile before it
+# looks for `.dockerignore` at the context root, so this scopes the rules to
+# this one image and leaves the root alone -- which matters, because a test in
+# `usage/tests/test_all.py` walks the repository root for container files by
+# NAME and refuses them there.
+#
+# THE BOUNDARY IS STRUCTURAL, NOT A PROMISE.
+#
+#   The MCP surface is an HTTP CLIENT of the read API: a forwarded reader
+#   token, no store access, no account outside its scope.  Handing it the
+#   DuckDB engine or the store's query layer would be a privilege escalation
+#   and would defeat the split.  The Containerfile could simply not COPY them
+#   -- but then the next edit could, by accident, and nothing would say so.
+#
+#   With this file, `server/srv/store.py`, `duck.py`, `query.py`, `api.py` and
+#   `serve.py` ARE NOT IN THE BUILD CONTEXT AT ALL.  A `COPY server/srv/` added
+#   to the Containerfile fails the build by name rather than quietly producing
+#   a fatter image with a database handle in it.  That is the same reason the
+#   read API is gated by `readers.json` rather than by being unreachable: a
+#   property enforced by the shape of the thing beats one enforced by everyone
+#   remembering.
+#
+# The context is the REPOSITORY ROOT, because the image needs `LICENCE`,
+# `server/srv/mcp.py` and `server/oci/entrypoint-mcp.sh`, and no one of them is
+# a parent of the others.
+#
+# Last match wins, so the `__pycache__` line at the bottom is what keeps a
+# developer's stale byte-code out of a published image.
+*
+!/LICENCE
+!/server/srv/mcp.py
+!/server/oci/entrypoint-mcp.sh
+**/__pycache__

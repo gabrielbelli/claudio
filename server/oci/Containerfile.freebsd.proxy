@@ -1,0 +1,210 @@
+# claudio's front end, as a FreeBSD OCI image.  One of three.
+#
+# Build, from the REPOSITORY ROOT:
+#
+#   ./server/oci/stage-freebsd.sh proxy FreeBSD:15:amd64 amd64 server/oci/stage-freebsd-proxy
+#   buildah bud --platform freebsd/amd64 --format oci \
+#       -f server/oci/Containerfile.freebsd.proxy \
+#       --ignorefile server/oci/Containerfile.freebsd.proxy.containerignore \
+#       -t ghcr.io/<owner>/claudio-proxy:testing-freebsd15.1-amd64 .
+#
+# WHAT IT IS FOR
+#
+#   One host, one port, one place for certificates.  The door and the mcp
+#   service are not published at all -- they bind inside the compose network
+#   and only this image has a `ports:` mapping -- so this is the only surface
+#   an operator has to reason about, and the only one a certificate goes near.
+#
+#       https://claudio.example.com/sender   -> door   POST /v1/ship
+#       https://claudio.example.com/api/     -> door   GET  /api/v1/*
+#       https://claudio.example.com/mcp      -> mcp    POST /mcp
+#
+#   `/healthz` is deliberately NOT published, and `claudio-locations.conf` says
+#   why where an operator will read it: it asks for no token, it names the
+#   store root and the engine's availability, and it is a question asked from
+#   inside the network the door binds on.
+#
+# WHY A FREEBSD PROXY IMAGE EXISTS AT ALL, WITH THE NUMBERS
+#
+#   Because a FreeBSD operator should be able to run the whole stack on their
+#   own operating system, and because it is nearly free.  Measured from the
+#   real FreeBSD:15:amd64 index on 2026-08-24, `nginx` closes over `pcre2` and
+#   nothing else: 2 packages, 10 MiB installed, 2 MiB to download.  Every other
+#   library `usr/local/sbin/nginx` asks for -- libssl.so.35, libcrypto.so.35,
+#   libz.so.6, libcrypt.so.5, libthr.so.3, libc.so.7 -- is already in the
+#   `freebsd-runtime` base, read out of the real published layer rather than
+#   assumed.  Had the answer been "nginx drags in a compiler", the honest
+#   report would have been that a FreeBSD host should run the Linux proxy or
+#   its own nginx outside the stack; it is not, so this exists.
+#
+#   Note the ABI sensitivity, and it is MEASURED here rather than inferred from
+#   the door's version of it.  Those `libssl.so.35`/`libcrypto.so.35` sonames
+#   are FreeBSD 15's; the FreeBSD:14 nginx package asks for `libssl.so.30` and
+#   `libcrypto.so.30`, which 14.4's base carries and 15.1's does not.  Staged
+#   from FreeBSD:14 and checked against the 15.1 base, `pkgindex.py shlibs`
+#   refuses by name:
+#
+#       libcrypto.so.30    wanted by usr/local/sbin/nginx
+#       libssl.so.30       wanted by usr/local/sbin/nginx
+#
+#   Nothing executes during this build, so crossed the pair would build, push
+#   and pull perfectly and fail at the first exec on somebody else's machine.
+#   That is why the matrix spells `base`, `arch` and `abi` out per row and why
+#   the staging step is given the unpacked base.
+#
+# THERE IS DELIBERATELY NO `RUN` INSTRUCTION, for the reason
+# `Containerfile.freebsd` gives at length: `RUN` executes a binary inside the
+# image and a Linux kernel cannot execute FreeBSD binaries -- qemu-user crosses
+# architectures, not operating systems.  Everything a `RUN` would have done
+# here is done by `stage-freebsd.sh` on the build host instead, and each of
+# those is named where it happens: `mime.types` copied from the
+# `mime.types-dist` pkg's post-install script would have installed, and the
+# writable directories created and `--chown`ed rather than `mkdir`ed.
+#
+# WHAT IS IN THIS IMAGE
+#
+#   nginx and pcre2 from the FreeBSD package repository, and the three
+#   configuration files next to this one -- two of which are SHARED WITH THE
+#   LINUX PROXY IMAGE byte for byte, because the routes are one decision.
+#
+#   NOT Python, NOT DuckDB, NOT `server/srv/` in any form, and NOT the store.
+#   This process proxies bytes; it parses no record and holds no token.
+
+ARG BASE_REF=docker.io/freebsd/freebsd-runtime:15.1
+FROM ${BASE_REF}
+
+# The staged tree: nginx and pcre2, unpacked from real `.pkg` files whose
+# blake2b checksums were verified against an index that is itself
+# signature-checked against a pinned FreeBSD repository key.
+ARG STAGE=server/oci/stage-freebsd-proxy
+COPY ${STAGE}/rootfs/ /
+
+# MEASURED, AND THE SINGLE EASIEST LINE TO DELETE AS OBVIOUSLY REDUNDANT.
+#
+# FreeBSD's runtime linker reaches `/usr/local/lib` ONLY through
+# `/var/run/ld-elf.so.hints`, which `ldconfig` writes at boot -- and this image
+# never boots and has no RUN to invoke `ldconfig` with.  `nginx` needs
+# `libpcre2-8.so.0`, which is in `/usr/local/lib` and in no other directory the
+# linker searches, so without this line the image fails at the first exec with
+# `ld-elf.so.1: Shared object "libpcre2-8.so.0" not found` -- after building,
+# pushing and pulling cleanly.
+ENV LD_LIBRARY_PATH=/usr/local/lib
+
+# The configuration.  `nginx.freebsd.conf` is base-specific -- the paths nginx
+# writes to, and how it logs -- and lands as the main configuration; the other
+# two are shared with the Linux proxy image verbatim and hold the routes.  The
+# TLS example is copied in as an example and is never included by anything: it
+# is meant to be edited and mounted at `/etc/claudio/nginx.d/`.
+COPY server/oci/nginx/nginx.freebsd.conf /usr/local/etc/nginx/nginx.conf
+COPY server/oci/nginx/claudio.conf /usr/local/etc/nginx/claudio.conf
+COPY server/oci/nginx/claudio-locations.conf /usr/local/etc/nginx/claudio-locations.conf
+COPY server/oci/nginx/claudio-tls.conf /usr/local/etc/nginx/claudio-tls.conf
+COPY server/oci/entrypoint-proxy.sh /usr/local/bin/entrypoint-proxy.sh
+COPY LICENCE /usr/local/share/claudio/LICENCE
+
+# THE WRITABLE DIRECTORIES, STAGED AND `--chown`ed, BECAUSE THERE IS NO RUN.
+#
+# nginx's paths are COMPILED IN and were read out of the real binary rather
+# than guessed: `/var/tmp/nginx/{client_body,proxy,fastcgi,uwsgi,scgi}_temp`,
+# `/var/log/nginx/{access,error}.log` and `/var/run/nginx.pid`.  The package
+# ships the first two directories owned by root and this image runs as 65534,
+# so a worker would fail to buffer a request body -- at run time, under load,
+# on somebody else's machine, which is the failure this project keeps refusing
+# to ship.  `stage-freebsd.sh` moves them out of the staged rootfs so this
+# `COPY --chown` can reach them.  The pid file is answered in the
+# configuration instead (`pid /var/tmp/nginx/nginx.pid`), because `/var/run`
+# belongs to the base image and is not this build's to chown.
+#
+# Anything mounted over either directory hides it, which is the ordinary way an
+# operator sends logs somewhere else.
+COPY --chown=65534:65534 ${STAGE}/run/ /var/tmp/nginx/
+COPY --chown=65534:65534 ${STAGE}/logs/ /var/log/nginx/
+
+# `/etc/claudio` is the same read-only mount the door uses for its two token
+# files, and here it is where a TLS certificate and any drop-in configuration
+# go.  Staged empty so the mount point is visible in the image: nginx ignores a
+# wildcard `include` that matches nothing, so the image starts with nothing
+# mounted, and a directory that exists says what the mount is for where a
+# missing one says nothing.
+COPY ${STAGE}/conf/ /etc/claudio/
+
+# NUMERIC, and both halves numeric, because this image cannot create a user:
+# it has no RUN.  65534 is `nobody` in both bases and the GROUP name differs,
+# so a name here would be a name the other image cannot use.
+#
+# THE CONSEQUENCE IS THE PORT NUMBER.  A process that is not root cannot bind
+# below 1024, so this listens on 8080 and 8443 rather than 80 and 443, and the
+# publish mapping is where they become the ports the world sees:
+#
+#   ports: ["443:8443", "80:8080"]
+#
+# Running the proxy as root to get port 80 would be trading the one privilege
+# this whole stack does not need for a number that the runtime can map for
+# free.
+USER 65534:65534
+
+# Documentation only -- `EXPOSE` publishes nothing.  8080 is plain HTTP and
+# 8443 is where the mounted TLS server block listens.
+EXPOSE 8080 8443
+
+# NO `HEALTHCHECK` INSTRUCTION.  The OCI image spec has no field for one, so a
+# `--format oci` build DROPS it, while a Docker-format build of the identical
+# file keeps it: it appears to work locally and vanishes on publish.
+#
+# Pass it at run time instead.  There is no Python in this image, so the string
+# is not the one the other two take -- and the honest question here is whether
+# nginx's own configuration still parses and its listener answers:
+#
+#   podman run --health-cmd "/usr/local/sbin/nginx -t" \
+#     --health-interval 30s --health-retries 3 ...
+#
+# `/healthz` is NOT the check to use, and not only because this proxy answers
+# it with a 404 by design: it is the DOOR's health, asked without a token, and
+# a proxy reporting itself unhealthy because an upstream is down turns one
+# failed service into two.
+
+ARG SOURCE_URL=https://github.com/gabrielbelli/claudio
+ARG REVISION=unspecified
+ARG VERSION=unspecified
+ARG BASE_NAME=docker.io/freebsd/freebsd-runtime:15.1
+ARG BASE_DIGEST=unspecified
+
+LABEL org.opencontainers.image.title="claudio-proxy" \
+      org.opencontainers.image.description="The front end that makes the claudio stack one host and one port: /sender to the door, /api/ to the read API, /mcp to the MCP surface. FreeBSD build." \
+      org.opencontainers.image.source="${SOURCE_URL}" \
+      org.opencontainers.image.revision="${REVISION}" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.licenses="BSD-2-Clause" \
+      org.opencontainers.image.base.name="${BASE_NAME}" \
+      org.opencontainers.image.base.digest="${BASE_DIGEST}" \
+      com.claudio.engine="none -- this component parses nothing" \
+      com.claudio.component="proxy"
+
+# `ENTRYPOINT` and no `CMD`, for the other two images' reason: everything after
+# the image name is appended to nginx's argv, so `-t` or `-c` can be added
+# without retyping anything.
+#
+# THE ENTRYPOINT IS A SCRIPT NOW, AND ITS ONE JOB BEFORE NGINX IS TLS.
+#
+# `claudio-tls.conf` is SHIPPED rather than mounted, which it could not be
+# while nginx exiting on a missing `ssl_certificate` was unanswered.
+# `entrypoint-proxy.sh` answers it: a mounted certificate is used unchanged, and
+# when there is none it generates a self-signed pair and says so, at length, on
+# every start.
+#
+# UNVERIFIED ON FREEBSD, AND SAID RATHER THAN ASSUMED.  The script needs an
+# `openssl` on PATH.  FreeBSD's base system carries one at `/usr/bin/openssl`,
+# but this image is a staged package tree on `freebsd/freebsd-runtime` and
+# whether that runtime includes it has NOT been checked here -- buildah and
+# podman cannot be installed on the machine this was written on, so no FreeBSD
+# image was built or run.  If it is absent the script REFUSES BY NAME (exit 10)
+# and prints the openssl command to run on the host, which is the loud half of
+# the trade: nginx would otherwise exit with "cannot load certificate", which
+# names the wrong fault.
+#
+# `-g "daemon off;"` LIVES IN THAT SCRIPT AND NOT IN THE CONFIGURATION, and the two are
+# mutually exclusive rather than redundant: nginx refuses to start on a
+# duplicate `daemon` directive.  On the command line it survives an operator
+# mounting their own `nginx.conf` over this one, which is the case where
+# forgetting it would background the master and end the container immediately.
+ENTRYPOINT ["/usr/local/bin/entrypoint-proxy.sh"]

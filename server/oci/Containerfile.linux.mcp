@@ -1,0 +1,116 @@
+# claudio's MCP surface, as a Linux OCI image.  An HTTP CLIENT, and nothing else.
+#
+#   POST /mcp.  One JSON-RPC object in, one out.  Every tool is generated at
+#   call time from the api's own `/api/v1/openapi`, and every call is an HTTP
+#   request to the api carrying THE CALLER'S bearer token.
+#
+# WHAT ITS AUTHORITY IS, AND WHY THE IMAGE IS THE PLACE TO SAY IT
+#
+#   Exactly one forwarded bearer token, and the api decides what that token may
+#   read from the same `readers.json` that gates `/api/v1/*`.  So a served MCP
+#   shows exactly what a person holding that token would get: it cannot see an
+#   account outside the scope, cannot reach the store's files, and cannot
+#   answer a question the api refuses.
+#
+#   Handing it the DuckDB handle instead would have been fewer moving parts and
+#   a privilege escalation -- an agent with a database handle is bounded by
+#   nothing an operator configured.  That sentence is easy to write and easy to
+#   undo, so it is not what enforces the boundary.  THREE THINGS DO:
+#
+#     1. This image gets NO store volume.  Not read-only -- none.
+#     2. `srv/mcp.py` imports json, os, sys, urllib and `http.server`, and NO
+#        sibling module at all, so it runs as a flat script with no package
+#        around it.  A test parses it and asserts that.
+#     3. `Containerfile.linux.mcp.dockerignore` keeps `store.py`, `duck.py`,
+#        `query.py`, `api.py` and `serve.py` OUT OF THE BUILD CONTEXT.  A
+#        `COPY server/srv/` added below fails the build by name.  That is the
+#        difference between a boundary and a promise.
+#
+# THERE IS NO `pip install` HERE AND NO DUCKDB.  The whole component is one
+# standard-library module; the base's own CPython is the entire dependency.
+# Built and measured on this machine: 213 MB, of which ~99% is the base image.
+# Say that plainly rather than selling the split on megabytes -- what it buys is
+# that the process an agent talks to has no engine, no store and no second token
+# model in it.
+#
+# Build, from the REPOSITORY ROOT.  BuildKit finds the ignore file beside this
+# one by name:
+#
+#   docker build -f server/oci/Containerfile.linux.mcp \
+#       -t ghcr.io/<owner>/claudio-mcp:testing-linux-amd64 .
+
+# The base, and the reasoning is `Containerfile.linux.ingest`'s: a Debian point
+# release rather than a floating `slim`, pinned to a digest by CI and left as a
+# readable tag for a hand build.  It is the same base as the other two Python
+# components ON PURPOSE -- three images from one base share its layers on any
+# host that runs more than one of them, and a second base would be a second
+# thing to patch for a component that runs one stdlib module.
+ARG BASE_REF=python:3.12-slim-bookworm
+FROM ${BASE_REF}
+
+# THE MODULE, FLAT, AND RUN AS A SCRIPT RATHER THAN AS `-m srv.mcp`.
+#
+# `python -m srv.mcp` would import `srv/__init__.py` first, which imports
+# `attribute, coverage, ingest, reconcile, window, wire`.  Those are
+# stdlib-only and would drag no DuckDB in -- but they would put six modules of
+# the reconciler in an image whose stated contents are "the MCP surface and
+# nothing else", and `reconcile` re-exports from `ingest`, so the set only
+# grows.  It cannot happen here anyway: the package is not in this context.
+COPY server/srv/mcp.py /opt/claudio-mcp/mcp.py
+COPY server/oci/entrypoint-mcp.sh /opt/claudio-mcp/entrypoint-mcp.sh
+COPY LICENCE /opt/claudio-mcp/LICENCE
+
+# Byte-compiled at build time, as root, so nothing is written at run time --
+# `Containerfile.linux.ingest` gives the reason: the image runs as 65534 and
+# `/opt` is root-owned, so without this every start attempts a `__pycache__`
+# write, fails, and carries on in silence.  It works, and it means the image
+# cannot honestly claim to run under `--read-only`, and it should be able to.
+RUN python -m compileall -q /opt/claudio-mcp/mcp.py
+
+# NUMERIC, both halves, for `Containerfile.linux.ingest`'s reason: 65534 is
+# `nobody` on Debian and on FreeBSD, but the GROUP is `nogroup` on one and
+# `nobody` on the other.
+#
+# THIS IMAGE HAS NO STORE DIRECTORY AND NO SECRET DIRECTORY IN IT.  Neither is
+# created, neither is chowned, and neither path appears anywhere in this file
+# or in the entrypoint -- deliberately not even in a comment, because a mount
+# point named in prose is how the next person learns to add the mount.  A
+# directory that does not exist cannot be mounted over by accident and read.
+USER 65534:65534
+
+# Documentation only -- `EXPOSE` publishes nothing.  8788, so it does not
+# collide with the two 8787s in the same compose network.
+EXPOSE 8788
+
+# NO `HEALTHCHECK`: the OCI image spec has no field for one, so a `--format oci`
+# build drops it while a Docker-format build of the identical file keeps it --
+# it appears to work locally and vanishes on publish.  Pass it at run time.
+# This service has no unauthenticated route at all (that is the point of it), so
+# the honest check is that the port answers:
+#
+#   --health-cmd "python -c \"import socket,sys; s=socket.create_connection(('127.0.0.1',8788),5); s.close()\""
+#
+# A POST /mcp health check would need a reader token, and putting one in a
+# health check is the ambient token this component refuses on principle.
+
+ARG SOURCE_URL=https://github.com/gabrielbelli/claudio
+ARG REVISION=unspecified
+ARG VERSION=unspecified
+ARG BASE_NAME=docker.io/library/python:3.12-slim-bookworm
+ARG BASE_DIGEST=unspecified
+
+LABEL org.opencontainers.image.title="claudio-mcp" \
+      org.opencontainers.image.description="The claudio MCP surface: POST /mcp, an HTTP client of the read API. Forwards the caller's bearer token and holds none of its own. Standard library only -- no DuckDB, no store. Linux build." \
+      org.opencontainers.image.source="${SOURCE_URL}" \
+      org.opencontainers.image.revision="${REVISION}" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.licenses="BSD-2-Clause" \
+      org.opencontainers.image.base.name="${BASE_NAME}" \
+      org.opencontainers.image.base.digest="${BASE_DIGEST}" \
+      com.claudio.engine="none -- this component holds no data at all" \
+      com.claudio.component="mcp"
+
+# `ENTRYPOINT` and no `CMD`, matching the other three: everything after the
+# image name is appended, and `stdio` is a MODE the entrypoint names before its
+# escape hatch could swallow it.
+ENTRYPOINT ["/opt/claudio-mcp/entrypoint-mcp.sh"]

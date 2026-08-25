@@ -1,0 +1,33 @@
+# The engine, pinned to a FILE and not only to a version number.
+#
+# `pip install duckdb==1.5.5` pins the version and refuses an sdist fallback,
+# and the Containerfile re-imports afterwards to prove what was installed.
+# What none of that pins is the BYTES: a different file published under the
+# same version, an index or mirror substitution, or a `PIP_INDEX_URL` /
+# `PIP_EXTRA_INDEX_URL` inherited from the environment all pass every one of
+# those checks.  The asymmetry is what made it worth closing: the FreeBSD half
+# verifies a blake2b digest for every package it stages, and the Linux half --
+# the one whose image is actually built and pulled today -- verified nothing at
+# all about the bytes of its single third-party dependency.
+#
+# BOTH ARCHITECTURES IN ONE FILE, ON PURPOSE.  pip matches a requirement if ANY
+# of its `--hash` lines matches, so amd64 takes the first and arm64 the second
+# and there is ONE place to edit when the engine is bumped -- which is the same
+# commit that changes `ARG DUCKDB_VERSION` and re-runs
+# `server/tests/test_duck.py` against the live engine.  A test asserts this
+# file and that ARG name the same version, because two places to forget is how
+# a pin goes stale while looking pinned.
+#
+# `--no-deps` is on the install line and is not tidiness: duckdb's own metadata
+# lists ipython, fsspec, numpy, pandas, pyarrow and adbc-driver-manager, and
+# EVERY ONE of them is under `extra == "all"` (read off the PyPI JSON for
+# 1.5.5 on 2026-08-21).  So the runtime dependency set is empty, and `--no-deps`
+# is what stops a future release adding a mandatory one that this hash list
+# does not cover and pip installing it unhashed.
+#
+# Digests read from https://pypi.org/pypi/duckdb/1.5.5/json on 2026-08-21.
+#   manylinux_2_26_x86_64.manylinux_2_28_x86_64  -> amd64
+#   manylinux_2_26_aarch64.manylinux_2_28_aarch64 -> arm64
+duckdb==1.5.5 \
+    --hash=sha256:7a6d2d11859d82a936ebdcb30ce3d8a1cbb3e990bff05c12abb9b54c44fa7bd1 \
+    --hash=sha256:f316eae2323d9a851883fdf2dee91c1f9efe251ab33e14a2272f82a913422ed6

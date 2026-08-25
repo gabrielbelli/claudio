@@ -400,6 +400,7 @@ Settings:
   statusline [--preview | --set <account> | --all]  Status line and plan-usage
                               recording: show, render, or wire into accounts
   usage [args]                Read what was recorded: ingest, show, doctor
+  key new <account>           Print a ship key for the server (one line)
   recv [args]                 Run the OTLP receiver in the foreground
   migrate [--dry-run|--undo]  Move claudio's data out of ~/.claude (one-time)
   update [--check]            Check for a newer claudio and say how to get it
@@ -688,6 +689,60 @@ _dir_email() {
   [ -f "$1/.claude.json" ] || return 0
   sed -n 's/.*"emailAddress"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
     "$1/.claude.json" 2>/dev/null | head -1
+}
+
+_dir_uuid() {
+  # $1 = an account config dir. Prints the account uuid, or nothing.
+  # sed for _dir_email's reason: jq is optional everywhere else in claudio, and
+  # a missing uuid should cost you a message that says so, not the command.
+  [ -f "$1/.claude.json" ] || return 0
+  sed -n 's/.*"accountUuid"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+    "$1/.claude.json" 2>/dev/null | head -1
+}
+
+cmd_key() {
+  # `claudio key new <account>` prints ONE LINE to paste into the server.
+  #
+  # This exists because the server needs to know which account a shipment
+  # belongs to, and that answer lives HERE -- in the account's own
+  # .claude.json -- not on the machine somebody is configuring. Before this,
+  # setting up shipping meant copying a 36-character uuid between hosts, and
+  # guessing wrong produced a 409 with no clue in it. The uuid is now the left
+  # half of the key, so the line carries its own meaning and there is nothing
+  # to look up.
+  #
+  # The secret half is 32 bytes of urandom, base64url without padding. No
+  # rotation policy and no expiry: run this again, paste the new line, delete
+  # the old one. A key you can replace in ten seconds needs no schedule.
+  case ${1:-} in
+    new) ;;
+    ''|-h|--help)
+      printf 'Usage: claudio key new <account>\n\n' >&2
+      printf 'Prints one line for the server'"'"'s tokens.json.\n' >&2
+      return 1 ;;
+    *)  printf 'claudio: unknown key command: %s\n' "$1" >&2
+        printf 'Usage: claudio key new <account>\n' >&2
+        return 1 ;;
+  esac
+  shift
+  _require_account "${1:-}" || return 1
+  _ck_dir=$(_account_dir "$1")
+  _ck_uuid=$(_dir_uuid "$_ck_dir")
+  if [ -z "$_ck_uuid" ]; then
+    printf 'claudio: %s has no account uuid yet.\n' "$1" >&2
+    printf 'It appears once the account has logged in: claudio account login %s\n' "$1" >&2
+    return 1
+  fi
+  # No jq, no openssl, no python: `od` is POSIX and /dev/urandom is everywhere
+  # this runs. The alphabet excludes `.` so the split above can never be
+  # ambiguous, and excludes `+/=` so the line survives a shell, a YAML file and
+  # a copy-paste without quoting.
+  _ck_secret=$(LC_ALL=C tr -dc 'A-Za-z0-9_-' < /dev/urandom 2>/dev/null | dd bs=1 count=43 2>/dev/null)
+  if [ -z "$_ck_secret" ]; then
+    printf 'claudio: could not read /dev/urandom\n' >&2
+    return 1
+  fi
+  printf '%s.%s\n' "$_ck_uuid" "$_ck_secret"
 }
 
 _validate_name() {
@@ -4381,6 +4436,7 @@ case $CMD in
   default) cmd_default "$@" ;;
   statusline) cmd_statusline "$@" ;;
   usage)   cmd_usage_cmd "$@" ;;
+  key)     cmd_key "$@" ;;
   recv)    cmd_recv "$@" ;;
   clean)   cmd_clean ;;
   migrate) cmd_migrate "$@" ;;

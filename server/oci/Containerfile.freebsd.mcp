@@ -1,0 +1,175 @@
+# claudio's MCP surface, as a FreeBSD OCI image.  One of three.
+#
+# Build, from the REPOSITORY ROOT:
+#
+#   ./server/oci/stage-freebsd.sh mcp FreeBSD:15:amd64 amd64 server/oci/stage-freebsd-mcp
+#   buildah bud --platform freebsd/amd64 --format oci \
+#       -f server/oci/Containerfile.freebsd.mcp \
+#       --ignorefile server/oci/Containerfile.freebsd.mcp.containerignore \
+#       -t ghcr.io/<owner>/claudio-mcp:testing-freebsd15.1-amd64 .
+#
+# WHY THIS IS A SEPARATE IMAGE AND NOT A MODE OF THE DOOR
+#
+#   `srv/mcp.py` is an HTTP CLIENT of the read API.  It holds a reader token
+#   and makes `GET /api/v1/...` calls; it opens no file in the store, imports
+#   no sibling module and needs no database.  That is the whole of its
+#   authority -- it cannot see an account the token's scope excludes, cannot
+#   reach the store's files, and cannot answer a question the API refuses.
+#
+#   Two consequences, and the second is the one that pays for the extra file:
+#
+#   1. GIVING IT DUCKDB WOULD BE A PRIVILEGE ESCALATION.  An agent with a
+#      database handle is not bounded by anything the operator configured.  A
+#      component that never has one cannot be talked into using one, in this
+#      release or in any later edit, because the engine is not in the image.
+#
+#   2. IT IS A DIFFERENT DEPENDENCY PROFILE.  Measured from the real
+#      FreeBSD:15:amd64 index on 2026-08-24, and then measured again on the
+#      staged tree, which is what the image actually carries:
+#
+#        door   8 packages, 285 MiB installed, 52 MiB download, 121 MiB staged
+#        mcp    7 packages, 226 MiB installed, 38 MiB download,  60 MiB staged
+#
+#      `py312-duckdb` is the entire difference between those two rows.  Both
+#      figures are printed by `stage-freebsd.sh` on every run, so neither can
+#      go stale in silence.
+#
+#   The size is the weaker half of the argument.  The boundary is the strong
+#   half, and the ignore file beside this Containerfile is what makes it
+#   structural: this image's build CONTEXT contains `server/srv/mcp.py` and no
+#   other module of the package, so `store.py` cannot be copied in by a later
+#   edit even by accident.
+#
+# THERE IS DELIBERATELY NO `RUN` INSTRUCTION, for the reason
+# `Containerfile.freebsd` gives at length: `RUN` executes a binary inside the
+# image, a Linux kernel cannot execute FreeBSD binaries, and qemu-user crosses
+# architectures, not operating systems.  `FROM` and `COPY` execute nothing, so
+# with every package staged beforehand this image builds on an ordinary Linux
+# runner for both architectures in seconds.
+#
+# WHAT IS IN THIS IMAGE
+#
+#   CPython 3.12 from the FreeBSD package repository, `server/srv/mcp.py`, and
+#   the entrypoint next to this file, which is SHARED WITH THE LINUX MCP IMAGE
+#   verbatim.  Nothing else.  Specifically NOT `py312-duckdb`, NOT
+#   `srv/store.py`, `duck.py`, `query.py`, `api.py` or `serve.py`, NOT the pure
+#   reconciler, NOT `preflight.py` -- which checks a store this component does
+#   not have -- and NOT the store or token mounts.
+#
+#   And NOT `claudio`, the OTLP receiver or the shipper, for the door image's
+#   reason: those three run on a WORKSTATION, are installed with `make install`
+#   and have no third-party dependency at all.
+
+ARG BASE_REF=docker.io/freebsd/freebsd-runtime:15.1
+FROM ${BASE_REF}
+
+# The staged tree: CPython 3.12 and its closure, unpacked from real `.pkg`
+# files whose blake2b checksums were verified against an index that is itself
+# signature-checked against a pinned FreeBSD repository key.  Both halves, in
+# that order: the index says which URL each package comes from AND what its
+# digest should be, so a checksum check over an unverified index proves only
+# that the bytes match what the same document said.
+ARG STAGE=server/oci/stage-freebsd-mcp
+COPY ${STAGE}/rootfs/ /
+
+# MEASURED, AND THE SINGLE EASIEST LINE TO DELETE AS OBVIOUSLY REDUNDANT.
+#
+# FreeBSD's runtime linker searches DT_RPATH/DT_RUNPATH, then
+# `LD_LIBRARY_PATH`, then the hints file `/var/run/ld-elf.so.hints`, then
+# `/lib:/usr/lib`.  `/usr/local/lib` is reached ONLY through the hints file,
+# which `ldconfig` writes at boot from `/usr/local/libdata/ldconfig/*` -- and
+# this image never boots and has no RUN to invoke `ldconfig` with.
+#
+# `usr/local/bin/python3.12` from the FreeBSD package has an EMPTY DT_RUNPATH
+# and needs `libpython3.12.so.1.0` and `libintl.so.8`, both of which live in
+# `/usr/local/lib`.  Without this line the image fails at the first exec with
+# `ld-elf.so.1: Shared object "libpython3.12.so.1.0" not found` -- after
+# building, pushing and pulling cleanly.
+ENV LD_LIBRARY_PATH=/usr/local/lib
+
+# No RUN, so no `compileall`; and an interpreter that tries to write
+# `__pycache__` into a root-owned `/opt` as uid 65534 fails and carries on in
+# silence, which works but makes `--read-only` a claim nobody checked.  Telling
+# it not to try is the version of that decision available without a RUN.  The
+# stdlib's own .pyc files come from the FreeBSD package, which the ports tree
+# builds.
+ENV PYTHONDONTWRITEBYTECODE=1
+
+# THE MODULE, FLAT, AND RUN AS A SCRIPT RATHER THAN AS `-m srv.mcp`.
+#
+# `python -m srv.mcp` would import `srv/__init__.py` first, which imports
+# `attribute, coverage, ingest, reconcile, window, wire` -- stdlib-only, so no
+# DuckDB, but six modules of the reconciler in an image whose stated contents
+# are "the MCP surface and nothing else", and `reconcile` re-exports from
+# `ingest`, so the set only grows.  `srv/mcp.py` imports json, os, sys and
+# urllib and no sibling module at all, which is what makes the flat copy
+# possible; a `from . import` appearing in it would break this image loudly at
+# the first request, and the suite refuses one statically as well.
+COPY server/srv/mcp.py /opt/claudio-mcp/mcp.py
+COPY server/oci/entrypoint-mcp.sh /opt/claudio-mcp/entrypoint-mcp.sh
+COPY LICENCE /opt/claudio-mcp/LICENCE
+
+# NUMERIC, and both halves numeric, and here that is a necessity rather than a
+# preference: this image cannot create a user, because it has no RUN.  65534 is
+# `nobody` in both bases -- verified from `/etc/passwd` in the real
+# `freebsd-runtime` layers -- and the GROUP name differs (`nogroup` on Debian,
+# `nobody` on FreeBSD, whose `nogroup` is 65533), so a name here would be a
+# name the other image cannot use.
+#
+# This component needs no privilege and no writable path at all.  It binds one
+# port, reads one module and makes outbound HTTP calls.
+USER 65534:65534
+
+# Documentation only -- `EXPOSE` publishes nothing, and in the stack this image
+# is not published: the proxy is the only service with a `ports:` mapping and
+# it reaches this one by service name inside the compose network.
+EXPOSE 8788
+
+# NO `HEALTHCHECK` INSTRUCTION.  The OCI image spec has no field for one, so a
+# `--format oci` build -- which is what buildah does here -- DROPS it, while a
+# Docker-format build of the identical file keeps it: it appears to work
+# locally and vanishes on publish.  A health check present in one image and
+# absent in another is a health check nothing may rely on.
+#
+# Pass it at run time instead.  There is no `/healthz` on this component --
+# that one is the door's, unversioned and served before reader auth -- and the
+# honest question to ask here is whether the MCP transport answers, which is
+# one JSON-RPC message:
+#
+#   podman run --health-cmd \
+#     "/usr/local/bin/python3.12 -c \"import json,urllib.request,sys; r=urllib.request.urlopen(urllib.request.Request('http://127.0.0.1:8788/mcp',data=json.dumps({'jsonrpc':'2.0','id':1,'method':'initialize'}).encode(),headers={'Content-Type':'application/json'}),timeout=5); sys.exit(0 if r.status==200 else 1)\"" \
+#     --health-interval 30s --health-retries 3 ...
+#
+# `initialize` is the right message for it: it contacts the door not at all, so
+# a green check here means this process is alive and says nothing about the
+# door -- which is what a per-container health check should mean.  Whether the
+# door answers is the door's own check, and a reader token is what it takes to
+# ask.
+
+ARG SOURCE_URL=https://github.com/gabrielbelli/claudio
+ARG REVISION=unspecified
+ARG VERSION=unspecified
+ARG BASE_NAME=docker.io/freebsd/freebsd-runtime:15.1
+ARG BASE_DIGEST=unspecified
+
+LABEL org.opencontainers.image.title="claudio-mcp" \
+      org.opencontainers.image.description="claudio's MCP surface: an HTTP client of the store's read API, over Streamable HTTP and stdio. Holds no database handle and no store. FreeBSD build." \
+      org.opencontainers.image.source="${SOURCE_URL}" \
+      org.opencontainers.image.revision="${REVISION}" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.licenses="BSD-2-Clause" \
+      org.opencontainers.image.base.name="${BASE_NAME}" \
+      org.opencontainers.image.base.digest="${BASE_DIGEST}" \
+      com.claudio.engine="none -- this component holds no data at all" \
+      com.claudio.component="mcp"
+
+# `ENTRYPOINT` and no `CMD`, for the door image's reason: everything after the
+# image name is appended to the process's argv, so one flag can be overridden
+# without retyping the others, where a `CMD` carrying the full list is replaced
+# wholesale.
+#
+# The entrypoint defaults to the HTTP transport and takes `stdio` as its first
+# argument for the other one.  Both call the same `mcp.handle()`, which is why
+# that function was extracted: a tool must not exist on one transport and not
+# the other.
+ENTRYPOINT ["/opt/claudio-mcp/entrypoint-mcp.sh"]

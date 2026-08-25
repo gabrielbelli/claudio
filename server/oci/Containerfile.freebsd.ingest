@@ -1,0 +1,332 @@
+# claudio's INGEST service, as a FreeBSD OCI image.  One of four.
+#
+# THE SPLIT, AND WHY IT IS A BOUNDARY AND NOT TIDINESS
+#
+#   claudio-ingest  this file.  POST /v1/ship, the only writer, holds the store
+#                   lock and the store read-write.  Needs CPython and NOTHING
+#                   ELSE: `import duckdb` in the whole package happens inside
+#                   `store.require()`, called from `DuckStore.con()` on the
+#                   first query, and this service never queries.
+#   claudio-api     `Containerfile.freebsd.api`.  GET /api/v1/*, the read API
+#                   and the reconciler.  The SAME SOURCE with one package
+#                   added, and that is the honest reason two images exist:
+#                   a package manager is the thing that differs.  Measured
+#                   from the real FreeBSD:15:amd64 index -- 7 packages and
+#                   226 MiB here against the api's 8 and 285, and the
+#                   difference is `py312-duckdb` alone.
+#   claudio-mcp     `Containerfile.freebsd.mcp`.  The MCP surface, an HTTP
+#                   CLIENT of the api: it forwards the caller's reader token,
+#                   opens no file in the store and carries none of the engine.
+#                   Giving it that engine would be a privilege escalation as
+#                   well as a fatter image.
+#   claudio-proxy   `Containerfile.freebsd.proxy`.  nginx, the only thing
+#                   published, and the one place certificates live.
+#
+#   The four are built from the same context by the same technique and their
+#   staged trees are four directories, never one: `stage-freebsd.sh` takes the
+#   component as its first argument and refuses an unknown one by name.
+#
+# EVERY FIGURE ABOVE IS UNVERIFIED ON THIS MACHINE, AND THAT IS SAID RATHER
+# THAN IMPLIED.  They come from the FreeBSD package index, read over the
+# network, not from a built image: buildah and podman cannot be installed on
+# the workstation this was written on, so a Linux kernel cannot execute the
+# FreeBSD binaries and no FreeBSD image here has ever been built or run.  CI
+# builds and smoke-tests them; `server/README.md` says which claims about this
+# image are verified and which are not.
+#
+# Build, from the REPOSITORY ROOT -- that is the context, because the image
+# needs `server/srv/` and `server/oci/` and neither is a parent of the other:
+#
+#   ./server/oci/stage-freebsd.sh ingest FreeBSD:15:amd64 amd64 server/oci/stage-freebsd-ingest
+#   buildah bud --platform freebsd/amd64 --format oci \
+#       -f server/oci/Containerfile.freebsd.ingest \
+#       --ignorefile server/oci/Containerfile.freebsd.ingest.containerignore \
+#       -t ghcr.io/<owner>/claudio-ingest:testing-freebsd15.1-amd64 .
+
+
+#
+# The base is `BASE_REF` and the name recorded on the image is `BASE_NAME`.
+# Both default to the same readable tag and a test pins the two DEFAULTS
+# equal; a build that changes the base passes BOTH, and CI passes BOTH -- a
+# digest for the first, the readable tag for the second.
+#
+# THERE IS DELIBERATELY NO `RUN` INSTRUCTION, AND EVERYTHING ELSE HERE FOLLOWS
+# FROM IT.
+#
+#   `RUN` executes a binary inside the image, and a Linux kernel cannot execute
+#   FreeBSD binaries -- qemu-user crosses architectures, not operating systems.
+#   `FROM` and `COPY` execute nothing, so with every package staged beforehand
+#   by `stage-freebsd.sh` this image builds on an ordinary Linux runner, for
+#   both architectures, in seconds.  That is the technique this repository took
+#   from `gabrielbelli/freebsd-oauth2-proxy-oci` and it is the reason CI needs
+#   no FreeBSD machine.
+#
+#   What it costs: no `mkdir`, no `chown`, no `useradd`, no `ldconfig`, no
+#   `compileall`, no `pip`.  Every one of those is answered below by something
+#   that executes nothing, and each answer says which instruction it replaces.
+#
+# WHAT IS IN THIS IMAGE
+#
+#   `server/srv/` -- the door, the reconciliation core, the coverage and
+#   attribution modules and the DuckDB query layer -- CPython 3.12 and
+#   py312-duckdb from the FreeBSD package repository, and the two files next to
+#   this one, which are SHARED WITH THE LINUX IMAGE verbatim.  Nothing else.
+#
+#   Specifically NOT `claudio`, NOT the OTLP receiver and NOT the shipper.
+#   Those three run on a WORKSTATION, are installed with `make install`, and
+#   have no third-party dependency at all; putting them in this image would
+#   suggest a container is a supported way to run them, which it is not.
+#
+# WHY THERE IS A FREEBSD IMAGE AT ALL
+#
+#   Because the deployment this door is for is a jail or a container on a
+#   FreeBSD host, and an operator who runs FreeBSD should not have to run Linux
+#   to accept shipments from their own workstations.  The two images are meant
+#   to be INTERCHANGEABLE: same entrypoint, same environment variables, same
+#   two mount points, same uid, same exit codes.  An operator learns one
+#   contract.  What differs is the base and how the interpreter got there.
+
+# 15.1 is the default because it is the newest supported release; the matrix
+# builds 15.1, 15.0 and 14.4.  The PACKAGE ABI must track this -- a 14.x image
+# takes its packages from the FreeBSD:14 repository, not FreeBSD:15 -- and the
+# matrix spells both out rather than deriving one from the other.
+#
+# THE MISMATCH IS SILENT AT BUILD TIME AND MEASURED, WHICH IS WHY IT IS
+# CHECKED.  Nothing executes here, so crossing them builds and pushes
+# perfectly: from the real published layers, 14.4's base carries
+# `libutil.so.9` and 15.1's carries `libutil.so.10`, and `python3.12` from the
+# FreeBSD:14 repository asks for the former.  `pkgindex.py shlibs`, run by
+# `stage-freebsd.sh` against the unpacked base, is what turns that into a
+# refusal before the build rather than a `ld-elf.so.1: Shared object not found`
+# on somebody else's machine.
+#
+# AND IT IS BUILT FROM A DIGEST, NOT FROM THIS TAG.  `freebsd-runtime:15.1` is
+# a moving reference its publisher re-points at will, and it is the entire
+# userland this image runs on -- so CI resolves it to a digest with the very
+# `skopeo` call it already makes for the shared-library check (the digest is a
+# free by-product), builds `FROM` that digest, and records BOTH: `base.name`
+# for the readable moving name and `base.digest` for what was actually used.
+# The two cannot disagree, because the digest recorded is the one `FROM` took.
+# The default keeps the readable tag so a hand build still works.
+ARG BASE_REF=docker.io/freebsd/freebsd-runtime:15.1
+FROM ${BASE_REF}
+
+# `FREEBSD_VERSION` USED TO BE REDECLARED HERE AND IS GONE ALTOGETHER.
+#
+# An `ARG` before `FROM` lives outside the build stage -- it is in scope for
+# the `FROM` line and nowhere else -- so the label block used to redeclare it
+# to stop `base.name` expanding to an empty string.  That worked.  What
+# replaced it did not obviously work: `ARG BASE_NAME=...:${FREEBSD_VERSION}`,
+# an ARG default REFERENCING ANOTHER ARG.  BuildKit does that; whether
+# buildah's parser does has never been observed here, because buildah cannot
+# be installed on this machine -- and the failure would be silent, publishing
+# a label containing the literal text `${FREEBSD_VERSION}`.
+#
+# So the dependency is removed rather than assumed: `BASE_REF` and `BASE_NAME`
+# are two plain literals, a test pins their defaults equal, and CI passes both
+# explicitly.  A knob that silently does nothing would have been worse than
+# either, which is why `FREEBSD_VERSION` is deleted rather than left in place
+# with nothing reading it.
+
+# THERE IS NO `ARG DUCKDB_VERSION` IN THIS FILE, AND THAT IS THE ASSERTION.
+#
+# The pin, the CI comparison against what `stage-freebsd.sh` resolved, and the
+# whole argument for why a FreeBSD pin is an assertion rather than a request
+# live in `Containerfile.freebsd.api`, which is the image that has an engine.
+# Naming a duckdb version here would describe a package this image does not
+# stage -- and `stage-freebsd.sh`'s `ingest` branch stages `python312` and
+# nothing else, so the label would be a claim contradicted by the tree it sits
+# on.  A test reads this file and refuses the string.
+
+# The staged tree: CPython 3.12 and its closure, unpacked from
+# real `.pkg` files whose blake2b checksums were verified against an index
+# that is itself signature-checked against a pinned FreeBSD repository key.
+# Both halves, in that order: the index says which URL each package comes
+# from AND what its digest should be, so a checksum check over an unverified
+# index proves only that the bytes match what the same document said.
+# 7 packages, 226 MiB installed before pruning -- one fewer and 59 MiB less
+# than the api image, and the one package is `py312-duckdb`.  Read from the
+# index rather than from a built image; see the header.
+ARG STAGE=server/oci/stage-freebsd-ingest
+COPY ${STAGE}/rootfs/ /
+
+# THE PART THAT HAS NO COUNTERPART IN THE LINUX IMAGE, AND THE ONE MOST LIKELY
+# TO BE DELETED AS REDUNDANT.
+#
+# FreeBSD's runtime linker searches DT_RPATH/DT_RUNPATH, then
+# `LD_LIBRARY_PATH`, then the hints file `/var/run/ld-elf.so.hints`, then
+# `/lib:/usr/lib`.  `/usr/local/lib` is reached ONLY through the hints file,
+# which `ldconfig` writes at boot from `/usr/local/libdata/ldconfig/*` -- and
+# this image never boots and has no RUN to invoke `ldconfig` with.
+#
+# Measured on the real artefacts, not assumed:
+#   * `freebsd/freebsd-runtime:15.1` and `:14.4` both ship NO
+#     `/var/run/ld-elf.so.hints`;
+#   * `usr/local/bin/python3.12` from the FreeBSD package has an EMPTY
+#     DT_RUNPATH and needs `libpython3.12.so.1.0` and `libintl.so.8`, both of
+#     which live in `/usr/local/lib`.
+#
+# So without this line the image fails at the first exec with
+# `ld-elf.so.1: Shared object "libpython3.12.so.1.0" not found`, and it fails
+# that way after building, pushing and pulling cleanly.  Deleting it as
+# "surely the linker finds /usr/local/lib" is the single easiest way to break
+# this image.
+ENV LD_LIBRARY_PATH=/usr/local/lib
+
+# The Linux image byte-compiles `srv/` at build time, as root, so that nothing
+# is written at run time and the image can honestly claim to run under
+# `--read-only`.  That is a RUN, so this image cannot do it -- and an
+# interpreter that tries to write `__pycache__` into a root-owned `/opt` as uid
+# 65534 fails and carries on in silence, which works but makes `--read-only` a
+# claim nobody checked.  Telling it not to try is the version of that decision
+# available without a RUN.  The stdlib's own .pyc files come from the FreeBSD
+# package, which the ports tree builds.
+ENV PYTHONDONTWRITEBYTECODE=1
+
+# The source.  `srv/serve.py` puts the parent of its own directory on
+# `sys.path`, so the package has to sit exactly one level under the entrypoint,
+# which is what this layout is.
+COPY server/srv/ /opt/claudio-server/srv/
+COPY server/oci/entrypoint.sh server/oci/preflight.py /opt/claudio-server/
+COPY LICENCE /opt/claudio-server/LICENCE
+
+# The two directories, staged rather than created, because `mkdir` and `chown`
+# are RUN.  Separate on purpose, exactly as in the Linux image:
+#
+#   /var/lib/claudio-usage  the STORE: append-only JSONL, the record of truth.
+#                           A volume.  `--chown` here is what `RUN chown` does
+#                           there; the `.keep` file is only how an empty
+#                           directory is created portably by COPY, and anything
+#                           mounted over the directory hides it.
+#   /etc/claudio            the two token files, mounted READ-ONLY.  They are
+#                           secrets and they are not records; keeping them out
+#                           of the store means the store stays a directory that
+#                           can be tailed, backed up and handed to a log
+#                           shipper without handing over the tokens with it.
+#
+# There is deliberately no `VOLUME` instruction.  `VOLUME` would make a
+# forgotten `-v` create an ANONYMOUS volume: the records would survive
+# `docker rm` in a directory named by a 64-character hex string the operator
+# does not know exists and will never back up.  That is a worse failure than
+# losing them, because it looks like success.  `preflight.py` says out loud
+# that nothing is mounted instead, on every start.
+COPY --chown=65534:65534 ${STAGE}/store/ /var/lib/claudio-usage/
+COPY ${STAGE}/conf/ /etc/claudio/
+
+# NUMERIC, and both halves numeric, and here that is a necessity rather than a
+# preference: this image cannot create a user, because it has no RUN.  65534 is
+# `nobody` in both bases -- verified from `/etc/passwd` in the real
+# `freebsd-runtime` layers for 14.4 and 15.1, and from Debian's -- and the
+# GROUP name differs (`nogroup` on Debian, `nobody` on FreeBSD, and FreeBSD's
+# `nogroup` is 65533), so a name here would be a name the other image cannot
+# use.  The numbers agree; the names do not.
+#
+# The ingest service needs no privilege of any kind.  It binds 8787, appends to one
+# directory and reads two files.
+USER 65534:65534
+
+# Documentation only -- `EXPOSE` publishes nothing.  8787 is the door's own
+# default and the port `claudio`'s shipper is pointed at.
+EXPOSE 8787
+
+# NO `HEALTHCHECK` INSTRUCTION, and this is the image the absence is really
+# about.  The OCI image spec has no field for one, so a `--format oci` build --
+# which is what buildah does here -- DROPS it, and the published config simply
+# would not contain it, while a Docker-format build of the identical file keeps
+# it.  That is how the omission goes unnoticed: it appears to work locally and
+# vanishes on publish.  A health check present in the Linux image and absent in
+# this one is a health check nothing may rely on.
+#
+# Pass it at run time instead.  `/healthz` is unversioned, unenveloped and
+# served BEFORE reader auth (`serve.py` answers it above the token check on
+# purpose, because operators and scripts read that one), so it needs no
+# credential.  `fetch(1)` is in the FreeBSD base image, which the Linux base
+# has no equivalent of -- so use the Python that is in both, and the two images
+# take the identical string:
+#
+#   podman run --health-cmd \
+#     "/usr/local/bin/python3.12 -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8787/healthz',timeout=5).status==200 else 1)\"" \
+#     --health-interval 30s --health-retries 3 ...
+#
+# AND A 200 FROM `/healthz` IS NOT A STATEMENT THAT STREAM A CAN BE QUERIED.
+# It means this service is up and taking shipments.  Whether the DuckDB half
+# answers is `engine.available` in that same payload -- which is there because
+# `/healthz` is the only surface served BEFORE reader auth, so a monitor with
+# no reader token could otherwise not detect a half-functional door at all.
+# To gate on that too, read the JSON instead of the status:
+#
+#   ... sys.exit(0 if json.load(urllib.request.urlopen(URL, timeout=5))["engine"]["available"] else 1)
+
+# PROVENANCE.  Read the same block in `Containerfile.linux.ingest` for the three
+# faults it replaces; two more were this file's own.
+#
+#   `image.version` was `${DUCKDB_VERSION}`.  The OCI spec defines that field
+#   as the version of the packaged SOFTWARE, and `claudio` reports
+#   `VERSION=0.1.0` -- so on a release, a workflow that has just asserted the
+#   git tag equals claudio's VERSION went on to publish an image annotated
+#   `1.5.5`, a third party's version number in the field that names this one.
+#   It was redundant as well: `com.claudio.engine` already carries the engine
+#   version in a field that means that, and it is on both images now.
+#
+#   `com.claudio.stream-a="available"` is DELETED rather than corrected.  It
+#   was a hardcoded literal on the one image that has never been executed
+#   anywhere, while the Linux image -- whose engine is imported and
+#   version-asserted at build time -- carried no such label at all, so anything
+#   keying on it read the proven image as not-available.  Nothing could falsify
+#   it either: `:testing` publishes even when the FreeBSD smoke job fails, and
+#   that job covers amd64/15.1 alone, so five of the six FreeBSD images carried
+#   a runtime capability claim the workflow's own comment says is not claimed.
+#   There is no RUN here to derive it with, and a directory existing is not a
+#   module importing -- the whole `LD_LIBRARY_PATH` section above is one staged
+#   tree that was perfectly correct and still failed at the first exec.  So the
+#   statement of engine availability is the RUN-TIME one, in one place, as
+#   `preflight.py` already argues: the startup banner, `/api/v1/capabilities`,
+#   and `engine.available` in `/healthz` -- which is served before reader auth
+#   precisely so it can be asked without a credential.
+# THE ROLE, DECLARED BY THE IMAGE AND NOT BY A `CMD`.
+#
+# `entrypoint.sh` turns this into `--no-api`, which is what makes this image the
+# ingest service: POST /v1/ship, the store lock, the store read-write, and no
+# read API at all.
+#
+# A `CMD ["--no-api"]` would have said the same thing in fewer lines and would
+# have broken the entrypoint's own contract: a CMD is replaced WHOLESALE, so
+# `docker run IMAGE --port 9000` would silently drop the flag that makes this
+# image what it is and start a whole door -- with the query engine that is
+# deliberately not in here, and an unauthenticated read API it has no
+# `readers.json` for.  As an environment variable the role survives every argv
+# override, is visible in `docker inspect`, and is printed on every start.
+#
+# `entrypoint.sh` REFUSES an unrecognised value (exit 11) rather than falling
+# back to the whole door.
+ENV CLAUDIO_SERVER_ROLE=ingest
+
+ARG SOURCE_URL=https://github.com/gabrielbelli/claudio
+ARG REVISION=unspecified
+ARG VERSION=unspecified
+ARG BASE_NAME=docker.io/freebsd/freebsd-runtime:15.1
+ARG BASE_DIGEST=unspecified
+
+LABEL org.opencontainers.image.title="claudio-ingest" \
+      org.opencontainers.image.description="The claudio store's ingest service: POST /v1/ship, the only writer, holds the store lock. Standard library only -- no DuckDB. FreeBSD build." \
+      org.opencontainers.image.source="${SOURCE_URL}" \
+      org.opencontainers.image.revision="${REVISION}" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.licenses="BSD-2-Clause" \
+      org.opencontainers.image.base.name="${BASE_NAME}" \
+      org.opencontainers.image.base.digest="${BASE_DIGEST}" \
+      com.claudio.engine="none -- this component never queries" \
+      com.claudio.component="ingest"
+
+# `ENTRYPOINT` and no `CMD`.  Everything after the image name on the command
+# line is appended to the door's argv, and argparse takes the last occurrence
+# of a repeated option, so one flag can be overridden without retyping the
+# other four.  A `CMD` carrying the full flag list would be replaced wholesale
+# and the flag people forget to retype is `--readers`.
+#
+# `entrypoint.sh` is byte-identical to the Linux image's, and the interpreter
+# search is the reason it exists: Debian's slim image gives
+# `/usr/local/bin/python3`, and this one gives `/usr/local/bin/python3.12`,
+# because the unversioned symlink lives in a separate `python3` metapackage
+# that there is no reason to stage.
+ENTRYPOINT ["/opt/claudio-server/entrypoint.sh"]

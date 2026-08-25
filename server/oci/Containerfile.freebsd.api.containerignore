@@ -1,0 +1,51 @@
+# The ignore file for `Containerfile.freebsd.api`, and it is deliberately NOT at the
+# repository root.
+#
+# buildah has no equivalent of BuildKit's `<dockerfile>.dockerignore` lookup, so
+# unlike `Containerfile.linux.dockerignore` this one is not found by being
+# beside the Containerfile: it is passed explicitly, and the workflow does so.
+#
+#   buildah bud --ignorefile server/oci/Containerfile.freebsd.api.containerignore ...
+#
+# It could have gone at the context root under the name `.containerignore`,
+# which is what buildah looks for there.  It does not, for the reason
+# `Containerfile.linux.dockerignore` gives: a test in `usage/tests/test_all.py`
+# walks the repository root for container files by NAME and refuses them, on
+# the grounds that a root-level container file "reads as the way to run the
+# project".  `.containerignore` is not on that test's list today -- which makes
+# putting one there a way of satisfying the letter of a guard while defeating
+# it, and this repository has audited itself for exactly that shape more than
+# once.
+#
+# The context is the REPOSITORY ROOT, because the image needs `server/srv/`,
+# `server/oci/` and the staged FreeBSD tree, and no one of them is a parent of
+# the others.
+#
+# Last match wins, so the `__pycache__` line at the bottom is what keeps a
+# developer's stale byte-code out of a published image -- and it matters more
+# here than it does for Linux, because this image has no RUN and therefore
+# never re-compiles what it copies.
+# WHAT THIS CONTEXT CONTAINS, NAMED RATHER THAN SWEPT IN.
+#
+# `!/server/oci/**` used to re-include the whole directory, which was harmless
+# while there was one staged tree.  There are four now -- one per component,
+# hundreds of megabytes each -- and a context that carried all of them would
+# ship the other three trees to this build for no reason.  Named explicitly
+# instead, which also means the STAGE build-arg and this file are a pair: build
+# with `--build-arg STAGE=somewhere-else` and the COPY fails by name, which is
+# the loud half of the trade.
+#
+# `srv/mcp.py` IS in this context, and that is now unconditional rather than
+# provisional.  `srv/serve.py` no longer imports it -- `POST /mcp` moved to the
+# mcp component, which is its own image -- but the module still ships with the
+# package, because excluding one file from a `COPY server/srv/` would need a
+# second COPY list and a list is a place to forget.  What matters is that
+# nothing in this image RUNS it: `entrypoint.sh` has no `mcp` mode any more, and
+# a test asserts all three of those facts.
+*
+!/LICENCE
+!/server/srv/**
+!/server/oci/entrypoint.sh
+!/server/oci/preflight.py
+!/server/oci/stage-freebsd-api/**
+**/__pycache__

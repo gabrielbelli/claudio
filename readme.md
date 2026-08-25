@@ -824,6 +824,34 @@ claudio default --tag team=soc --tag env=prod
 claudio run                       # now runs under work, tagged
 ```
 
+### `claudio key new <account>`
+
+Prints one line for the server's `tokens.json`:
+
+```sh
+claudio key new work
+00000000-0000-4000-8000-000000000000.EXAMPLE_ONLY_not_a_real_key_do_not_use_0000
+```
+
+Paste it into the list on the server and that account can ship. Nothing else to
+configure, and nothing to look up.
+
+**The left half is the account's own uuid**, which is why this runs here rather
+than on the server: the uuid lives in this account's `.claude.json` and nowhere
+the person configuring the door can see it. Before, setting up shipping meant
+copying a 36-character string between machines and getting a 409 with no clue
+in it when you copied the wrong one.
+
+The right half is 32 bytes from `/dev/urandom`, base64url. It is a shared
+secret, not a keypair: it proves the workstation is allowed to ship, and the
+`https://` certificate proves the server is the server. Cryptographic
+workstation identity — mTLS or Ed25519 — is roadmapped for the day the door is
+reachable outside a trusted network.
+
+**Rotation is running this again**, pasting the new line, and deleting the old
+one. There is no expiry and no schedule: a key you can replace in ten seconds
+does not need one.
+
 ### `claudio statusline [--preview | --set <account> | --all]`
 
 Works with the `statusline=<command>` and `logging=` keys (see [Status line, and
