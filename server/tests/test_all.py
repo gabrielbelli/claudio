@@ -10590,6 +10590,29 @@ def test_oci_the_workflow_publishes_both_images_and_pairs_base_with_abi():
         check("oci/ci: and never names the private development branch",
               "accounts-and-tags" in named, False)
 
+        # AND THE MOVING TAGS MUST BE GATED ON A BRANCH THAT CAN ACTUALLY FIRE.
+        # This is the same rule as the two checks above, one step on, and it is
+        # the step that was missed: the trigger was corrected to name
+        # `pre-release` while `DEV_BRANCH` -- the ref the manifest job compares
+        # against before it moves `:testing` -- was left naming the private
+        # branch.  A gate on a ref no push produces is not a scoping decision,
+        # it is an off switch: CI ran on that branch zero times, so `:testing`
+        # was never published on any component, while every per-commit
+        # `sha-<short>*` tag went up exactly as designed.  Nothing failed and
+        # nothing warned, because the `else` branch that handles "this run is
+        # not on DEV_BRANCH" is worded for a tag that stopped moving rather
+        # than one that never started.
+        #
+        # Pinned as membership rather than as the literal string `pre-release`,
+        # because the defect is the DISAGREEMENT between the two lines and not
+        # either value: whoever moves the publish branch next changes one line
+        # and this still holds.
+        dev = re.search(r"^\s*DEV_BRANCH:\s*(\S+)\s*$", text, re.M)
+        check_true("oci/ci: the moving-tag gate names a branch", bool(dev))
+        if dev:
+            check_true("oci/ci: ...and it is one the push trigger fires on",
+                       dev.group(1) in named)
+
     # THE STAGING STEP NAMES ITS COMPONENT.  `stage-freebsd.sh` takes the
     # component first and has no default, so a workflow written before that
     # argument existed fails on its next run -- loudly, which is the right

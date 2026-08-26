@@ -159,8 +159,8 @@ name: images
 # smuggled in under a security change.  Nothing here has ever been run -- see
 # "WHAT IS NOT VERIFIED" at the foot of this file.
 #
-# TRIGGERS.  `pre-release` is deliberately absent: it is the published squash
-# and nothing here may touch it.
+# TRIGGERS.  `pre-release` is the published squash and is exactly what CI
+# builds: it is the branch whose images anybody pulls.
 on:
   push:
     # `pre-release` is the published branch and the one CI runs on.
@@ -221,11 +221,17 @@ env:
   # Which FreeBSD base the unsuffixed FreeBSD tags point at, and the only one
   # that may appear in the mixed-OS `:testing` list -- see the manifest job.
   DEFAULT_FREEBSD: freebsd15.1
-  # The one branch the moving `:testing*` tags are published from.  It is
-  # `accounts-and-tags` today because that is where the work is: `master` is
-  # 21 commits behind it and does not yet carry this workflow at all.  When
-  # this lands on master, THIS ONE LINE MOVES and the rest of the file is
-  # unchanged.
+  # The one branch the moving `:testing*` tags are published from, and it must
+  # be a branch the push trigger above actually names.  It said
+  # `accounts-and-tags` for one release and that was not a setting, it was a
+  # dead gate: that branch is the PRIVATE development history, deliberately
+  # never pushed -- the trigger comment fifty lines above says so and a test
+  # pins it -- so the ref this compared against could not occur.  CI ran on it
+  # zero times, `:testing` was therefore never published at all on any of the
+  # four components, and the `else` branch below reported that as ":testing
+  # still points wherever the last build left it", a sentence whose only
+  # untrue word is "still".  A guard written for a tag that STOPPED moving
+  # reads as reassurance for a tag that never started.
   #
   # One consequence, stated rather than left to be discovered: GitHub always
   # runs a `schedule:` on the repository's DEFAULT branch, so while DEV_BRANCH
@@ -233,7 +239,7 @@ env:
   # tags and does NOT refresh `:testing`.  The manifest job prints that, by
   # name, on every such run -- a tag that quietly stopped moving is exactly the
   # silence this project exists to refuse.
-  DEV_BRANCH: accounts-and-tags
+  DEV_BRANCH: pre-release
   # NOT a performance knob, and deleting it publishes an image that panics on
   # pull.  With the overlay driver buildah leaves overlayfs bookkeeping
   # attributes (user.overlay.impure, user.overlay.origin) on any directory a

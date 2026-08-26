@@ -1370,14 +1370,17 @@ git add CLAUDE.md server/README.md server/.gitignore server/compose.yml \
         server/srv server/tests
 git commit -m "Publish the server as Linux and FreeBSD OCI images"
 
-# 2. push the branch the moving tags are scoped to. DEV_BRANCH in the
-#    workflow names it, and a build on any other ref publishes its sha- tags
-#    and says out loud that it did not move :testing.
-git push origin accounts-and-tags
+# 2. squash onto the branch the moving tags are scoped to, and push THAT.
+#    `accounts-and-tags` is the private development history and is never
+#    pushed; `pre-release` is the published squash, is what DEV_BRANCH in the
+#    workflow names, and is the only ref that moves :testing. A build on any
+#    other ref publishes its sha- tags and says out loud that it did not.
+git checkout pre-release && git merge --squash accounts-and-tags
+git commit && git push origin pre-release
 
 # 3. watch it. The four suites run first and nothing publishes from a red
 #    tree -- not even a per-commit sha- tag.
-gh run watch "$(gh run list --workflow=images.yml --branch=accounts-and-tags --limit=1 --json databaseId --jq '.[0].databaseId')"
+gh run watch "$(gh run list --workflow=images.yml --branch=pre-release --limit=1 --json databaseId --jq '.[0].databaseId')"
 
 # 4. pull what it published, on each operating system
 for c in ingest api mcp proxy; do
@@ -1390,7 +1393,7 @@ To publish without a push — a re-run on the same commit, which re-points the
 moving tags and the `sha-` tags alike:
 
 ```bash
-gh workflow run images.yml --ref accounts-and-tags
+gh workflow run images.yml --ref pre-release
 ```
 
 **The packages are private until you make them public, and there are four of
