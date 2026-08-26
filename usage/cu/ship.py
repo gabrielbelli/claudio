@@ -72,7 +72,28 @@ STREAM_LEDGER = "ledger"
 STREAM_SAMPLES = "samples"
 LEDGER_STAMP = "account_uuid"
 
-AGENT = "claudio-ship/1"
+# HOW THIS MACHINE NAMES ITSELF, in the manifest AND in the request headers.
+#
+# It was `claudio-ship/1` and it was written into the manifest alone, so claudio
+# identified itself in the one place a WAF cannot read: the body.  Every POST
+# this project has ever sent arrived as `User-Agent: Python-urllib/3.12` -- the
+# interpreter, its patch version, and nothing about claudio at all --
+# indistinguishable at a proxy from any other script that happens to use urllib,
+# which is not a shape a rule can be written against.
+#
+# The version is claudio's own rather than the ship protocol's, because what a
+# rule needs to discriminate is which RELEASE is calling: the protocol number
+# moves when the wire changes and is already on the manifest, where the door
+# reads it.  One constant feeds both so the two can never drift into two answers
+# to "what is talking to me".
+#
+# Deliberately nothing else.  No hostname, no platform, no interpreter version:
+# `otlp-recv` and the door both had `Server: BaseHTTP/0.6 Python/3.14.6`
+# replaced for publishing a machine's exact patch level from a listening socket,
+# and a request crossing somebody's network is the same disclosure pointed
+# outward.  Adding a platform token is a one-word change if a rule ever needs
+# one; taking it back after it has been logged is not.
+AGENT = "claudio-ship/" + config.CLAUDIO_VERSION
 CONTENT_TYPE = "application/x-ndjson"
 
 # One POST carries at most this many lines of the file.  A pass loops until the
@@ -395,7 +416,7 @@ def post_batch(url, token, man, records, timeout=TIMEOUT):
                       ensure_ascii=False).encode("utf-8") + b"\n"
     for rec in records:
         body += rec + b"\n"
-    headers = {"Content-Type": CONTENT_TYPE}
+    headers = {"Content-Type": CONTENT_TYPE, "User-Agent": AGENT}
     if token:
         headers["Authorization"] = "Bearer " + token
     req = urllib.request.Request(url, data=body, method="POST",

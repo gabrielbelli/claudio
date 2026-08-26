@@ -3527,6 +3527,72 @@ def test_the_shipper_never_reads_raw():
               any(secret.encode() in r for r in sink.records()), False)
 
 
+def test_the_shipper_names_itself_in_a_header_a_proxy_can_read():
+    """claudio identified itself in the one place a WAF cannot read.
+
+    `AGENT` existed and was written into the MANIFEST -- the body -- so every
+    POST this project has ever sent went out as `User-Agent: Python-urllib/3.x`.
+    A proxy sees headers; the body is past the point where a rule can act, and
+    on the ordinary deployment it is the WAF that has to decide whether to let
+    the request through at all.  So the string was there, correct, and useless.
+
+    It went unseen because of where the suite injects: `_run_ship` passes
+    `post=`, which replaces `post_batch` wholesale, so the entire header block
+    is below every test that drives a shipping pass.  This one goes through real
+    urllib to a real socket for that reason -- a test asserting `AGENT` is
+    non-empty would have passed throughout.
+    """
+    sink = _ShipHTTPSink()
+    sink.start()
+    try:
+        man = ship.manifest(ship.STREAM_LEDGER, "/x/ledger.jsonl",
+                            (1, 2, "h"), 0, 1, 1, "host", "machine",
+                            1786600000.0)
+        ok, detail, _ack = ship.post_batch(sink.url, "tok", man, [b'{"a":1}'])
+        check_true("ship/ua: the POST reached the sink", ok and not detail)
+        check("ship/ua: one batch arrived", len(sink.batches), 1)
+        got = sink.batches[0]["agent"]
+
+        check("ship/ua: the request names claudio", got, ship.AGENT)
+        check("ship/ua: ...and carries claudio's version", got,
+              "claudio-ship/" + config.CLAUDIO_VERSION)
+
+        # The defect stated as its own assertion, because "equals AGENT" would
+        # still hold if AGENT were ever set to urllib's default by accident.
+        check_true("ship/ua: ...and is not urllib's default",
+                   "Python-urllib" not in (got or ""))
+
+        # ONE identity, not two.  The manifest field and the header come from
+        # the same constant; two copies would drift into two answers to the
+        # question "what is talking to me", which is the question the header is
+        # being added to answer.
+        check("ship/ua: the manifest agrees with the header",
+              sink.batches[0]["manifest"].get("agent"), got)
+    finally:
+        sink.stop()
+
+
+def test_the_shipper_s_version_is_the_one_claudio_ships():
+    """Derived from the `claudio` script, never asserted as a literal.
+
+    `CLAUDIO_VERSION` is a copy -- the number belongs to a POSIX sh script that
+    cannot be imported -- so the guard is the one this project uses for every
+    other copy: read both, compare, fail at the moment it can still be fixed.
+    A hardcoded "0.1.0" here would be a fourth place to forget on release day,
+    and the symptom would be a WAF rule silently matching the wrong release.
+    """
+    path = os.path.join(os.path.dirname(ROOT), "claudio")
+    if not os.path.exists(path):
+        check_true("ship/ua: the claudio script is next to usage/", False)
+        return
+    src = open(path, encoding="utf-8").read()
+    found = re.findall(r"^VERSION=(\S+)\s*$", src, re.M)
+    check("ship/ua: claudio embeds exactly one VERSION", len(found), 1)
+    if found:
+        check("ship/ua: and the shipper reports that version",
+              config.CLAUDIO_VERSION, found[0])
+
+
 def test_the_tick_lives_in_the_receiver_and_runs_once_more_before_it_exits():
     """The two calls the design turns on, both against the real process.
 
@@ -3623,6 +3689,7 @@ class _ShipHTTPSink(object):
                 outer.batches.append({
                     "auth": self.headers.get("Authorization"),
                     "ctype": self.headers.get("Content-Type"),
+                    "agent": self.headers.get("User-Agent"),
                     "manifest": json.loads(lines[0]),
                     "records": [json.loads(l) for l in lines[1:]]})
                 self.send_response(200)

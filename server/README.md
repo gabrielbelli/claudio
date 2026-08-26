@@ -437,6 +437,35 @@ same port. It is four services now, each carrying only what it needs.
                                                      bearer token)
 ```
 
+### How the shipper identifies itself to a proxy
+
+Every `POST /v1/ship` claudio sends carries:
+
+```
+User-Agent: claudio-ship/<claudio version>      e.g. claudio-ship/0.1.0
+```
+
+That is what a WAF rule matches on. It is a copy of the `VERSION=` line in the
+`claudio` script and a test compares the two, so it tracks releases rather than
+being set once and forgotten; the same string is repeated in the batch
+manifest's `agent` field, from one constant, so the header and the body can
+never give two answers about what is calling.
+
+It deliberately carries nothing else -- no hostname, no platform, no
+interpreter version. `otlp-recv` and this door both had `Server: BaseHTTP/0.6
+Python/3.14.6` replaced for publishing a machine's exact patch level from a
+listening socket, and a request crossing somebody's network is that same
+disclosure pointed outward.
+
+> Rules keyed on the version need widening at each release. Match the prefix
+> `claudio-ship/` when what you mean is "claudio", and pin the full string only
+> when you mean one release.
+
+The door reads none of it. It authorises on the bearer token alone, so a rule
+here is a network control in front of the door and never a replacement for one:
+a request reaching `/v1/ship` with a valid token is accepted whatever its
+`User-Agent` says, and any client can send any header it likes.
+
 ```bash
 echo '["<account-uuid>.<secret>"]' > server/tokens.json    # who may SHIP
 echo '{"<reader-token>": "*"}'     > server/readers.json   # who may READ
