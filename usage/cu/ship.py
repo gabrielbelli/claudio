@@ -72,27 +72,16 @@ STREAM_LEDGER = "ledger"
 STREAM_SAMPLES = "samples"
 LEDGER_STAMP = "account_uuid"
 
-# HOW THIS MACHINE NAMES ITSELF, in the manifest AND in the request headers.
+# How this machine names itself, in the manifest AND in the request headers.
+# It was written into the manifest alone, so every POST went out as urllib's
+# default `User-Agent: Python-urllib/3.x`.  One constant feeds both, so the
+# header and the body cannot give two answers about what is calling.
 #
-# It was `claudio-ship/1` and it was written into the manifest alone, so claudio
-# identified itself in the one place a WAF cannot read: the body.  Every POST
-# this project has ever sent arrived as `User-Agent: Python-urllib/3.12` -- the
-# interpreter, its patch version, and nothing about claudio at all --
-# indistinguishable at a proxy from any other script that happens to use urllib,
-# which is not a shape a rule can be written against.
-#
-# The version is claudio's own rather than the ship protocol's, because what a
-# rule needs to discriminate is which RELEASE is calling: the protocol number
-# moves when the wire changes and is already on the manifest, where the door
-# reads it.  One constant feeds both so the two can never drift into two answers
-# to "what is talking to me".
-#
-# Deliberately nothing else.  No hostname, no platform, no interpreter version:
+# Carries claudio's version rather than the ship protocol's: the protocol number
+# is already on the manifest, where the door reads it.  Nothing else goes in --
 # `otlp-recv` and the door both had `Server: BaseHTTP/0.6 Python/3.14.6`
-# replaced for publishing a machine's exact patch level from a listening socket,
-# and a request crossing somebody's network is the same disclosure pointed
-# outward.  Adding a platform token is a one-word change if a rule ever needs
-# one; taking it back after it has been logged is not.
+# replaced for publishing a machine's exact patch level, and this is the same
+# disclosure pointed outward.
 AGENT = "claudio-ship/" + config.CLAUDIO_VERSION
 CONTENT_TYPE = "application/x-ndjson"
 

@@ -6,19 +6,14 @@ Read line-wise; never parsed into structures.  Environment beats file.
 
 import os
 
-# claudio's own version, and the ONLY copy of it on the Python side.
+# claudio's own version, and the only copy of it on the Python side.
 #
 # The number lives in the `VERSION=` line of the `claudio` script, which is
-# POSIX sh and cannot be imported; `test.sh` already reads it with `sed` in two
-# places and CI reads it in a third, so a value is derived from that line rather
-# than owned here.  Deriving it a fourth time AT RUNTIME was the alternative and
-# is worse: `claudio` sits at three different places relative to this file
-# (checkout, `$PREFIX/libexec/claudio/`, and `$PATH`) -- `_tool_path` exists to
+# POSIX sh and cannot be imported, so a test compares the two rather than either
+# side owning it.  Resolving the script at runtime was the alternative: it sits
+# at three different places relative to this file -- `_tool_path` exists to
 # resolve exactly that, downhill -- and a reverse resolver that missed would
-# degrade the User-Agent to "unknown" silently, which is precisely the WAF rule
-# this string exists to be matched by.  A constant that a test compares against
-# the script fails loudly at the one moment it can be fixed, which is the same
-# trade every doc guard in this project already makes.
+# degrade the version to "unknown" silently.
 CLAUDIO_VERSION = "0.1.0"
 
 # Every key here is read by something.  `idle_stop_minutes` and `retain_days`

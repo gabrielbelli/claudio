@@ -3527,18 +3527,15 @@ def test_the_shipper_never_reads_raw():
               any(secret.encode() in r for r in sink.records()), False)
 
 
-def test_the_shipper_names_itself_in_a_header_a_proxy_can_read():
-    """claudio identified itself in the one place a WAF cannot read.
+def test_the_shipper_names_itself_in_the_request_headers():
+    """`AGENT` was written into the manifest alone, so the header was urllib's.
 
-    `AGENT` existed and was written into the MANIFEST -- the body -- so every
-    POST this project has ever sent went out as `User-Agent: Python-urllib/3.x`.
-    A proxy sees headers; the body is past the point where a rule can act, and
-    on the ordinary deployment it is the WAF that has to decide whether to let
-    the request through at all.  So the string was there, correct, and useless.
+    Every POST went out as `User-Agent: Python-urllib/3.x`, naming the
+    interpreter and its patch version and nothing about claudio.
 
     It went unseen because of where the suite injects: `_run_ship` passes
-    `post=`, which replaces `post_batch` wholesale, so the entire header block
-    is below every test that drives a shipping pass.  This one goes through real
+    `post=`, which replaces `post_batch` wholesale, so the header block sits
+    below every test that drives a shipping pass.  This one goes through real
     urllib to a real socket for that reason -- a test asserting `AGENT` is
     non-empty would have passed throughout.
     """
@@ -3578,8 +3575,7 @@ def test_the_shipper_s_version_is_the_one_claudio_ships():
     `CLAUDIO_VERSION` is a copy -- the number belongs to a POSIX sh script that
     cannot be imported -- so the guard is the one this project uses for every
     other copy: read both, compare, fail at the moment it can still be fixed.
-    A hardcoded "0.1.0" here would be a fourth place to forget on release day,
-    and the symptom would be a WAF rule silently matching the wrong release.
+    A hardcoded "0.1.0" here would be a fourth place to forget on release day.
     """
     path = os.path.join(os.path.dirname(ROOT), "claudio")
     if not os.path.exists(path):
