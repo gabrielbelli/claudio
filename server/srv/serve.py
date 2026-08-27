@@ -312,7 +312,7 @@ class Tenants(object):
         A LIST of self-describing keys is the shape to write now -- one line
         each, nothing to look up:
 
-            ["9a701c41-....k7Qm3v...", "c0235ad1-....pR2wL8..."]
+            ["00000000-....k7Qm3v...", "11111111-....pR2wL8..."]
 
         The MAP is still read, because it is what is deployed and because a
         plain opaque token has nowhere else to say which account it means:
