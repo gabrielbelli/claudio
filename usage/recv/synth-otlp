@@ -63,7 +63,7 @@ import urllib.error
 import urllib.request
 import uuid
 
-SESSION_ID = "2f0eb9cf-cfd1-4185-8af8-550391549707"
+SESSION_ID = "f1f70000-0000-4000-8000-000000000000"
 PROMPT_ID = str(uuid.uuid4())
 
 # Copied from tests/fixtures/real-payloads/02-sonnet-repl-main-thread.json --

@@ -271,7 +271,7 @@ Verified output through `tail`:
 
 ```
 15:26:24 api_request            prompt.id=114c10e2-… cost_usd=0.08158 input_tokens=2
-15:26:24 user_prompt            prompt.id=114c10e2-… session.id=2f0eb9cf-…
+15:26:24 user_prompt            prompt.id=114c10e2-… session.id=f1f70000-…
 15:26:33 assistant_response     prompt.id=114c10e2-… duration_ms=8600
 ```
 
